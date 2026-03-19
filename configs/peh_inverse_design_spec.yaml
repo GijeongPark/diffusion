@@ -1,0 +1,106 @@
+project:
+  name: peh_inverse_design
+  description: >
+    Inverse design of a repeated unit-cell geometry from the global voltage FRF
+    of a finite cantilevered piezoelectric metamaterial plate.
+
+geometry:
+  representation: sdf
+  unit_cell_size_m: [0.10, 0.10]
+  tile_counts: [10, 10]
+  total_plate_size_m: [1.00, 1.00]
+  substrate_thickness_m: 0.001
+  piezo_patch_thickness_m: 0.0002667
+  piezo_patch_coverage: full
+  native_grf_resolution: 64
+  native_sdf_resolution: 120
+  ml_sdf_resolution: 128
+
+materials:
+  substrate:
+    youngs_modulus_pa: 1.9305e11
+    poisson_ratio: 0.30
+    density_kg_per_m3: 7930.0
+  piezoelectric:
+    polarization_axis: z
+    reduced_plate_constants:
+      e31_c_per_m2: -23.38
+      eps33s_f_per_m: 1.729e-08
+    constitutive_form_3d: stress_charge
+    full_3d_constants:
+      piezoelectric_e_c_per_m2:
+        - [0.0, 0.0, -6.622811852]
+        - [0.0, 0.0, -6.622811852]
+        - [0.0, 0.0, 23.24031303]
+        - [0.0, 0.0, 0.0]
+        - [0.0, 17.03448276, 0.0]
+        - [17.03448276, 0.0, 0.0]
+      stiffness_cE_pa:
+        - [1.27205e11, 8.0212213391e10, 8.4670187076e10, 0.0, 0.0, 0.0]
+        - [8.0212213391e10, 1.27205e11, 8.4670187076e10, 0.0, 0.0, 0.0]
+        - [8.4670187076e10, 8.4670187076e10, 1.17436e11, 0.0, 0.0, 0.0]
+        - [0.0, 0.0, 0.0, 2.3474178404e10, 0.0, 0.0]
+        - [0.0, 0.0, 0.0, 0.0, 2.30e10, 0.0]
+        - [0.0, 0.0, 0.0, 0.0, 0.0, 2.30e10]
+      permittivity_epsS_f_per_m:
+        - [1.50911e-08, 0.0, 0.0]
+        - [0.0, 1.50911e-08, 0.0]
+        - [0.0, 0.0, 1.26934e-08]
+    notes:
+      - Use the reduced plate constants only for analytical reduced-order derivations.
+      - Use the full 3D constitutive data for the coupled FEM dataset.
+      - Keep the same constitutive convention and axis ordering across all samples.
+
+mechanics:
+  structure_type: finite_repeated_plate
+  boundary_condition: clamped_free_free_free
+  clamped_edge: x_min
+  base_excitation:
+    type: harmonic_support_acceleration
+    amplitude_m_per_s2: 2.5
+    direction: z
+    interpretation: moving_clamped_base
+    time_domain_form: a_base(t) = 2.5 * sin(omega * t)
+    implementation_options:
+      - impose_support_motion_at_clamped_edge
+      - equivalent_inertial_loading_in_relative_coordinates
+  damping:
+    method: modal_superposition
+    modal_damping_ratio: 0.025
+
+electrical:
+  measured_quantity: voltage
+  measured_form: magnitude
+  electrode_measurement_region: full_plate_electrode
+  external_load_resistance_ohm: 10000.0
+
+frf:
+  target_mode: fundamental
+  conditioning:
+    include_f_peak_hz: true
+  frequency_axis:
+    type: normalized_with_peak_scalar
+    normalized_range: [0.9, 1.1]
+    recommended_num_points: 256
+    store_absolute_frequency_axis: true
+
+data_products:
+  geometry_dataset: data/geometry_dataset.npz
+  response_dataset: data/response_dataset.npz
+  manifest_csv: data/samples.csv
+  mesh_directory: meshes/
+
+ml_pipeline:
+  geometry_encoder: autoencoder
+  inverse_model: conditional_latent_diffusion
+  frf_encoder:
+    sequence_encoder: 1d_cnn_or_small_transformer
+    scalar_encoder: mlp
+  inference:
+    sample_multiple_candidates: true
+    rerank_with_fem: true
+
+notes:
+  - The inverse target is one unit-cell geometry, not a full-plate image.
+  - The forward FEM should evaluate the full tiled plate under cantilever boundary conditions.
+  - Save both normalized FRF data and the corresponding absolute peak frequency.

@@ -12,6 +12,10 @@ __pycache__/
 # Generated data & meshes
 data/
 meshes/
+runs/
+
+# Claude local settings
+.claude/settings.local.json
 
 # Jupyter checkpoints
 .ipynb_checkpoints/

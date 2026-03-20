@@ -103,12 +103,10 @@ def _extract_top_surface_mesh(mesh: dict[str, np.ndarray]) -> tuple[np.ndarray, 
     return local_points, local_tri
 
 
-def _add_mesh_zoom_inset(
-    parent_ax: plt.Axes,
+def _extract_mesh_zoom(
     points: np.ndarray,
     triangles: np.ndarray,
-    strain: np.ndarray | None,
-) -> None:
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float], tuple[float, float]] | None:
     span_x = float(np.max(points[:, 0]) - np.min(points[:, 0]))
     span_y = float(np.max(points[:, 1]) - np.min(points[:, 1]))
     center = np.array([np.min(points[:, 0]) + 0.60 * span_x, np.min(points[:, 1]) + 0.60 * span_y], dtype=np.float64)
@@ -122,46 +120,69 @@ def _add_mesh_zoom_inset(
     )
     zoom_triangles = triangles[mask]
     if zoom_triangles.shape[0] == 0:
-        return
+        return None
 
     used_nodes = np.unique(zoom_triangles.reshape(-1))
     local_points = points[used_nodes]
     node_map = np.full(points.shape[0], -1, dtype=np.int64)
     node_map[used_nodes] = np.arange(used_nodes.shape[0], dtype=np.int64)
     local_triangles = node_map[zoom_triangles]
-    triangulation = mtri.Triangulation(local_points[:, 0], local_points[:, 1], local_triangles)
+    xlim = (center[0] - half_window, center[0] + half_window)
+    ylim = (center[1] - half_window, center[1] + half_window)
+    return local_points, local_triangles, xlim, ylim
 
-    inset = parent_ax.inset_axes([0.60, 0.04, 0.36, 0.36])
-    if strain is not None and strain.shape[0] == triangles.shape[0]:
-        zoom_strain = strain[mask]
-        vmax = float(np.percentile(zoom_strain, 99.0))
-        if vmax <= 0.0:
-            vmax = float(np.max(zoom_strain))
-        if vmax <= 0.0:
-            vmax = 1.0
-        inset.tripcolor(
-            triangulation,
-            facecolors=zoom_strain,
-            shading="flat",
-            cmap="inferno",
-            norm=mcolors.PowerNorm(gamma=0.45, vmin=0.0, vmax=vmax),
-        )
+
+def _plot_mesh_detail(
+    ax: plt.Axes,
+    points: np.ndarray,
+    triangles: np.ndarray,
+    title: str = "Mesh Detail",
+    show_ticks: bool = True,
+) -> bool:
+    zoom = _extract_mesh_zoom(points, triangles)
+    if zoom is None:
+        return False
+    local_points, local_triangles, xlim, ylim = zoom
+    triangulation = mtri.Triangulation(local_points[:, 0], local_points[:, 1], local_triangles)
+    ax.tripcolor(
+        triangulation,
+        facecolors=np.full(local_triangles.shape[0], 0.88, dtype=np.float64),
+        shading="flat",
+        cmap="Greys",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.triplot(triangulation, color=(0.82, 0.78, 0.96, 0.95), linewidth=0.22)
+    ax.plot(
+        local_points[:, 0],
+        local_points[:, 1],
+        linestyle="None",
+        marker="o",
+        markersize=0.9,
+        color=(0.92, 0.90, 0.99, 0.95),
+    )
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect("equal")
+    if show_ticks:
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
     else:
-        inset.tripcolor(
-            triangulation,
-            facecolors=np.full(local_triangles.shape[0], 1.0, dtype=np.float64),
-            shading="flat",
-            cmap="Greys",
-            vmin=0.0,
-            vmax=1.0,
-        )
-    inset.triplot(triangulation, color=(0.95, 0.95, 0.95, 0.70), linewidth=0.22)
-    inset.set_xlim(center[0] - half_window, center[0] + half_window)
-    inset.set_ylim(center[1] - half_window, center[1] + half_window)
-    inset.set_aspect("equal")
-    inset.set_xticks([])
-    inset.set_yticks([])
-    inset.set_title("mesh detail", fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    ax.set_title(title)
+    ax.grid(alpha=0.12)
+    return True
+
+
+def _add_mesh_zoom_inset(
+    parent_ax: plt.Axes,
+    points: np.ndarray,
+    triangles: np.ndarray,
+) -> None:
+    inset = parent_ax.inset_axes([0.60, 0.04, 0.36, 0.36])
+    if not _plot_mesh_detail(inset, points, triangles, title="mesh detail", show_ticks=False):
+        return
     for spine in inset.spines.values():
         spine.set_color("white")
         spine.set_linewidth(1.0)
@@ -172,6 +193,7 @@ def _plot_surface_mesh_or_strain(
     ax: plt.Axes,
     mesh: dict[str, np.ndarray],
     modal: dict[str, np.ndarray] | None,
+    include_mesh_inset: bool = True,
 ) -> float:
     points, triangles = _extract_top_surface_mesh(mesh)
     triangulation = mtri.Triangulation(points[:, 0], points[:, 1], triangles)
@@ -204,7 +226,8 @@ def _plot_surface_mesh_or_strain(
         cbar = fig.colorbar(collection, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(r"$\varepsilon_{eq}$")
         strain_max = float(np.max(strain))
-        _add_mesh_zoom_inset(ax, points, triangles, strain)
+        if include_mesh_inset:
+            _add_mesh_zoom_inset(ax, points, triangles)
     else:
         collection = ax.tripcolor(
             triangulation,
@@ -218,7 +241,8 @@ def _plot_surface_mesh_or_strain(
         collection.set_alpha(0.95)
         ax.set_title("Top Surface FEM Mesh")
         strain_max = float("nan")
-        _add_mesh_zoom_inset(ax, points, triangles, None)
+        if include_mesh_inset:
+            _add_mesh_zoom_inset(ax, points, triangles)
 
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
@@ -287,17 +311,12 @@ def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray]
 
 def _plot_sample_summary(
     sample_id: int,
-    dataset_path: Path,
-    mesh_npz_path: Path,
-    response_path: Path,
-    modal_path: Path | None,
+    dataset_row: dict[str, np.ndarray],
+    mesh: dict[str, np.ndarray],
+    response: dict[str, np.ndarray],
+    modal: dict[str, np.ndarray] | None,
     output_path: Path,
 ) -> dict[str, float]:
-    dataset_row = _load_dataset_row(dataset_path, sample_id)
-    mesh = _load_mesh(mesh_npz_path)
-    response = _load_response(response_path)
-    modal = _load_modal(modal_path)
-
     fig = plt.figure(figsize=(16, 8))
     gs = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 1.25], height_ratios=[1.0, 1.0])
     ax_unit = fig.add_subplot(gs[0, 0])
@@ -308,7 +327,7 @@ def _plot_sample_summary(
 
     _plot_unit_cell(ax_unit, dataset_row["binary"])
     _plot_tiled_geometry(ax_tiled, dataset_row["binary"])
-    strain_max = _plot_surface_mesh_or_strain(fig, ax_mesh, mesh, modal)
+    strain_max = _plot_surface_mesh_or_strain(fig, ax_mesh, mesh, modal, include_mesh_inset=True)
     _plot_frf(ax_frf, response, modal)
     stats = _plot_stats(ax_stats, sample_id, dataset_row, mesh, response, modal, strain_max)
 
@@ -317,6 +336,50 @@ def _plot_sample_summary(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
+    return stats
+
+
+def _save_figure(fig: plt.Figure, output_path: Path, dpi: int = 300) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_individual_plots(
+    sample_id: int,
+    dataset_row: dict[str, np.ndarray],
+    mesh: dict[str, np.ndarray],
+    response: dict[str, np.ndarray],
+    modal: dict[str, np.ndarray] | None,
+    sample_output_dir: Path,
+) -> dict[str, float]:
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(5.2, 5.0))
+    _plot_unit_cell(ax, dataset_row["binary"])
+    _save_figure(fig, sample_output_dir / "unit_cell_geometry.png", dpi=320)
+
+    fig, ax = plt.subplots(figsize=(5.6, 5.0))
+    _plot_tiled_geometry(ax, dataset_row["binary"])
+    _save_figure(fig, sample_output_dir / "repeated_plate_geometry.png", dpi=320)
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.2))
+    _plot_frf(ax, response, modal)
+    _save_figure(fig, sample_output_dir / "voltage_frf.svg", dpi=220)
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.6))
+    strain_max = _plot_surface_mesh_or_strain(fig, ax, mesh, modal, include_mesh_inset=False)
+    _save_figure(fig, sample_output_dir / "top_surface_equivalent_strain.png", dpi=320)
+
+    fig, ax = plt.subplots(figsize=(4.8, 3.6))
+    stats = _plot_stats(ax, sample_id, dataset_row, mesh, response, modal, strain_max=strain_max)
+    _save_figure(fig, sample_output_dir / "run_summary.svg", dpi=220)
+
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+    points, triangles = _extract_top_surface_mesh(mesh)
+    _plot_mesh_detail(ax, points, triangles, title="Mesh Detail", show_ticks=True)
+    _save_figure(fig, sample_output_dir / "mesh_detail.svg", dpi=220)
     return stats
 
 
@@ -350,7 +413,7 @@ def _build_gallery(image_paths: list[Path], output_path: Path) -> None:
         img = plt.imread(path)
         ax.imshow(img)
         ax.axis("off")
-        ax.set_title(path.stem)
+        ax.set_title(path.parent.name)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
@@ -361,11 +424,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create human-readable figures for geometry, mesh/strain, and FEM outputs.",
     )
-    parser.add_argument("--dataset", default="data/dataset_100.npz", help="Source unit-cell dataset.")
+    parser.add_argument("--dataset", default="data/unit_cell_dataset.npz", help="Source unit-cell dataset.")
     parser.add_argument("--mesh-dir", default="meshes/volumes", help="Directory with plate3d_*_fenicsx.npz meshes.")
     parser.add_argument("--response-dir", default="data/fem_responses", help="Directory with sample response files.")
     parser.add_argument("--modal-dir", default="data/modal_data", help="Directory with modal diagnostics.")
-    parser.add_argument("--output-dir", default="reports/run_outputs", help="Directory for PNG reports.")
+    parser.add_argument("--output-dir", default="reports/run_outputs", help="Directory for sample report folders.")
     parser.add_argument("--sample-ids", default="", help="Comma-separated sample ids. Empty means infer from response files.")
     parser.add_argument("--limit", type=int, default=None, help="Only visualize the first N inferred samples.")
     args = parser.parse_args()
@@ -375,6 +438,8 @@ def main() -> None:
     response_dir = Path(args.response_dir)
     modal_dir = Path(args.modal_dir)
     output_dir = Path(args.output_dir)
+    for legacy_path in output_dir.glob("sample_*_summary.png"):
+        legacy_path.unlink(missing_ok=True)
 
     if args.sample_ids.strip():
         sample_ids = [int(item.strip()) for item in args.sample_ids.split(",") if item.strip()]
@@ -396,13 +461,28 @@ def main() -> None:
         if not response_npz.exists():
             raise FileNotFoundError(f"Response file not found: {response_npz}")
 
-        output_path = output_dir / f"sample_{sample_id:04d}_summary.png"
+        dataset_row = _load_dataset_row(dataset_path, sample_id)
+        mesh = _load_mesh(mesh_npz)
+        response = _load_response(response_npz)
+        modal = _load_modal(modal_npz if modal_npz.exists() else None)
+
+        sample_output_dir = output_dir / f"sample_{sample_id:04d}"
+        row = _save_individual_plots(
+            sample_id=sample_id,
+            dataset_row=dataset_row,
+            mesh=mesh,
+            response=response,
+            modal=modal,
+            sample_output_dir=sample_output_dir,
+        )
+
+        output_path = sample_output_dir / "summary.png"
         row = _plot_sample_summary(
             sample_id=sample_id,
-            dataset_path=dataset_path,
-            mesh_npz_path=mesh_npz,
-            response_path=response_npz,
-            modal_path=modal_npz if modal_npz.exists() else None,
+            dataset_row=dataset_row,
+            mesh=mesh,
+            response=response,
+            modal=modal,
             output_path=output_path,
         )
         rows.append(row)

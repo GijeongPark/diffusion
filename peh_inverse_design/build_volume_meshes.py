@@ -11,6 +11,7 @@ if __package__ in (None, ""):
     from peh_inverse_design.geometry_pipeline import GeometryBuildConfig
     from peh_inverse_design.volume_mesh import (
         VolumeMeshConfig,
+        convert_volume_msh_to_ansys_input,
         convert_volume_msh_to_fenicsx_npz,
         convert_volume_msh_to_xdmf,
         mesh_tiled_plate_volume_sample,
@@ -19,6 +20,7 @@ else:
     from .geometry_pipeline import GeometryBuildConfig
     from .volume_mesh import (
         VolumeMeshConfig,
+        convert_volume_msh_to_ansys_input,
         convert_volume_msh_to_fenicsx_npz,
         convert_volume_msh_to_xdmf,
         mesh_tiled_plate_volume_sample,
@@ -27,7 +29,7 @@ else:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build 3D layered substrate+piezo meshes for FEniCSx.",
+        description="Build 3D layered substrate+piezo meshes for FEniCSx and ANSYS External Model import.",
     )
     parser.add_argument(
         "--unit-cell-npz",
@@ -37,7 +39,7 @@ def main() -> None:
     parser.add_argument(
         "--mesh-dir",
         default="meshes/volumes",
-        help="Output directory for 3D .msh files.",
+        help="Output directory for 3D .msh/.xdmf/.npz/.inp files.",
     )
     parser.add_argument(
         "--limit",
@@ -92,11 +94,12 @@ def main() -> None:
             fail += 1
         else:
             convert_volume_msh_to_xdmf(path)
+            convert_volume_msh_to_ansys_input(path)
             convert_volume_msh_to_fenicsx_npz(path)
             ok += 1
         print(f"[{idx + 1:4d}/{n_samples}] ok={ok} fail={fail}")
 
-    print(f"Saved {ok} 3D meshes to {mesh_dir}")
+    print(f"Saved {ok} 3D meshes and ANSYS-compatible .inp exports to {mesh_dir}")
 
 
 if __name__ == "__main__":

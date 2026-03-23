@@ -36,6 +36,7 @@ The repository now includes a reusable Python package, [peh_inverse_design](/hom
 
 - building `data/geometry_dataset.npz` from the unit-cell notebook output
 - generating `10 x 10` tiled full-plate meshes for FEM
+- exporting ANSYS Mechanical-compatible `plate3d_*_ansys.inp` files for External Model import
 - aggregating per-sample FEM outputs into `data/response_dataset.npz`
 - collecting everything into one `integrated_dataset.npz`
 
@@ -85,6 +86,13 @@ Build 3D layered substrate+piezo meshes for the FEniCSx solver:
   --unit-cell-npz data/dataset_100.npz \
   --mesh-dir meshes/volumes
 ```
+
+This writes one set of files per sample under `meshes/volumes/`, including:
+
+- `plate3d_XXXX.msh` for the native gmsh mesh
+- `plate3d_XXXX.xdmf` and `plate3d_XXXX_facets.xdmf` for FEniCSx-style inspection
+- `plate3d_XXXX_fenicsx.npz` for the in-house solver
+- `plate3d_XXXX_ansys.inp` for ANSYS Mechanical External Model import
 
 Run the FEniCSx modal-reduction solver in the official Docker image:
 

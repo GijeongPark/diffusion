@@ -27,6 +27,21 @@ from .mesh_tags import (
     VOLUME_SUBSTRATE_TAG,
 )
 
+_VOLUME_PHYSICAL_NAMES = {
+    VOLUME_SUBSTRATE_TAG: "substrate",
+    VOLUME_PIEZO_TAG: "piezo",
+}
+
+_FACET_PHYSICAL_NAMES = {
+    FACET_CLAMPED_TAG: "clamped",
+    FACET_FREE_X_MAX_TAG: "free_x_max",
+    FACET_FREE_Y_MIN_TAG: "free_y_min",
+    FACET_FREE_Y_MAX_TAG: "free_y_max",
+    FACET_TOP_ELECTRODE_TAG: "top_electrode",
+    FACET_BOTTOM_ELECTRODE_TAG: "bottom_electrode",
+    FACET_BOTTOM_PLATE_TAG: "bottom_plate",
+}
+
 
 @dataclass(frozen=True)
 class VolumeMeshConfig:
@@ -293,6 +308,37 @@ def _stack_cell_blocks(mesh: meshio.Mesh, cell_type: str, data_name: str) -> tup
     return np.vstack(cell_blocks), np.concatenate(data_blocks)
 
 
+def _build_ansys_external_model_mesh(mesh: meshio.Mesh) -> meshio.Mesh | None:
+    tetra = _stack_cell_blocks(mesh, "tetra", "gmsh:physical")
+    if tetra is None:
+        return None
+
+    tetra_cells, tetra_tags = tetra
+    triangles = _stack_cell_blocks(mesh, "triangle", "gmsh:physical")
+
+    cell_sets: dict[str, list[np.ndarray]] = {}
+    for tag, name in _VOLUME_PHYSICAL_NAMES.items():
+        indices = np.flatnonzero(tetra_tags == tag).astype(np.int64)
+        if indices.size > 0:
+            cell_sets[name] = [indices]
+
+    point_sets: dict[str, np.ndarray] = {}
+    if triangles is not None:
+        tri_cells, tri_tags = triangles
+        for tag, name in _FACET_PHYSICAL_NAMES.items():
+            tagged_triangles = tri_cells[tri_tags == tag]
+            if tagged_triangles.size == 0:
+                continue
+            point_sets[name] = np.unique(tagged_triangles.reshape(-1)).astype(np.int64)
+
+    return meshio.Mesh(
+        points=np.asarray(mesh.points, dtype=np.float64),
+        cells=[("tetra", np.asarray(tetra_cells, dtype=np.int64))],
+        cell_sets=cell_sets,
+        point_sets=point_sets,
+    )
+
+
 def convert_volume_msh_to_xdmf(msh_path: str | Path) -> tuple[Path | None, Path | None]:
     msh_path = Path(msh_path)
     try:
@@ -324,6 +370,25 @@ def convert_volume_msh_to_xdmf(msh_path: str | Path) -> tuple[Path | None, Path 
     meshio.write(volume_xdmf, volume_mesh)
     meshio.write(facet_xdmf, facet_mesh)
     return volume_xdmf, facet_xdmf
+
+
+def convert_volume_msh_to_ansys_input(msh_path: str | Path) -> Path | None:
+    msh_path = Path(msh_path)
+    try:
+        mesh = meshio.read(msh_path)
+    except Exception:
+        return None
+
+    ansys_mesh = _build_ansys_external_model_mesh(mesh)
+    if ansys_mesh is None:
+        return None
+
+    inp_path = msh_path.with_name(f"{msh_path.stem}_ansys.inp")
+    try:
+        meshio.write(inp_path, ansys_mesh, file_format="abaqus")
+    except Exception:
+        return None
+    return inp_path
 
 
 def convert_volume_msh_to_fenicsx_npz(msh_path: str | Path) -> Path | None:

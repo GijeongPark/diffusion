@@ -247,6 +247,7 @@ MPLCONFIGDIR=/tmp/mpl $VENV_PYTHON peh_inverse_design/visualize_run_outputs.py \
 echo ""
 echo "===== 완료! ====="
 echo "  기하 데이터:  $MESH_DIR/"
+echo "  ANSYS 입력:   ${MESH_DIR}/plate3d_*_ansys.inp"
 echo "  FEM 응답:     $RESPONSE_DIR/"
 echo "  모달 데이터:  $MODES_DIR/"
 echo "  최종 데이터셋: $RESPONSE_OUTPUT"

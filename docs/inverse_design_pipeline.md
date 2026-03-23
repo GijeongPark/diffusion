@@ -234,6 +234,7 @@ The current FEniCSx implementation in this repository uses a 3D layered mesh and
 Current implementation note:
 
 - the solver currently assumes `piezo density = 7800 kg/m^3` unless overridden at runtime
+- the mesh builder can also emit `plate3d_*_ansys.inp` files so the same repeated geometry can be checked in ANSYS Mechanical via External Model import
 
 ## 6. Recommended ML Pipeline
 

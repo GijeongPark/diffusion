@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import re
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,9 +14,21 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from peh_inverse_design.problem_spec import (
+        build_mechanical_config_kwargs,
+        build_piezo_config_kwargs,
+        default_problem_spec_path,
+        load_problem_spec,
+    )
     from peh_inverse_design.response_dataset import save_fem_response
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from .problem_spec import (
+        build_mechanical_config_kwargs,
+        build_piezo_config_kwargs,
+        default_problem_spec_path,
+        load_problem_spec,
+    )
     from .response_dataset import save_fem_response
 
 
@@ -58,38 +72,52 @@ def _extract_sample_id(mesh_path: Path) -> int:
     return int(matches[-1])
 
 
-def _build_component_point_maps(V, raw_points: np.ndarray):
-    raw_points = np.asarray(raw_points, dtype=np.float64)
-    point_lookup = {
-        tuple(np.round(point, 9)): idx
-        for idx, point in enumerate(raw_points)
-    }
-    component_maps: list[tuple[np.ndarray, np.ndarray]] = []
-    for comp in range(3):
-        Vc, parent_dofs = V.sub(comp).collapse()
-        coords = np.asarray(Vc.tabulate_dof_coordinates(), dtype=np.float64).reshape(-1, 3)
-        point_ids = np.empty(coords.shape[0], dtype=np.int64)
-        for idx, coord in enumerate(coords):
-            key = tuple(np.round(coord, 9))
-            raw_idx = point_lookup.get(key)
-            if raw_idx is None:
-                dist2 = np.sum((raw_points - coord) ** 2, axis=1)
-                raw_idx = int(np.argmin(dist2))
-                if dist2[raw_idx] > 1.0e-16:
-                    raise KeyError(f"Could not match dof coordinate {coord} to raw mesh points.")
-            point_ids[idx] = raw_idx
-        component_maps.append((np.asarray(parent_dofs, dtype=np.int64), point_ids))
-    return component_maps
+def _build_top_surface_point_cell_map(
+    raw_points: np.ndarray,
+    raw_tetra_cells: np.ndarray,
+    raw_triangle_cells: np.ndarray,
+    raw_triangle_tags: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    point_cells = np.full(raw_points.shape[0], -1, dtype=np.int32)
+    top_triangles = np.asarray(raw_triangle_cells[raw_triangle_tags == FACET_TOP_ELECTRODE_TAG], dtype=np.int64)
+    if raw_points.size == 0 or raw_tetra_cells.size == 0 or top_triangles.size == 0:
+        return np.zeros((0,), dtype=np.int64), point_cells
+
+    top_point_ids = np.unique(top_triangles.reshape(-1))
+    remaining = np.zeros(raw_points.shape[0], dtype=bool)
+    remaining[top_point_ids] = True
+    unassigned = int(top_point_ids.size)
+
+    for cell_idx, tetra in enumerate(np.asarray(raw_tetra_cells, dtype=np.int64)):
+        active = remaining[tetra] & (point_cells[tetra] < 0)
+        if not np.any(active):
+            continue
+        matched = tetra[active]
+        point_cells[matched] = cell_idx
+        remaining[matched] = False
+        unassigned -= matched.size
+        if unassigned == 0:
+            break
+
+    if unassigned > 0:
+        missing_point_id = int(top_point_ids[point_cells[top_point_ids] < 0][0])
+        raise KeyError(f"Could not match top-surface point {raw_points[missing_point_id]} to any tetra cell.")
+    return top_point_ids, point_cells
 
 
 def _mode_to_nodal_displacement(
-    mode_values: np.ndarray,
-    component_maps: list[tuple[np.ndarray, np.ndarray]],
-    n_points: int,
+    mode,
+    raw_points: np.ndarray,
+    top_point_ids: np.ndarray,
+    top_point_cells: np.ndarray,
 ) -> np.ndarray:
-    nodal = np.zeros((n_points, 3), dtype=np.float64)
-    for comp, (parent_dofs, point_ids) in enumerate(component_maps):
-        nodal[point_ids, comp] = mode_values[parent_dofs]
+    nodal = np.zeros((raw_points.shape[0], 3), dtype=np.float64)
+    if top_point_ids.size == 0:
+        return nodal
+    nodal[top_point_ids] = np.asarray(
+        mode.eval(raw_points[top_point_ids], top_point_cells[top_point_ids]),
+        dtype=np.float64,
+    )
     return nodal
 
 
@@ -170,11 +198,22 @@ def _isotropic_stiffness_matrix(E: float, nu: float) -> np.ndarray:
     return C
 
 
+def _destroy_petsc_object(obj) -> None:
+    destroy = getattr(obj, "destroy", None)
+    if callable(destroy):
+        try:
+            destroy()
+        except Exception:
+            pass
+
+
 def _assemble_modal_model(
     mesh_path: Path,
     num_modes: int,
     mechanical: MechanicalConfig,
     piezo: PiezoConfig,
+    element_order: int = 1,
+    store_mode_shapes: bool = False,
 ) -> dict[str, np.ndarray]:
     MPI, PETSc, SLEPc, fem, fem_petsc, io, io_gmsh, ufl = _load_fenicsx()
     import basix.ufl  # type: ignore
@@ -206,11 +245,33 @@ def _assemble_modal_model(
     else:
         mesh, cell_tags, _ = io_gmsh.read_from_msh(str(mesh_path), comm, 0, gdim=3)
     gdim = mesh.geometry.dim
-    V = fem.functionspace(mesh, ("Lagrange", 1, (gdim,)))
-    component_maps = _build_component_point_maps(V, raw_points) if raw_points.size else []
+    x_coords = np.asarray(mesh.geometry.x, dtype=np.float64)
+    V = fem.functionspace(mesh, ("Lagrange", int(element_order), (gdim,)))
+    store_surface_mode_shapes = (
+        bool(store_mode_shapes)
+        and raw_points.size > 0
+        and raw_tetra_cells.size > 0
+        and raw_triangle_cells.size > 0
+    )
+    top_surface_point_ids = np.zeros((0,), dtype=np.int64)
+    top_surface_point_cells = np.full(raw_points.shape[0], -1, dtype=np.int32)
+    if store_surface_mode_shapes:
+        top_surface_point_ids, top_surface_point_cells = _build_top_surface_point_cell_map(
+            raw_points=raw_points,
+            raw_tetra_cells=raw_tetra_cells,
+            raw_triangle_cells=raw_triangle_cells,
+            raw_triangle_tags=raw_triangle_tags,
+        )
+    plate_dimensions_m = np.asarray(
+        [
+            float(np.max(x_coords[:, 0]) - np.min(x_coords[:, 0])),
+            float(np.max(x_coords[:, 1]) - np.min(x_coords[:, 1])),
+        ],
+        dtype=np.float64,
+    )
+    total_thickness_m = float(np.max(x_coords[:, 2]) - np.min(x_coords[:, 2]))
 
     fdim = mesh.topology.dim - 1
-    x_coords = np.asarray(mesh.geometry.x, dtype=np.float64)
     x_tol = max(1.0e-9, float(np.max(x_coords[:, 0])) * 1.0e-8)
     clamped_facets = dmesh.locate_entities_boundary(
         mesh,
@@ -258,100 +319,368 @@ def _assemble_modal_model(
         + rho_pz * ufl.dot(u, v) * dx(VOLUME_PIEZO_TAG)
     )
 
-    K = fem_petsc.assemble_matrix(a_form, bcs=bcs, diag=1.0)
-    M = fem_petsc.assemble_matrix(m_form, bcs=bcs, diag=0.0)
-    K.assemble()
-    M.assemble()
+    K = None
+    M = None
+    eps_solver = None
+    vr = None
+    vi = None
+    try:
+        K = fem_petsc.assemble_matrix(a_form, bcs=bcs, diag=1.0)
+        M = fem_petsc.assemble_matrix(m_form, bcs=bcs, diag=0.0)
+        K.assemble()
+        M.assemble()
 
-    eps_solver = SLEPc.EPS().create(comm)
-    eps_solver.setOperators(K, M)
-    eps_solver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-    eps_solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-    eps_solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-    eps_solver.setTarget(0.0)
-    eps_solver.setDimensions(num_modes)
-    st = eps_solver.getST()
-    st.setType(SLEPc.ST.Type.SINVERT)
-    eps_solver.setFromOptions()
-    eps_solver.solve()
+        eps_solver = SLEPc.EPS().create(comm)
+        eps_solver.setOperators(K, M)
+        eps_solver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
+        eps_solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+        eps_solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
+        eps_solver.setTarget(0.0)
+        eps_solver.setDimensions(num_modes)
+        st = eps_solver.getST()
+        st.setType(SLEPc.ST.Type.SINVERT)
+        ksp = st.getKSP()
+        ksp.setType(PETSc.KSP.Type.PREONLY)
+        pc = ksp.getPC()
+        pc.setType(PETSc.PC.Type.LU)
+        pc.setFactorSolverType("mumps")
+        eps_solver.setFromOptions()
+        eps_solver.solve()
 
-    nconv = eps_solver.getConverged()
-    if nconv <= 0:
-        raise RuntimeError("SLEPc did not converge any eigenpairs.")
+        nconv = eps_solver.getConverged()
+        if nconv <= 0:
+            raise RuntimeError("SLEPc did not converge any eigenpairs.")
 
-    e_col3 = np.asarray(piezo.e_matrix_c_per_m2, dtype=np.float64)[:, 2]
-    e_col3_constant = ufl.as_vector(np.asarray(e_col3, dtype=np.float64).tolist())
-    one = PETSc.ScalarType(1.0)
+        e_col3 = np.asarray(piezo.e_matrix_c_per_m2, dtype=np.float64)[:, 2]
+        e_col3_constant = ufl.as_vector(np.asarray(e_col3, dtype=np.float64).tolist())
+        one = PETSc.ScalarType(1.0)
 
-    piezo_volume_local = fem.assemble_scalar(fem.form(one * dx(VOLUME_PIEZO_TAG)))
-    piezo_volume = comm.allreduce(piezo_volume_local, op=MPI.SUM)
-    capacitance = piezo.eps33s_f_per_m * piezo_volume / (piezo.thickness_m ** 2)
+        piezo_volume_local = fem.assemble_scalar(fem.form(one * dx(VOLUME_PIEZO_TAG)))
+        piezo_volume = comm.allreduce(piezo_volume_local, op=MPI.SUM)
+        substrate_volume_local = fem.assemble_scalar(fem.form(one * dx(VOLUME_SUBSTRATE_TAG)))
+        substrate_volume = comm.allreduce(substrate_volume_local, op=MPI.SUM)
+        capacitance = piezo.eps33s_f_per_m * piezo_volume / (piezo.thickness_m ** 2)
 
-    eigenfreq_hz: list[float] = []
-    modal_force: list[float] = []
-    modal_theta: list[float] = []
-    modal_mass: list[float] = []
-    mode_nodal_displacements: list[np.ndarray] = []
+        eigenfreq_hz: list[float] = []
+        modal_force: list[float] = []
+        modal_theta: list[float] = []
+        modal_mass: list[float] = []
+        mode_nodal_displacements: list[np.ndarray] = []
 
-    vr, _ = K.getVecs()
-    vi, _ = K.getVecs()
-    for mode_idx in range(min(nconv, num_modes)):
-        eigval = eps_solver.getEigenpair(mode_idx, vr, vi)
-        if eigval <= 0.0:
-            continue
-        mode = fem.Function(V)
-        mode.x.array[:] = vr.array_r
+        vr, _ = K.getVecs()
+        vi, _ = K.getVecs()
+        for mode_idx in range(min(nconv, num_modes)):
+            eigval = eps_solver.getEigenpair(mode_idx, vr, vi)
+            if eigval <= 0.0:
+                continue
+            mode = fem.Function(V)
+            mode.x.array[:] = vr.array_r
 
-        mass_local = fem.assemble_scalar(
-            fem.form(
-                rho_sub * ufl.dot(mode, mode) * dx(VOLUME_SUBSTRATE_TAG)
-                + rho_pz * ufl.dot(mode, mode) * dx(VOLUME_PIEZO_TAG)
+            mass_local = fem.assemble_scalar(
+                fem.form(
+                    rho_sub * ufl.dot(mode, mode) * dx(VOLUME_SUBSTRATE_TAG)
+                    + rho_pz * ufl.dot(mode, mode) * dx(VOLUME_PIEZO_TAG)
+                )
             )
-        )
-        mass_value = comm.allreduce(mass_local, op=MPI.SUM)
-        if mass_value <= 0.0:
-            continue
-        scale = 1.0 / math.sqrt(mass_value)
-        mode.x.array[:] *= scale
+            mass_value = comm.allreduce(mass_local, op=MPI.SUM)
+            if mass_value <= 0.0:
+                continue
+            scale = 1.0 / math.sqrt(mass_value)
+            mode.x.array[:] *= scale
 
-        gamma_local = fem.assemble_scalar(
-            fem.form(
-                rho_sub * mode[2] * dx(VOLUME_SUBSTRATE_TAG)
-                + rho_pz * mode[2] * dx(VOLUME_PIEZO_TAG)
+            gamma_local = fem.assemble_scalar(
+                fem.form(
+                    rho_sub * mode[2] * dx(VOLUME_SUBSTRATE_TAG)
+                    + rho_pz * mode[2] * dx(VOLUME_PIEZO_TAG)
+                )
             )
-        )
-        gamma_value = comm.allreduce(gamma_local, op=MPI.SUM)
+            gamma_value = comm.allreduce(gamma_local, op=MPI.SUM)
 
-        theta_local = fem.assemble_scalar(
-            fem.form(ufl.dot(e_col3_constant, strain_voigt(mode)) * dx(VOLUME_PIEZO_TAG))
-        )
-        theta_value = comm.allreduce(theta_local, op=MPI.SUM) / piezo.thickness_m
-
-        eigenfreq_hz.append(math.sqrt(float(eigval)) / (2.0 * math.pi))
-        modal_force.append(-gamma_value * mechanical.base_acceleration_m_per_s2)
-        modal_theta.append(theta_value)
-        modal_mass.append(1.0)
-        if component_maps:
-            mode_nodal_displacements.append(
-                _mode_to_nodal_displacement(mode.x.array, component_maps, raw_points.shape[0])
+            theta_local = fem.assemble_scalar(
+                fem.form(ufl.dot(e_col3_constant, strain_voigt(mode)) * dx(VOLUME_PIEZO_TAG))
             )
+            theta_value = comm.allreduce(theta_local, op=MPI.SUM) / piezo.thickness_m
 
-    if not eigenfreq_hz:
-        raise RuntimeError("No positive eigenfrequencies were extracted from the mesh.")
+            eigenfreq_hz.append(math.sqrt(float(eigval)) / (2.0 * math.pi))
+            modal_force.append(-gamma_value * mechanical.base_acceleration_m_per_s2)
+            modal_theta.append(theta_value)
+            modal_mass.append(1.0)
+            if top_surface_point_ids.size > 0:
+                mode_nodal_displacements.append(
+                    _mode_to_nodal_displacement(mode, raw_points, top_surface_point_ids, top_surface_point_cells)
+                )
 
-    return {
-        "eigenfreq_hz": np.asarray(eigenfreq_hz, dtype=np.float64),
-        "modal_force": np.asarray(modal_force, dtype=np.float64),
-        "modal_theta": np.asarray(modal_theta, dtype=np.float64),
-        "modal_mass": np.asarray(modal_mass, dtype=np.float64),
-        "capacitance_f": np.asarray([capacitance], dtype=np.float64),
-        "mode_nodal_displacements": np.asarray(mode_nodal_displacements, dtype=np.float64),
-        "raw_points": np.asarray(raw_points, dtype=np.float64),
-        "raw_tetra_cells": np.asarray(raw_tetra_cells, dtype=np.int64),
-        "raw_tetra_tags": np.asarray(raw_tetra_tags, dtype=np.int32),
-        "raw_triangle_cells": np.asarray(raw_triangle_cells, dtype=np.int32),
-        "raw_triangle_tags": np.asarray(raw_triangle_tags, dtype=np.int32),
-    }
+        if not eigenfreq_hz:
+            raise RuntimeError("No positive eigenfrequencies were extracted from the mesh.")
+
+        return {
+            "element_order": np.asarray([int(element_order)], dtype=np.int32),
+            "eigenfreq_hz": np.asarray(eigenfreq_hz, dtype=np.float64),
+            "modal_force": np.asarray(modal_force, dtype=np.float64),
+            "modal_theta": np.asarray(modal_theta, dtype=np.float64),
+            "modal_mass": np.asarray(modal_mass, dtype=np.float64),
+            "capacitance_f": np.asarray([capacitance], dtype=np.float64),
+            "mode_nodal_displacements": np.asarray(mode_nodal_displacements, dtype=np.float64),
+            "raw_points": np.asarray(raw_points, dtype=np.float64),
+            "raw_tetra_cells": np.asarray(raw_tetra_cells, dtype=np.int64),
+            "raw_tetra_tags": np.asarray(raw_tetra_tags, dtype=np.int32),
+            "raw_triangle_cells": np.asarray(raw_triangle_cells, dtype=np.int32),
+            "raw_triangle_tags": np.asarray(raw_triangle_tags, dtype=np.int32),
+            "plate_dimensions_m": plate_dimensions_m,
+            "total_thickness_m": np.asarray([total_thickness_m], dtype=np.float64),
+            "substrate_volume_m3": np.asarray([substrate_volume], dtype=np.float64),
+            "piezo_volume_m3": np.asarray([piezo_volume], dtype=np.float64),
+        }
+    finally:
+        _destroy_petsc_object(vi)
+        _destroy_petsc_object(vr)
+        _destroy_petsc_object(eps_solver)
+        _destroy_petsc_object(M)
+        _destroy_petsc_object(K)
+        garbage_cleanup = getattr(PETSc, "garbage_cleanup", None)
+        if callable(garbage_cleanup):
+            try:
+                garbage_cleanup(comm=comm)
+            except TypeError:
+                garbage_cleanup()
+
+
+def _build_peak_search_grid(
+    f1_hz: float,
+    lower_factor: float,
+    upper_factor: float,
+    search_points: int,
+) -> np.ndarray:
+    f_min = max(1.0e-9, float(lower_factor) * float(f1_hz))
+    f_max = float(upper_factor) * float(f1_hz)
+    f_max = max(f_max, 1.05 * float(f1_hz))
+    if f_max <= f_min:
+        f_max = max(1.10 * float(f1_hz), 1.05 * f_min)
+    return np.linspace(f_min, f_max, int(search_points), dtype=np.float64)
+
+
+def _search_peak_with_adaptive_window(
+    modal_model: dict[str, np.ndarray],
+    damping_ratio: float,
+    resistance_ohm: float,
+    search_scale: tuple[float, float],
+    search_points: int,
+    max_expansions: int = 12,
+) -> tuple[np.ndarray, np.ndarray, int, bool]:
+    freq_n = np.sort(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1))
+    if freq_n.size == 0:
+        raise ValueError("modal_model does not contain any eigenfrequencies.")
+    f1_hz = float(freq_n[0])
+    lower_factor = float(search_scale[0])
+    upper_factor = float(search_scale[1])
+
+    search_freq = _build_peak_search_grid(
+        f1_hz=f1_hz,
+        lower_factor=lower_factor,
+        upper_factor=upper_factor,
+        search_points=search_points,
+    )
+    search_voltage = _evaluate_voltage_frf(
+        frequencies_hz=search_freq,
+        modal_model=modal_model,
+        damping_ratio=damping_ratio,
+        resistance_ohm=resistance_ohm,
+    )
+    peak_index = int(np.argmax(np.abs(search_voltage)))
+    expansions = 0
+    while (peak_index == 0 or peak_index == search_freq.shape[0] - 1) and expansions < int(max_expansions):
+        if peak_index == 0:
+            lower_factor = max(1.0e-6, 0.5 * lower_factor)
+        else:
+            upper_factor *= 2.0
+        search_freq = _build_peak_search_grid(
+            f1_hz=f1_hz,
+            lower_factor=lower_factor,
+            upper_factor=upper_factor,
+            search_points=search_points,
+        )
+        search_voltage = _evaluate_voltage_frf(
+            frequencies_hz=search_freq,
+            modal_model=modal_model,
+            damping_ratio=damping_ratio,
+            resistance_ohm=resistance_ohm,
+        )
+        peak_index = int(np.argmax(np.abs(search_voltage)))
+        expansions += 1
+
+    boundary_hit = peak_index == 0 or peak_index == search_freq.shape[0] - 1
+    return search_freq, search_voltage, peak_index, boundary_hit
+
+
+def _refine_peak_frequency(
+    search_freq_hz: np.ndarray,
+    search_voltage: np.ndarray,
+    modal_model: dict[str, np.ndarray],
+    damping_ratio: float,
+    resistance_ohm: float,
+    refinement_points: int = 401,
+    refinement_passes: int = 2,
+) -> float:
+    refined_freq = np.asarray(search_freq_hz, dtype=np.float64)
+    refined_voltage = np.asarray(search_voltage, dtype=np.complex128)
+    peak_index = int(np.argmax(np.abs(refined_voltage)))
+    for _ in range(int(refinement_passes)):
+        if peak_index == 0 or peak_index == refined_freq.shape[0] - 1:
+            break
+        lower_hz = float(refined_freq[peak_index - 1])
+        upper_hz = float(refined_freq[peak_index + 1])
+        if upper_hz <= lower_hz:
+            break
+        refined_freq = np.linspace(lower_hz, upper_hz, int(refinement_points), dtype=np.float64)
+        refined_voltage = _evaluate_voltage_frf(
+            frequencies_hz=refined_freq,
+            modal_model=modal_model,
+            damping_ratio=damping_ratio,
+            resistance_ohm=resistance_ohm,
+        )
+        peak_index = int(np.argmax(np.abs(refined_voltage)))
+    return float(refined_freq[peak_index])
+
+
+def _inject_exact_frequency(freq_hz: np.ndarray, target_hz: float) -> np.ndarray:
+    freq_hz = np.asarray(freq_hz, dtype=np.float64).copy()
+    if freq_hz.ndim != 1 or freq_hz.size == 0:
+        raise ValueError("freq_hz must be a non-empty 1-D array.")
+    closest_idx = int(np.argmin(np.abs(freq_hz - float(target_hz))))
+    freq_hz[closest_idx] = float(target_hz)
+    return freq_hz
+
+
+def _simple_cantilever_frequency_estimate_hz(
+    modal_model: dict[str, np.ndarray],
+    mechanical: MechanicalConfig,
+    piezo: PiezoConfig,
+) -> float:
+    plate_dimensions = np.asarray(modal_model.get("plate_dimensions_m", []), dtype=np.float64).reshape(-1)
+    if plate_dimensions.size < 2:
+        return float("nan")
+    length_m = float(plate_dimensions[0])
+    width_m = float(plate_dimensions[1])
+    if length_m <= 0.0 or width_m <= 0.0:
+        return float("nan")
+
+    total_thickness_m = float(np.asarray(modal_model.get("total_thickness_m", [np.nan]), dtype=np.float64)[0])
+    substrate_thickness_m = total_thickness_m - float(piezo.thickness_m)
+    substrate_volume = float(np.asarray(modal_model.get("substrate_volume_m3", [np.nan]), dtype=np.float64)[0])
+    planform_area = length_m * width_m
+    if planform_area <= 0.0 or piezo.thickness_m <= 0.0 or substrate_thickness_m <= 0.0:
+        return float("nan")
+
+    substrate_fill_fraction = substrate_volume / (planform_area * substrate_thickness_m)
+    substrate_fill_fraction = float(np.clip(substrate_fill_fraction, 1.0e-6, 1.0))
+
+    piezo_ex = float(np.asarray(piezo.stiffness_cE_pa, dtype=np.float64)[0, 0])
+    beta1 = 1.875104068711961
+    unit_width = 1.0
+
+    area_sub = substrate_fill_fraction * unit_width * substrate_thickness_m
+    area_pz = unit_width * piezo.thickness_m
+    if area_sub <= 0.0 or area_pz <= 0.0:
+        return float("nan")
+
+    z_sub = 0.5 * substrate_thickness_m
+    z_pz = substrate_thickness_m + 0.5 * piezo.thickness_m
+    neutral_axis = (
+        mechanical.substrate_E_pa * area_sub * z_sub
+        + piezo_ex * area_pz * z_pz
+    ) / (
+        mechanical.substrate_E_pa * area_sub
+        + piezo_ex * area_pz
+    )
+
+    inertia_sub = substrate_fill_fraction * unit_width * substrate_thickness_m ** 3 / 12.0
+    inertia_pz = unit_width * piezo.thickness_m ** 3 / 12.0
+    bending_rigidity = (
+        mechanical.substrate_E_pa * (inertia_sub + area_sub * (z_sub - neutral_axis) ** 2)
+        + piezo_ex * (inertia_pz + area_pz * (z_pz - neutral_axis) ** 2)
+    )
+    mass_per_length = mechanical.substrate_rho * area_sub + mechanical.piezo_rho * area_pz
+    if bending_rigidity <= 0.0 or mass_per_length <= 0.0:
+        return float("nan")
+
+    omega_1 = (beta1 ** 2) * math.sqrt(bending_rigidity / (mass_per_length * length_m ** 4))
+    return omega_1 / (2.0 * math.pi)
+
+
+def _log_modal_diagnostics(
+    modal_model: dict[str, np.ndarray],
+) -> None:
+    plate_dimensions = np.asarray(modal_model.get("plate_dimensions_m", []), dtype=np.float64).reshape(-1)
+    total_thickness_m = float(np.asarray(modal_model.get("total_thickness_m", [np.nan]), dtype=np.float64)[0])
+    substrate_volume = float(np.asarray(modal_model.get("substrate_volume_m3", [np.nan]), dtype=np.float64)[0])
+    piezo_volume = float(np.asarray(modal_model.get("piezo_volume_m3", [np.nan]), dtype=np.float64)[0])
+    capacitance = float(np.asarray(modal_model.get("capacitance_f", [np.nan]), dtype=np.float64)[0])
+    eigenfreq_hz = np.asarray(modal_model.get("eigenfreq_hz", []), dtype=np.float64).reshape(-1)
+    modal_theta = np.asarray(modal_model.get("modal_theta", []), dtype=np.float64).reshape(-1)
+    print(
+        "Modal diagnostics: "
+        f"plate=({plate_dimensions[0]:.6g}, {plate_dimensions[1]:.6g}) m, "
+        f"thickness={total_thickness_m:.6g} m, "
+        f"substrate_volume={substrate_volume:.6g} m^3, "
+        f"piezo_volume={piezo_volume:.6g} m^3, "
+        f"capacitance={capacitance:.6g} F"
+    )
+    print(
+        "Modal diagnostics: "
+        f"eigenfreq_hz[:6]={np.array2string(eigenfreq_hz[:6], precision=6, separator=', ')}, "
+        f"modal_theta[:6]={np.array2string(modal_theta[:6], precision=6, separator=', ')}"
+    )
+
+
+def _warn_if_frequency_scale_is_suspicious(
+    modal_model: dict[str, np.ndarray],
+    mechanical: MechanicalConfig,
+    piezo: PiezoConfig,
+) -> None:
+    f1_hz = float(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1)[0])
+    estimate_hz = _simple_cantilever_frequency_estimate_hz(
+        modal_model=modal_model,
+        mechanical=mechanical,
+        piezo=piezo,
+    )
+    if not np.isfinite(estimate_hz) or estimate_hz <= 0.0:
+        return
+    ratio = f1_hz / estimate_hz
+    if ratio < 0.1 or ratio > 10.0:
+        dimensions = np.asarray(modal_model.get("plate_dimensions_m", []), dtype=np.float64).reshape(-1)
+        warnings.warn(
+            "Fundamental frequency sanity check failed: "
+            f"f1={f1_hz:.6g} Hz, simple cantilever estimate={estimate_hz:.6g} Hz, "
+            f"ratio={ratio:.3e}, plate=({dimensions[0]:.6g}, {dimensions[1]:.6g}) m.",
+            stacklevel=2,
+        )
+
+
+def _warn_if_open_circuit_resonance_is_inverted(
+    search_freq_hz: np.ndarray,
+    modal_model: dict[str, np.ndarray],
+    damping_ratio: float,
+) -> None:
+    short_circuit_voltage = _evaluate_voltage_frf(
+        frequencies_hz=search_freq_hz,
+        modal_model=modal_model,
+        damping_ratio=damping_ratio,
+        resistance_ohm=1.0e-6,
+    )
+    open_circuit_voltage = _evaluate_voltage_frf(
+        frequencies_hz=search_freq_hz,
+        modal_model=modal_model,
+        damping_ratio=damping_ratio,
+        resistance_ohm=float("inf"),
+    )
+    short_circuit_hz = float(search_freq_hz[int(np.argmax(np.abs(short_circuit_voltage)))])
+    open_peak_hz = float(search_freq_hz[int(np.argmax(np.abs(open_circuit_voltage)))])
+    if open_peak_hz + 1.0e-12 < short_circuit_hz:
+        warnings.warn(
+            "Open-circuit resonance check failed: "
+            f"open-circuit peak={open_peak_hz:.6g} Hz is below short-circuit f1={short_circuit_hz:.6g} Hz.",
+            stacklevel=2,
+        )
 
 
 def _solve_reduced_system(
@@ -374,7 +703,7 @@ def _solve_reduced_system(
         A[mode_idx, -1] = -theta[mode_idx]
         b[mode_idx] = force[mode_idx]
     A[-1, :-1] = 1j * omega * theta
-    A[-1, -1] = (1.0 / resistance_ohm) - 1j * omega * capacitance
+    A[-1, -1] = (1.0 / resistance_ohm) + 1j * omega * capacitance
     solution = np.linalg.solve(A, b)
     return solution[:-1], solution[-1]
 
@@ -399,14 +728,16 @@ def _evaluate_voltage_frf(
 def solve_modal_voltage_frf(
     mesh_path: str | Path,
     response_dir: str | Path,
-    num_modes: int = 12,
-    search_scale: tuple[float, float] = (0.8, 1.2),
-    search_points: int = 801,
+    num_modes: int = 8,
+    search_scale: tuple[float, float] = (0.5, 2.0),
+    search_points: int = 301,
     frf_points: int = 256,
     normalized_range: tuple[float, float] = (0.9, 1.1),
     mechanical: MechanicalConfig | None = None,
     piezo: PiezoConfig | None = None,
     modes_output_dir: str | Path | None = None,
+    element_order: int = 2,
+    store_mode_shapes: bool = False,
 ) -> Path:
     mechanical = mechanical or MechanicalConfig()
     piezo = piezo or PiezoConfig()
@@ -418,24 +749,48 @@ def solve_modal_voltage_frf(
         num_modes=num_modes,
         mechanical=mechanical,
         piezo=piezo,
+        element_order=element_order,
+        store_mode_shapes=store_mode_shapes,
     )
-    f1 = float(modal_model["eigenfreq_hz"][0])
-    search_freq = np.linspace(search_scale[0] * f1, search_scale[1] * f1, int(search_points), dtype=np.float64)
-    search_voltage = _evaluate_voltage_frf(
-        frequencies_hz=search_freq,
+    _log_modal_diagnostics(modal_model)
+    _warn_if_frequency_scale_is_suspicious(
+        modal_model=modal_model,
+        mechanical=mechanical,
+        piezo=piezo,
+    )
+    search_freq, search_voltage, peak_index, boundary_hit = _search_peak_with_adaptive_window(
+        modal_model=modal_model,
+        damping_ratio=mechanical.damping_ratio,
+        resistance_ohm=piezo.resistance_ohm,
+        search_scale=search_scale,
+        search_points=search_points,
+    )
+    _warn_if_open_circuit_resonance_is_inverted(
+        search_freq_hz=search_freq,
+        modal_model=modal_model,
+        damping_ratio=mechanical.damping_ratio,
+    )
+    if boundary_hit:
+        warnings.warn(
+            "FRF peak search still landed on the search-window boundary after adaptive expansion.",
+            stacklevel=2,
+        )
+    f_peak_hz = _refine_peak_frequency(
+        search_freq_hz=search_freq,
+        search_voltage=search_voltage,
         modal_model=modal_model,
         damping_ratio=mechanical.damping_ratio,
         resistance_ohm=piezo.resistance_ohm,
     )
-    search_voltage_mag = np.abs(search_voltage)
-    peak_index = int(np.argmax(search_voltage_mag))
-    f_peak_hz = float(search_freq[peak_index])
 
-    freq_hz = np.linspace(
-        normalized_range[0] * f_peak_hz,
-        normalized_range[1] * f_peak_hz,
-        int(frf_points),
-        dtype=np.float64,
+    freq_hz = _inject_exact_frequency(
+        np.linspace(
+            normalized_range[0] * f_peak_hz,
+            normalized_range[1] * f_peak_hz,
+            int(frf_points),
+            dtype=np.float64,
+        ),
+        f_peak_hz,
     )
     voltage = _evaluate_voltage_frf(
         frequencies_hz=freq_hz,
@@ -443,6 +798,11 @@ def solve_modal_voltage_frf(
         damping_ratio=mechanical.damping_ratio,
         resistance_ohm=piezo.resistance_ohm,
     )
+    saved_peak_ratio = float(freq_hz[int(np.argmax(np.abs(voltage)))] / f_peak_hz)
+    if abs(saved_peak_ratio - 1.0) >= 5.0e-3:
+        raise AssertionError(
+            f"Saved FRF peak is not centered on f_peak_hz: saved_peak_ratio={saved_peak_ratio:.6g}."
+        )
     top_surface_strain = np.zeros(0, dtype=np.float64)
     mode_nodal_displacements = np.asarray(modal_model["mode_nodal_displacements"], dtype=np.float64)
     if mode_nodal_displacements.size > 0:
@@ -488,33 +848,230 @@ def solve_modal_voltage_frf(
     return response_path
 
 
+def _response_output_path(response_dir: str | Path, sample_id: int) -> Path:
+    return Path(response_dir) / f"sample_{int(sample_id):04d}_response.npz"
+
+
+def _modal_output_path(modes_output_dir: str | Path | None, sample_id: int) -> Path | None:
+    if modes_output_dir is None:
+        return None
+    return Path(modes_output_dir) / f"sample_{int(sample_id):04d}_modal.npz"
+
+
+def _modal_output_has_top_surface_strain(modal_path: Path) -> bool:
+    if not modal_path.exists():
+        return False
+    try:
+        with np.load(modal_path) as modal:
+            if "top_surface_strain_eqv" not in modal:
+                return False
+            strain = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64).reshape(-1)
+    except Exception:
+        return False
+    return strain.size > 0 and bool(np.isfinite(strain).any())
+
+
+def solve_modal_voltage_frf_batch(
+    mesh_paths: list[str | Path],
+    response_dir: str | Path,
+    num_modes: int = 8,
+    search_scale: tuple[float, float] = (0.5, 2.0),
+    search_points: int = 301,
+    frf_points: int = 256,
+    normalized_range: tuple[float, float] = (0.9, 1.1),
+    mechanical: MechanicalConfig | None = None,
+    piezo: PiezoConfig | None = None,
+    modes_output_dir: str | Path | None = None,
+    element_order: int = 2,
+    store_mode_shapes: bool = False,
+    skip_existing: bool = False,
+) -> list[Path]:
+    response_dir = Path(response_dir)
+    response_dir.mkdir(parents=True, exist_ok=True)
+    if modes_output_dir is not None:
+        Path(modes_output_dir).mkdir(parents=True, exist_ok=True)
+
+    saved: list[Path] = []
+    total = len(mesh_paths)
+    for idx, mesh_path in enumerate(mesh_paths, start=1):
+        mesh_path = Path(mesh_path)
+        sample_id = _extract_sample_id(mesh_path)
+        response_path = _response_output_path(response_dir, sample_id)
+        modal_path = _modal_output_path(modes_output_dir, sample_id)
+        modal_ready = modal_path is None or modal_path.exists()
+        modal_missing_strain = False
+        if modal_path is not None and modal_path.exists() and store_mode_shapes:
+            modal_missing_strain = not _modal_output_has_top_surface_strain(modal_path)
+            modal_ready = modal_ready and not modal_missing_strain
+        if skip_existing and response_path.exists() and modal_ready:
+            print(f"[{idx}/{total}] Skipping {mesh_path.name} (existing outputs found).")
+            saved.append(response_path)
+            gc.collect()
+            continue
+        if modal_missing_strain:
+            print(f"[{idx}/{total}] Solving {mesh_path.name} (refreshing missing top-surface strain data)")
+        else:
+            print(f"[{idx}/{total}] Solving {mesh_path.name}")
+        try:
+            saved.append(
+                solve_modal_voltage_frf(
+                    mesh_path=mesh_path,
+                    response_dir=response_dir,
+                    num_modes=num_modes,
+                    search_scale=search_scale,
+                    search_points=search_points,
+                    frf_points=frf_points,
+                    normalized_range=normalized_range,
+                    mechanical=mechanical,
+                    piezo=piezo,
+                    modes_output_dir=modes_output_dir,
+                    element_order=element_order,
+                    store_mode_shapes=store_mode_shapes,
+                )
+            )
+        finally:
+            gc.collect()
+    return saved
+
+
+def _resolve_mesh_paths(mesh_args: list[str], mesh_dir_arg: str) -> list[Path]:
+    mesh_paths: list[Path] = [Path(value) for value in mesh_args if str(value).strip()]
+    if mesh_dir_arg.strip():
+        mesh_dir = Path(mesh_dir_arg)
+        mesh_paths.extend(sorted(mesh_dir.glob("plate3d_*_fenicsx.npz")))
+    # preserve order while removing duplicates
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in mesh_paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(path)
+    return unique_paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Solve the base-excited piezoelectric plate FRF with FEniCSx modal reduction.",
     )
-    parser.add_argument("--mesh", required=True, help="Path to one 3D .msh file.")
-    parser.add_argument("--response-dir", default="data/fem_responses", help="Output directory for sample responses.")
-    parser.add_argument("--modes-dir", default="data/modal_data", help="Optional output directory for modal diagnostics.")
-    parser.add_argument("--num-modes", type=int, default=12, help="Number of structural modes to retain.")
-    parser.add_argument("--search-points", type=int, default=801, help="Number of points used to locate the fundamental FRF peak.")
-    parser.add_argument("--frf-points", type=int, default=256, help="Number of samples saved in the final normalized FRF window.")
-    parser.add_argument("--substrate-rho", type=float, default=7930.0, help="Substrate density in kg/m^3.")
-    parser.add_argument("--piezo-rho", type=float, default=7800.0, help="Piezo density in kg/m^3.")
+    parser.add_argument(
+        "--mesh",
+        action="append",
+        default=[],
+        help="Path to one 3D plate3d_*_fenicsx.npz mesh. Repeat the flag to solve multiple meshes.",
+    )
+    parser.add_argument(
+        "--mesh-dir",
+        default="",
+        help="Optional directory containing plate3d_*_fenicsx.npz files to solve in one batch.",
+    )
+    parser.add_argument(
+        "--response-dir",
+        default="data/fem_responses",
+        help="Output directory for sample responses.",
+    )
+    parser.add_argument(
+        "--modes-dir",
+        default="data/modal_data",
+        help="Optional output directory for modal diagnostics.",
+    )
+    parser.add_argument(
+        "--num-modes",
+        type=int,
+        default=8,
+        help="Number of structural modes to retain.",
+    )
+    parser.add_argument(
+        "--search-points",
+        type=int,
+        default=301,
+        help="Number of coarse points used to locate the fundamental FRF peak before refinement.",
+    )
+    parser.add_argument(
+        "--frf-points",
+        type=int,
+        default=256,
+        help="Number of samples saved in the final normalized FRF window.",
+    )
+    parser.add_argument(
+        "--element-order",
+        type=int,
+        default=2,
+        help="Lagrange order for the solid displacement field. Use 2 by default for thin-plate bending accuracy.",
+    )
+    parser.add_argument(
+        "--store-mode-shapes",
+        action="store_true",
+        help="Store per-mode nodal fields for extra diagnostics. Disabled by default to keep screening runs fast.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip meshes whose response (and modal file, if requested) already exist.",
+    )
+    parser.add_argument(
+        "--substrate-rho",
+        type=float,
+        default=7930.0,
+        help="Substrate density in kg/m^3.",
+    )
+    parser.add_argument(
+        "--piezo-rho",
+        type=float,
+        default=7800.0,
+        help="Piezo density in kg/m^3.",
+    )
+    parser.add_argument(
+        "--problem-spec",
+        default="",
+        help=(
+            "Optional shared problem specification YAML. Defaults to configs/peh_inverse_design_spec.yaml "
+            "when present."
+        ),
+    )
     args = parser.parse_args()
 
-    response_path = solve_modal_voltage_frf(
-        mesh_path=args.mesh,
-        response_dir=args.response_dir,
-        num_modes=args.num_modes,
-        search_points=args.search_points,
-        frf_points=args.frf_points,
-        mechanical=MechanicalConfig(
+    mesh_paths = _resolve_mesh_paths(args.mesh, args.mesh_dir)
+    if not mesh_paths:
+        raise ValueError("Provide at least one --mesh path or a --mesh-dir containing plate3d_*_fenicsx.npz files.")
+
+    project_root = Path(__file__).resolve().parents[1]
+    if args.problem_spec:
+        problem_spec = load_problem_spec(args.problem_spec, project_root=project_root)
+    else:
+        default_spec_path = default_problem_spec_path(project_root)
+        problem_spec = load_problem_spec(default_spec_path, project_root=project_root) if default_spec_path.exists() else None
+
+    if problem_spec is not None:
+        mechanical_kwargs = build_mechanical_config_kwargs(problem_spec)
+        mechanical_kwargs["substrate_rho"] = float(args.substrate_rho)
+        mechanical_kwargs["piezo_rho"] = float(args.piezo_rho)
+        piezo_kwargs = build_piezo_config_kwargs(problem_spec)
+        mechanical = MechanicalConfig(**mechanical_kwargs)
+        piezo = PiezoConfig(**piezo_kwargs)
+    else:
+        mechanical = MechanicalConfig(
             substrate_rho=float(args.substrate_rho),
             piezo_rho=float(args.piezo_rho),
-        ),
+        )
+        piezo = PiezoConfig()
+
+    saved_paths = solve_modal_voltage_frf_batch(
+        mesh_paths=[str(path) for path in mesh_paths],
+        response_dir=args.response_dir,
+        num_modes=int(args.num_modes),
+        search_points=int(args.search_points),
+        frf_points=int(args.frf_points),
+        mechanical=mechanical,
+        piezo=piezo,
         modes_output_dir=args.modes_dir,
+        element_order=int(args.element_order),
+        store_mode_shapes=bool(args.store_mode_shapes),
+        skip_existing=bool(args.skip_existing),
     )
-    print(f"Saved response to {response_path}")
+    print(f"Saved {len(saved_paths)} response file(s) to {Path(args.response_dir)}")
+
 
 
 if __name__ == "__main__":

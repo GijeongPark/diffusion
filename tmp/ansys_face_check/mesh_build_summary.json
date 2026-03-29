@@ -1,0 +1,22 @@
+{
+  "cad_mode": "exact",
+  "cad_reference_size_relative_to_cell": 0.01,
+  "examined_candidates": 1,
+  "fail": 0,
+  "failure_records": [],
+  "limit_solver_mesh_by_thickness": false,
+  "ok": 1,
+  "piezo_layers": 1,
+  "problem_spec_path": "/home/gijeong/Inverse Design/runs/0329TEST/meshes/volumes/problem_spec_used.yaml",
+  "requested_candidates": 1,
+  "requested_ok": null,
+  "selected_sample_ids": [
+    0
+  ],
+  "selected_source_indices": [
+    0
+  ],
+  "solver_mesh_backend": "layered_tet",
+  "solver_mesh_size_relative_to_cell": 0.08,
+  "substrate_layers": 2
+}

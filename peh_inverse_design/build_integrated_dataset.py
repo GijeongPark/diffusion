@@ -77,6 +77,31 @@ def _load_modal_records(modal_dir: Path) -> dict[int, dict[str, np.ndarray | str
     return records
 
 
+def _max_shape_for_key(
+    records: dict[int, dict[str, np.ndarray | str | float]],
+    key: str,
+) -> tuple[int, ...] | None:
+    shapes = [np.asarray(record[key]).shape for record in records.values() if key in record]
+    if not shapes:
+        return None
+    ndims = {len(shape) for shape in shapes}
+    if len(ndims) != 1:
+        return None
+    ndim = next(iter(ndims))
+    if ndim == 0:
+        return ()
+    return tuple(max(shape[axis] for shape in shapes) for axis in range(ndim))
+
+
+def _assign_padded(target: np.ndarray, idx: int, values: np.ndarray) -> None:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 0:
+        target[idx] = values
+        return
+    slices = tuple(slice(0, dim) for dim in values.shape)
+    target[(idx,) + slices] = values
+
+
 def _extract_top_surface_mesh(mesh_npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
     raw = np.load(mesh_npz_path)
     points = np.asarray(raw["points"], dtype=np.float64)
@@ -177,17 +202,20 @@ def build_integrated_dataset(
         top_surface_triangles[:] = None
 
     modal_records = _load_modal_records(modal_dir) if modal_dir is not None and modal_dir.exists() else {}
-    first_modal = next(iter(modal_records.values()), None)
-    if first_modal is not None:
-        eigen_shape = np.asarray(first_modal.get("eigenfreq_hz", np.zeros(0))).shape
-        force_shape = np.asarray(first_modal.get("modal_force", np.zeros(0))).shape
-        theta_shape = np.asarray(first_modal.get("modal_theta", np.zeros(0))).shape
-        mass_shape = np.asarray(first_modal.get("modal_mass", np.zeros(0))).shape
-        cap_shape = np.asarray(first_modal.get("capacitance_f", np.zeros(0))).shape
+    eigen_shape = _max_shape_for_key(modal_records, "eigenfreq_hz")
+    force_shape = _max_shape_for_key(modal_records, "modal_force")
+    theta_shape = _max_shape_for_key(modal_records, "modal_theta")
+    mass_shape = _max_shape_for_key(modal_records, "modal_mass")
+    cap_shape = _max_shape_for_key(modal_records, "capacitance_f")
+    if eigen_shape is not None:
         eigenfreq_hz = np.full((n_samples,) + eigen_shape, np.nan, dtype=np.float64)
+    if force_shape is not None:
         modal_force = np.full((n_samples,) + force_shape, np.nan, dtype=np.float64)
+    if theta_shape is not None:
         modal_theta = np.full((n_samples,) + theta_shape, np.nan, dtype=np.float64)
+    if mass_shape is not None:
         modal_mass = np.full((n_samples,) + mass_shape, np.nan, dtype=np.float64)
+    if cap_shape is not None:
         capacitance_f = np.full((n_samples,) + cap_shape, np.nan, dtype=np.float64)
 
     for idx, sid in enumerate(sample_id.tolist()):
@@ -206,15 +234,15 @@ def build_integrated_dataset(
         modal_ok[idx] = 1
         modal_npz_path[idx] = str(modal["path"])
         if eigenfreq_hz is not None and "eigenfreq_hz" in modal:
-            eigenfreq_hz[idx] = np.asarray(modal["eigenfreq_hz"], dtype=np.float64)
+            _assign_padded(eigenfreq_hz, idx, np.asarray(modal["eigenfreq_hz"], dtype=np.float64))
         if modal_force is not None and "modal_force" in modal:
-            modal_force[idx] = np.asarray(modal["modal_force"], dtype=np.float64)
+            _assign_padded(modal_force, idx, np.asarray(modal["modal_force"], dtype=np.float64))
         if modal_theta is not None and "modal_theta" in modal:
-            modal_theta[idx] = np.asarray(modal["modal_theta"], dtype=np.float64)
+            _assign_padded(modal_theta, idx, np.asarray(modal["modal_theta"], dtype=np.float64))
         if modal_mass is not None and "modal_mass" in modal:
-            modal_mass[idx] = np.asarray(modal["modal_mass"], dtype=np.float64)
+            _assign_padded(modal_mass, idx, np.asarray(modal["modal_mass"], dtype=np.float64))
         if capacitance_f is not None and "capacitance_f" in modal:
-            capacitance_f[idx] = np.asarray(modal["capacitance_f"], dtype=np.float64)
+            _assign_padded(capacitance_f, idx, np.asarray(modal["capacitance_f"], dtype=np.float64))
         if "field_frequency_hz" in modal:
             field_frequency_hz[idx] = float(np.asarray(modal["field_frequency_hz"], dtype=np.float64))
         if "top_surface_strain_eqv" in modal:

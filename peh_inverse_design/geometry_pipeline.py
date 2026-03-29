@@ -12,18 +12,17 @@ from numpy.typing import NDArray
 from scipy.interpolate import RegularGridInterpolator
 from shapely import affinity
 from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon, box
-from shapely.ops import polygonize, unary_union
+from shapely.ops import nearest_points, polygonize, unary_union
 from skimage.measure import find_contours
 from skimage.transform import resize
 
 ArrayF64 = NDArray[np.float64]
 ArrayBool = NDArray[np.bool_]
 
-DEFAULT_CELL_SIZE_M = (0.10, 0.10)
-DEFAULT_TILE_COUNTS = (10, 10)
 DEFAULT_SDF_ML_RESOLUTION = (128, 128)
 DEFAULT_MESH_SIZE_RELATIVE_TO_CELL = 0.04
 DEFAULT_CONTOUR_DECIMATE_TOL = 0.005
+DEFAULT_CONNECTIVITY_BRIDGE_RELATIVE_TO_CELL = 0.08
 DEFAULT_SPLIT_SEED = 42
 
 _CELL_CORNERS = np.array(
@@ -34,17 +33,38 @@ _CELL_CORNERS = np.array(
 
 @dataclass(frozen=True)
 class GeometryBuildConfig:
-    cell_size_m: tuple[float, float] = DEFAULT_CELL_SIZE_M
-    tile_counts: tuple[int, int] = DEFAULT_TILE_COUNTS
+    cell_size_m: tuple[float, float]
+    tile_counts: tuple[int, int]
     sdf_ml_resolution: tuple[int, int] = DEFAULT_SDF_ML_RESOLUTION
     mesh_size_relative_to_cell: float = DEFAULT_MESH_SIZE_RELATIVE_TO_CELL
     contour_decimate_tol: float = DEFAULT_CONTOUR_DECIMATE_TOL
+    # Keep the physical tiled geometry exact by default; connectivity repair changes the plate shape.
+    enforce_connected_plate: bool = False
+    connectivity_bridge_relative_to_cell: float = DEFAULT_CONNECTIVITY_BRIDGE_RELATIVE_TO_CELL
     split_seed: int = DEFAULT_SPLIT_SEED
     split_ratios: tuple[float, float, float] = (0.70, 0.15, 0.15)
+
+    def __post_init__(self) -> None:
+        cell_size = tuple(float(value) for value in self.cell_size_m)
+        tile_counts = tuple(int(value) for value in self.tile_counts)
+        if len(cell_size) != 2:
+            raise ValueError("cell_size_m must contain exactly two entries.")
+        if len(tile_counts) != 2:
+            raise ValueError("tile_counts must contain exactly two entries.")
+        if min(cell_size) <= 0.0:
+            raise ValueError("cell_size_m must be strictly positive.")
+        if min(tile_counts) <= 0:
+            raise ValueError("tile_counts must be strictly positive.")
+        object.__setattr__(self, "cell_size_m", cell_size)
+        object.__setattr__(self, "tile_counts", tile_counts)
 
     @property
     def mesh_size_m(self) -> float:
         return self.mesh_size_relative_to_cell * float(self.cell_size_m[0])
+
+    @property
+    def connectivity_bridge_width_m(self) -> float:
+        return self.connectivity_bridge_relative_to_cell * float(min(self.cell_size_m))
 
     @property
     def plate_size_m(self) -> tuple[float, float]:
@@ -177,10 +197,66 @@ def _iter_polygons(geometry: Polygon | MultiPolygon | GeometryCollection) -> Ite
                 yield from _iter_polygons(geom)
 
 
+def _connect_plate_components(
+    polygons: Iterable[Polygon],
+    plate_size_m: tuple[float, float],
+    bridge_width_m: float,
+) -> list[Polygon]:
+    plate_box = box(0.0, 0.0, float(plate_size_m[0]), float(plate_size_m[1]))
+    merged = unary_union(list(polygons))
+    if merged.is_empty:
+        return []
+
+    merged = merged.intersection(plate_box).buffer(0)
+    components = list(_iter_polygons(merged))
+    if len(components) <= 1:
+        return components
+
+    working = merged
+    max_iterations = max(1, len(components) - 1)
+    for _ in range(max_iterations):
+        components = list(_iter_polygons(working))
+        if len(components) <= 1:
+            break
+
+        best_pair: tuple[int, int] | None = None
+        best_gap = float("inf")
+        for idx_i, poly_i in enumerate(components):
+            for idx_j in range(idx_i + 1, len(components)):
+                gap = float(poly_i.distance(components[idx_j]))
+                if gap < best_gap:
+                    best_gap = gap
+                    best_pair = (idx_i, idx_j)
+        if best_pair is None:
+            break
+
+        poly_a = components[best_pair[0]]
+        poly_b = components[best_pair[1]]
+        point_a, point_b = nearest_points(poly_a, poly_b)
+        bridge_centerline = LineString([point_a.coords[0], point_b.coords[0]])
+
+        # Add an explicit local bridge instead of a global morphological closing so
+        # existing holes and narrow voids are preserved everywhere else.
+        bridge = bridge_centerline.buffer(
+            max(0.5 * float(bridge_width_m), 1.0e-9),
+            cap_style="round",
+            join_style="mitre",
+        )
+        working = unary_union([working, bridge]).intersection(plate_box).buffer(0)
+
+    simplify_tol = max(1.0e-9, 0.25 * float(bridge_width_m))
+    return [
+        poly.simplify(simplify_tol, preserve_topology=True).buffer(0)
+        for poly in _iter_polygons(working)
+    ]
+
+
 def tile_unit_cell_polygons(
     unit_cell_polygons: Iterable[Polygon],
-    cell_size_m: tuple[float, float] = DEFAULT_CELL_SIZE_M,
-    tile_counts: tuple[int, int] = DEFAULT_TILE_COUNTS,
+    cell_size_m: tuple[float, float],
+    tile_counts: tuple[int, int],
+    enforce_connectivity: bool = False,
+    connectivity_bridge_width_m: float = 0.0,
 ) -> list[Polygon]:
     """Scale one unit cell to physical units and tile it across the finite plate."""
     scaled_polygons = [
@@ -201,7 +277,17 @@ def tile_unit_cell_polygons(
                 tiled.append(affinity.translate(polygon, xoff=xoff, yoff=yoff))
 
     merged = unary_union(tiled)
-    return list(_iter_polygons(merged))
+    polygons = list(_iter_polygons(merged))
+    if enforce_connectivity and len(polygons) > 1 and connectivity_bridge_width_m > 0.0:
+        polygons = _connect_plate_components(
+            polygons=polygons,
+            plate_size_m=(
+                float(cell_size_m[0]) * int(tile_counts[0]),
+                float(cell_size_m[1]) * int(tile_counts[1]),
+            ),
+            bridge_width_m=float(connectivity_bridge_width_m),
+        )
+    return polygons
 
 
 def _classify_outer_plate_edge(
@@ -377,6 +463,8 @@ def mesh_tiled_plate_sample(
         unit_cell_polygons=unit_cell_polygons,
         cell_size_m=config.cell_size_m,
         tile_counts=config.tile_counts,
+        enforce_connectivity=config.enforce_connected_plate,
+        connectivity_bridge_width_m=config.connectivity_bridge_width_m,
     )
 
     output_dir = Path(output_dir)
@@ -463,7 +551,10 @@ def build_geometry_dataset(
     build_meshes: bool = True,
 ) -> dict[str, NDArray]:
     """Create the ML geometry dataset and the FEM mesh manifest."""
-    config = config or GeometryBuildConfig()
+    if config is None:
+        raise ValueError(
+            "config must be provided explicitly so the geometry dataset carries the intended physical plate size."
+        )
 
     unit_cell_dataset_path = Path(unit_cell_dataset_path)
     geometry_output_path = Path(geometry_output_path)

@@ -36,7 +36,7 @@ The repository now includes a reusable Python package, [peh_inverse_design](/hom
 
 - building `data/geometry_dataset.npz` from the unit-cell notebook output
 - generating `10 x 10` tiled full-plate meshes for FEM
-- exporting ANSYS Mechanical-compatible `plate3d_*_ansys.inp` files for External Model import
+- exporting ANSYS Workbench Geometry-compatible `plate3d_*.step` CAD files
 - aggregating per-sample FEM outputs into `data/response_dataset.npz`
 - collecting everything into one `integrated_dataset.npz`
 
@@ -79,7 +79,7 @@ This aligned dataset contains, per sample:
 - modal diagnostics such as `eigenfreq_hz`, `field_frequency_hz`, `top_surface_strain_eqv`
 - path indices to the corresponding mesh, response, and modal files
 
-Build 3D layered substrate+piezo meshes for the FEniCSx solver:
+Export solid STEP geometry for ANSYS and build the fast Python solver meshes from the same planform:
 
 ```bash
 ./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
@@ -89,10 +89,49 @@ Build 3D layered substrate+piezo meshes for the FEniCSx solver:
 
 This writes one set of files per sample under `meshes/volumes/`, including:
 
-- `plate3d_XXXX.msh` for the native gmsh mesh
-- `plate3d_XXXX.xdmf` and `plate3d_XXXX_facets.xdmf` for FEniCSx-style inspection
+- `plate3d_XXXX.step` for CAD-style geometry import into the ANSYS Workbench Geometry cell
 - `plate3d_XXXX_fenicsx.npz` for the in-house solver
-- `plate3d_XXXX_ansys.inp` for ANSYS Mechanical External Model import
+- `plate3d_XXXX_cad.json` for the CAD validation report
+- `plate3d_XXXX_ansys_workbench.json` for the ANSYS Workbench handoff bundle, including the shared problem specification and expected solid-body layout
+- `mesh_build_summary.json` for per-run mesh/CAD success and rejection reasons
+
+By default the ANSYS path stays STEP-only and solid, while the Python path uses the faster `layered_tet` solver mesh backend. That backend meshes a partitioned 2D plate surface with gmsh and extrudes it into a layered tetrahedral mesh for FEniCSx, which is much faster than tetrahedralizing the full 3D STEP body for every sample.
+
+If you explicitly want the old full 3D gmsh volume-mesh route for the Python solver, switch to the legacy backend:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
+  --unit-cell-npz data/dataset_100.npz \
+  --mesh-dir meshes/volumes \
+  --solver-mesh-backend gmsh_volume \
+  --write-native-msh \
+  --write-xdmf
+```
+
+The CAD export defaults to `exact` mode:
+
+- preserve the tiled substrate topology exactly
+- reject disconnected or under-resolved planforms instead of silently healing them
+- export and validate exactly two solid bodies: substrate and piezo
+- keep the ANSYS path on solid STEP bodies rather than 2D or reduced-order geometry
+
+Runtime note for the in-house solver:
+
+- the STEP/ANSYS path stays fully solid, but the in-house FEniCSx mesh no longer ties the global in-plane element size to the ~1.27 mm total thickness by default
+- CAD validation now uses its own small reference size, while the solver mesh uses the requested in-plane scale
+- the default FEniCSx solve now batches all samples in one Docker run, skips already-finished outputs, and uses quadratic solid displacement interpolation (`element_order = 2`) for thin-plate bending accuracy on a much coarser mesh
+
+If you intentionally want repaired CAD for disconnected samples, opt in with:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
+  --unit-cell-npz data/dataset_100.npz \
+  --mesh-dir meshes/volumes \
+  --repair-cad \
+  --repair-bridge-width-m 0.0008
+```
+
+That mode adds explicit bridge geometry between disconnected substrate components and records the repair in the CAD report.
 
 Run the FEniCSx modal-reduction solver in the official Docker image:
 
@@ -136,6 +175,8 @@ bash scripts/run_all.sh \
   --run-name test3
 ```
 
+`run_all.sh` now delegates to the same Python pipeline as the notebook. When `--limit 3` is used without explicit `--sample-ids`, the pipeline requests **3 successful solid exports** and keeps scanning/rejecting candidate unit cells until it has 3 samples that survive the full 3D solid-build stage, or until the candidate dataset is exhausted.
+
 This writes everything under `runs/test3/`:
 
 - `runs/test3/meshes/volumes/`
@@ -159,9 +200,18 @@ Recommended order:
 4. update `SOURCE_UNIT_CELL_NPZ`, `RUN_NAME`, and `LIMIT`
 5. click `Run All`
 
-The notebook calls the same Python pipeline underneath and creates meshes, FEM results, the integrated dataset, and report images in one run.
+The notebook calls the same Python pipeline underneath and creates STEP geometry, Python solver meshes, FEM results, the integrated dataset, and report images in one run.
+
+The notebook pipeline now also exposes CAD mode:
+
+- `EXACT_CAD = True`, `REPAIR_CAD = False` rejects disconnected tiled substrates
+- `EXACT_CAD = False`, `REPAIR_CAD = True` adds explicit bridge geometry for repair CAD
+
+If Step 1 fails, inspect `runs/<RUN_NAME>/meshes/volumes/mesh_build_summary.json` for the exact CAD rejection reasons.
 
 Density values used by the solver can now be set explicitly:
 
 - `SUBSTRATE_RHO = 7930.0`
 - `PIEZO_RHO = 7500.0` or your desired patch density
+
+Both the notebook and `run_all.sh` use the same `peh_inverse_design.pipeline_runner` implementation under the hood.

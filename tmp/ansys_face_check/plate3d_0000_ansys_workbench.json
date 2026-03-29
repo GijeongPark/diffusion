@@ -1,0 +1,279 @@
+{
+  "sample_id": 0,
+  "geometry": {
+    "unit_cell_size_m": [
+      0.1,
+      0.1
+    ],
+    "tile_counts": [
+      10,
+      10
+    ],
+    "plate_size_m": [
+      1.0,
+      1.0
+    ],
+    "substrate_thickness_m": 0.001,
+    "piezo_thickness_m": 0.0002667,
+    "total_thickness_m": 0.0012667
+  },
+  "files": {
+    "step_path": "/home/gijeong/Inverse Design/tmp/ansys_face_check/plate3d_0000.step",
+    "gmsh_volume_mesh_path": "",
+    "python_solver_mesh_path": "/home/gijeong/Inverse Design/tmp/ansys_face_check/plate3d_0000_fenicsx.npz",
+    "cad_report_path": "/home/gijeong/Inverse Design/tmp/ansys_face_check/plate3d_0000_cad.json"
+  },
+  "ansys_workbench_geometry_import": {
+    "import_via": "Geometry cell",
+    "geometry_format": "STEP",
+    "expected_body_type": "solid",
+    "expected_solid_body_count": 2,
+    "allow_surface_bodies": false,
+    "allow_line_bodies": false,
+    "body_roles": [
+      {
+        "name": "substrate",
+        "kind": "solid",
+        "z_range_m": [
+          0.0,
+          0.001
+        ]
+      },
+      {
+        "name": "piezo",
+        "kind": "solid",
+        "z_range_m": [
+          0.001,
+          0.0012667
+        ]
+      }
+    ]
+  },
+  "shared_problem_definition": {
+    "mechanical_boundary_condition": {
+      "type": "cantilever_clamped_edge",
+      "location": {
+        "axis": "x",
+        "side": "min",
+        "value_m": 0.0
+      }
+    },
+    "base_excitation": {
+      "type": "harmonic_support_acceleration",
+      "direction": "z",
+      "location": "clamped_edge",
+      "implementation_intent": "same as FEniCS modal-reduction path"
+    },
+    "electrodes": {
+      "top_electrode": {
+        "surface": "piezo_top_face",
+        "z_value_m": 0.0012667
+      },
+      "bottom_electrode": {
+        "surface": "substrate_piezo_interface",
+        "z_value_m": 0.001
+      }
+    },
+    "response": {
+      "quantity": "voltage_magnitude",
+      "frequency_window": "normalized about fundamental peak"
+    }
+  },
+  "problem_spec": {
+    "project": {
+      "name": "peh_inverse_design",
+      "description": "Inverse design of a repeated unit-cell geometry from the global voltage FRF of a finite cantilevered piezoelectric metamaterial plate.\n"
+    },
+    "geometry": {
+      "representation": "sdf",
+      "unit_cell_size_m": [
+        0.1,
+        0.1
+      ],
+      "tile_counts": [
+        10,
+        10
+      ],
+      "total_plate_size_m": [
+        1.0,
+        1.0
+      ],
+      "substrate_thickness_m": 0.001,
+      "piezo_patch_thickness_m": 0.0001,
+      "piezo_patch_coverage": "full",
+      "native_grf_resolution": 64,
+      "native_sdf_resolution": 120,
+      "ml_sdf_resolution": 128
+    },
+    "materials": {
+      "substrate": {
+        "youngs_modulus_pa": "1.9305e11",
+        "poisson_ratio": 0.3,
+        "density_kg_per_m3": 7930.0
+      },
+      "piezoelectric": {
+        "polarization_axis": "z",
+        "reduced_plate_constants": {
+          "e31_c_per_m2": -23.38,
+          "eps33s_f_per_m": 1.729e-08
+        },
+        "constitutive_form_3d": "stress_charge",
+        "full_3d_constants": {
+          "piezoelectric_e_c_per_m2": [
+            [
+              0.0,
+              0.0,
+              -6.622811852
+            ],
+            [
+              0.0,
+              0.0,
+              -6.622811852
+            ],
+            [
+              0.0,
+              0.0,
+              23.24031303
+            ],
+            [
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              17.03448276,
+              0.0
+            ],
+            [
+              17.03448276,
+              0.0,
+              0.0
+            ]
+          ],
+          "stiffness_cE_pa": [
+            [
+              "1.27205e11",
+              "8.0212213391e10",
+              "8.4670187076e10",
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              "8.0212213391e10",
+              "1.27205e11",
+              "8.4670187076e10",
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              "8.4670187076e10",
+              "8.4670187076e10",
+              "1.17436e11",
+              0.0,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              "2.3474178404e10",
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              "2.30e10",
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              "2.30e10"
+            ]
+          ],
+          "permittivity_epsS_f_per_m": [
+            [
+              1.50911e-08,
+              0.0,
+              0.0
+            ],
+            [
+              0.0,
+              1.50911e-08,
+              0.0
+            ],
+            [
+              0.0,
+              0.0,
+              1.26934e-08
+            ]
+          ]
+        },
+        "notes": [
+          "Use the reduced plate constants only for analytical reduced-order derivations.",
+          "Use the full 3D constitutive data for the coupled FEM dataset.",
+          "Keep the same constitutive convention and axis ordering across all samples."
+        ]
+      }
+    },
+    "mechanics": {
+      "structure_type": "finite_repeated_plate",
+      "boundary_condition": "clamped_free_free_free",
+      "clamped_edge": "x_min",
+      "base_excitation": {
+        "type": "harmonic_support_acceleration",
+        "amplitude_m_per_s2": 2.5,
+        "direction": "z",
+        "interpretation": "moving_clamped_base",
+        "time_domain_form": "a_base(t) = 2.5 * sin(omega * t)",
+        "implementation_options": [
+          "impose_support_motion_at_clamped_edge",
+          "equivalent_inertial_loading_in_relative_coordinates"
+        ]
+      },
+      "damping": {
+        "method": "modal_superposition",
+        "modal_damping_ratio": 0.025
+      }
+    },
+    "electrical": {
+      "measured_quantity": "voltage",
+      "measured_form": "magnitude",
+      "electrode_measurement_region": "full_plate_electrode",
+      "external_load_resistance_ohm": 10000.0
+    },
+    "frf": {
+      "target_mode": "fundamental",
+      "conditioning": {
+        "include_f_peak_hz": true
+      },
+      "frequency_axis": {
+        "type": "normalized_with_peak_scalar",
+        "normalized_range": [
+          0.9,
+          1.1
+        ],
+        "recommended_num_points": 256,
+        "store_absolute_frequency_axis": true
+      }
+    },
+    "_metadata": {
+      "source_path": "/home/gijeong/Inverse Design/runs/0329TEST/meshes/volumes/problem_spec_used.yaml"
+    }
+  },
+  "notes": [
+    "Use the STEP geometry as a 3D solid model in Workbench; do not replace it with a 2D or reduced-order representation.",
+    "The Python path uses its own Gmsh-derived solver mesh; ANSYS should import the STEP assembly directly and mesh it inside Workbench.",
+    "Keep the ANSYS setup synchronized with the FEniCS path through the shared problem specification embedded in this handoff file."
+  ]
+}

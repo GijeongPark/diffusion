@@ -67,7 +67,7 @@ def build_mechanical_config_kwargs(problem_spec: Mapping[str, Any]) -> dict[str,
     piezoelectric = materials.get("piezoelectric", {}) if isinstance(materials, Mapping) else {}
     geometry = problem_spec.get("geometry", {})
 
-    piezo_density = piezoelectric.get("density_kg_per_m3", substrate.get("density_kg_per_m3", 7800.0))
+    piezo_density = piezoelectric.get("density_kg_per_m3", 7500.0)
     if isinstance(geometry, Mapping) and "piezo_density_kg_per_m3" in geometry:
         piezo_density = geometry["piezo_density_kg_per_m3"]
 
@@ -99,11 +99,27 @@ def build_piezo_config_kwargs(problem_spec: Mapping[str, Any]) -> dict[str, Any]
         raise ValueError("Problem specification must define materials.piezoelectric.full_3d_constants.stiffness_cE_pa.")
 
     return {
-        "thickness_m": float(geometry.get("piezo_patch_thickness_m", 2.667e-4)),
+        "thickness_m": float(geometry.get("piezo_patch_thickness_m", 1.0e-4)),
         "resistance_ohm": float(electrical.get("external_load_resistance_ohm", 1.0e4)),
         "eps33s_f_per_m": float(eps_matrix[2][2]),
         "e_matrix_c_per_m2": tuple(tuple(float(value) for value in row) for row in e_matrix),
         "stiffness_cE_pa": tuple(tuple(float(value) for value in row) for row in stiffness),
+    }
+
+
+def build_runtime_defaults(problem_spec: Mapping[str, Any]) -> dict[str, float]:
+    geometry = problem_spec.get("geometry", {})
+    materials = problem_spec.get("materials", {})
+    substrate = materials.get("substrate", {}) if isinstance(materials, Mapping) else {}
+    mechanics = build_mechanical_config_kwargs(problem_spec)
+    electrical = problem_spec.get("electrical", {})
+
+    return {
+        "substrate_thickness_m": float(geometry.get("substrate_thickness_m", 1.0e-3)),
+        "piezo_thickness_m": float(geometry.get("piezo_patch_thickness_m", 1.0e-4)),
+        "substrate_rho": float(substrate.get("density_kg_per_m3", mechanics["substrate_rho"])),
+        "piezo_rho": float(mechanics["piezo_rho"]),
+        "resistance_ohm": float(electrical.get("external_load_resistance_ohm", 1.0e4)),
     }
 
 

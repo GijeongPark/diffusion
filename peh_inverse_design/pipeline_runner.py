@@ -8,12 +8,13 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 from .problem_spec import (
+    build_runtime_defaults,
     default_problem_spec_path,
     geometry_defaults_from_problem_spec,
     load_problem_spec,
@@ -32,8 +33,8 @@ class PipelineConfig:
     materialize_input_dataset: bool = True
     problem_spec_path: str | Path | None = None
     docker_image: str = "dolfinx/dolfinx:stable"
-    substrate_thickness_m: float = 1.0e-3
-    piezo_thickness_m: float = 2.667e-4
+    substrate_thickness_m: float | None = None
+    piezo_thickness_m: float | None = None
     mesh_size_scale: float = 0.08
     cad_reference_size_scale: float = 0.01
     limit_solver_mesh_by_thickness: bool = False
@@ -52,8 +53,8 @@ class PipelineConfig:
     cell_size_y_m: float | None = None
     tile_count_x: int | None = None
     tile_count_y: int | None = None
-    substrate_rho: float = 7930.0
-    piezo_rho: float = 7800.0
+    substrate_rho: float | None = None
+    piezo_rho: float | None = None
     exact_cad: bool = True
     repair_cad: bool = False
     repair_bridge_width_m: float | None = None
@@ -389,6 +390,57 @@ def _resolve_problem_spec_path(config: PipelineConfig, project_root: Path) -> Pa
     return None
 
 
+def _resolve_runtime_config(config: PipelineConfig, problem_spec: dict[str, object] | None) -> PipelineConfig:
+    runtime_defaults = build_runtime_defaults(problem_spec) if problem_spec is not None else {}
+    return replace(
+        config,
+        substrate_thickness_m=float(
+            runtime_defaults.get("substrate_thickness_m", 1.0e-3)
+            if config.substrate_thickness_m is None
+            else config.substrate_thickness_m
+        ),
+        piezo_thickness_m=float(
+            runtime_defaults.get("piezo_thickness_m", 1.0e-4)
+            if config.piezo_thickness_m is None
+            else config.piezo_thickness_m
+        ),
+        substrate_rho=float(
+            runtime_defaults.get("substrate_rho", 7930.0)
+            if config.substrate_rho is None
+            else config.substrate_rho
+        ),
+        piezo_rho=float(
+            runtime_defaults.get("piezo_rho", 7500.0)
+            if config.piezo_rho is None
+            else config.piezo_rho
+        ),
+    )
+
+
+def _write_run_config_snapshot(
+    run_root: Path,
+    config: PipelineConfig,
+    problem_spec_path: Path | None,
+    runtime_problem_spec_path: Path | None,
+    geometry_scale_source: str,
+    plate_size_m: tuple[float, float],
+) -> Path:
+    snapshot_path = run_root / "data" / "run_config_used.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "problem_spec_path": "" if problem_spec_path is None else str(problem_spec_path),
+        "runtime_problem_spec_path": "" if runtime_problem_spec_path is None else str(runtime_problem_spec_path),
+        "geometry_scale_source": str(geometry_scale_source),
+        "effective_plate_size_m": [float(plate_size_m[0]), float(plate_size_m[1])],
+        "effective_config": {
+            key: (str(value) if isinstance(value, Path) else value)
+            for key, value in asdict(config).items()
+        },
+    }
+    snapshot_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    return snapshot_path
+
+
 def _prepare_candidate_unit_cell_dataset(config: PipelineConfig, run_root: Path, project_root: Path) -> Path:
     source_path = _resolve_path(config.source_unit_cell_npz, project_root)
     if not source_path.exists():
@@ -546,10 +598,12 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
 
     problem_spec_path = _resolve_problem_spec_path(config, project_root)
     runtime_problem_spec_path: Path | None = None
+    problem_spec: dict[str, object] | None = None
     if problem_spec_path is not None:
         runtime_problem_spec_path = run_root / "data" / "problem_spec_used.yaml"
         problem_spec = load_problem_spec(problem_spec_path, project_root=project_root)
         write_problem_spec_snapshot(problem_spec, runtime_problem_spec_path)
+    config = _resolve_runtime_config(config, problem_spec)
     candidate_unit_cell_npz = _prepare_candidate_unit_cell_dataset(config, run_root, project_root)
     cell_size_m, tile_counts, geometry_scale_source = _resolve_geometry_scale_summary(
         config,
@@ -571,6 +625,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         float(cell_size_m[0]) * int(tile_counts[0]),
         float(cell_size_m[1]) * int(tile_counts[1]),
     )
+    run_config_path = _write_run_config_snapshot(
+        run_root=run_root,
+        config=config,
+        problem_spec_path=problem_spec_path,
+        runtime_problem_spec_path=runtime_problem_spec_path,
+        geometry_scale_source=geometry_scale_source,
+        plate_size_m=plate_size_m,
+    )
     print(
         "Geometry scale       : "
         f"cell=({cell_size_m[0]:.6g}, {cell_size_m[1]:.6g}) m, "
@@ -578,6 +640,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"plate=({plate_size_m[0]:.6g}, {plate_size_m[1]:.6g}) m "
         f"[source: {geometry_scale_source}]"
     )
+    print(f"Run config snapshot : {run_config_path}")
     cad_mode = "repair" if config.repair_cad else "exact"
     if config.repair_cad and config.repair_bridge_width_m is not None:
         print(
@@ -811,8 +874,18 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-ids", default="", help="Comma-separated sample ids to process exactly. Overrides limit-based success targeting.")
     parser.add_argument("--problem-spec", default="", help="Optional shared problem specification YAML.")
     parser.add_argument("--docker-image", "--image", dest="docker_image", default="dolfinx/dolfinx:stable", help="Docker image used for the FEniCSx solve.")
-    parser.add_argument("--substrate-thickness", type=float, default=1.0e-3, help="Substrate thickness in meters.")
-    parser.add_argument("--piezo-thickness", type=float, default=2.667e-4, help="Piezo thickness in meters.")
+    parser.add_argument(
+        "--substrate-thickness",
+        type=float,
+        default=None,
+        help="Substrate thickness in meters. Defaults to the shared problem spec when available.",
+    )
+    parser.add_argument(
+        "--piezo-thickness",
+        type=float,
+        default=None,
+        help="Piezo thickness in meters. Defaults to the shared problem spec when available.",
+    )
     parser.add_argument("--mesh-size-scale", type=float, default=0.08, help="Target in-plane solver element size as a fraction of one cell size.")
     parser.add_argument("--cad-reference-size-scale", type=float, default=0.01, help="Reference size for CAD feature checks as a fraction of one cell size.")
     parser.add_argument("--solver-mesh-backend", default="layered_tet", choices=["layered_tet", "gmsh_volume"], help="Python solver mesh backend. layered_tet is the fast default.")
@@ -841,8 +914,18 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cell-size-y-m", type=float, default=None, help="Unit-cell size in y in meters.")
     parser.add_argument("--tile-count-x", type=int, default=None, help="Number of tiled unit cells in x.")
     parser.add_argument("--tile-count-y", type=int, default=None, help="Number of tiled unit cells in y.")
-    parser.add_argument("--substrate-rho", type=float, default=7930.0, help="Substrate density in kg/m^3.")
-    parser.add_argument("--piezo-rho", type=float, default=7800.0, help="Piezo density in kg/m^3.")
+    parser.add_argument(
+        "--substrate-rho",
+        type=float,
+        default=None,
+        help="Substrate density in kg/m^3. Defaults to the shared problem spec when available.",
+    )
+    parser.add_argument(
+        "--piezo-rho",
+        type=float,
+        default=None,
+        help="Piezo density in kg/m^3. Defaults to the shared problem spec when available.",
+    )
     parser.add_argument("--repair-cad", action="store_true", help="Use explicit bridge-repair CAD instead of exact topology-preserving CAD.")
     parser.add_argument("--repair-bridge-width-m", type=float, default=None, help="Explicit bridge width in repair CAD mode.")
     parser.add_argument("--no-reports", action="store_true", help="Skip summary image generation.")
@@ -863,8 +946,8 @@ def main() -> None:
         materialize_input_dataset=not bool(args.no_materialize_input_dataset),
         problem_spec_path=args.problem_spec or None,
         docker_image=args.docker_image,
-        substrate_thickness_m=float(args.substrate_thickness),
-        piezo_thickness_m=float(args.piezo_thickness),
+        substrate_thickness_m=None if args.substrate_thickness is None else float(args.substrate_thickness),
+        piezo_thickness_m=None if args.piezo_thickness is None else float(args.piezo_thickness),
         mesh_size_scale=float(args.mesh_size_scale),
         cad_reference_size_scale=float(args.cad_reference_size_scale),
         limit_solver_mesh_by_thickness=bool(args.limit_solver_mesh_by_thickness),
@@ -885,8 +968,8 @@ def main() -> None:
         cell_size_y_m=args.cell_size_y_m,
         tile_count_x=args.tile_count_x,
         tile_count_y=args.tile_count_y,
-        substrate_rho=float(args.substrate_rho),
-        piezo_rho=float(args.piezo_rho),
+        substrate_rho=None if args.substrate_rho is None else float(args.substrate_rho),
+        piezo_rho=None if args.piezo_rho is None else float(args.piezo_rho),
         exact_cad=not bool(args.repair_cad),
         repair_cad=bool(args.repair_cad),
         repair_bridge_width_m=args.repair_bridge_width_m,

@@ -15,6 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from peh_inverse_design.problem_spec import (
+        build_runtime_defaults,
         build_mechanical_config_kwargs,
         build_piezo_config_kwargs,
         default_problem_spec_path,
@@ -24,6 +25,7 @@ if __package__ in (None, ""):
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from .problem_spec import (
+        build_runtime_defaults,
         build_mechanical_config_kwargs,
         build_piezo_config_kwargs,
         default_problem_spec_path,
@@ -37,14 +39,14 @@ class MechanicalConfig:
     substrate_E_pa: float = 1.9305e11
     substrate_nu: float = 0.30
     substrate_rho: float = 7930.0
-    piezo_rho: float = 7800.0
+    piezo_rho: float = 7500.0
     damping_ratio: float = 0.025
     base_acceleration_m_per_s2: float = 2.5
 
 
 @dataclass(frozen=True)
 class PiezoConfig:
-    thickness_m: float = 2.667e-4
+    thickness_m: float = 1.0e-4
     resistance_ohm: float = 1.0e4
     eps33s_f_per_m: float = 1.26934e-08
     e_matrix_c_per_m2: tuple[tuple[float, ...], ...] = (
@@ -839,6 +841,12 @@ def solve_modal_voltage_frf(
             "modal_theta": modal_model["modal_theta"],
             "modal_mass": modal_model["modal_mass"],
             "capacitance_f": modal_model["capacitance_f"],
+            "substrate_rho": np.asarray(mechanical.substrate_rho, dtype=np.float64),
+            "piezo_rho": np.asarray(mechanical.piezo_rho, dtype=np.float64),
+            "damping_ratio": np.asarray(mechanical.damping_ratio, dtype=np.float64),
+            "base_acceleration_m_per_s2": np.asarray(mechanical.base_acceleration_m_per_s2, dtype=np.float64),
+            "piezo_thickness_m": np.asarray(piezo.thickness_m, dtype=np.float64),
+            "resistance_ohm": np.asarray(piezo.resistance_ohm, dtype=np.float64),
             "field_frequency_hz": np.asarray(f_peak_hz, dtype=np.float64),
             "top_surface_strain_eqv": top_surface_strain,
         }
@@ -1014,14 +1022,14 @@ def main() -> None:
     parser.add_argument(
         "--substrate-rho",
         type=float,
-        default=7930.0,
-        help="Substrate density in kg/m^3.",
+        default=None,
+        help="Substrate density in kg/m^3. Defaults to the shared problem spec when available.",
     )
     parser.add_argument(
         "--piezo-rho",
         type=float,
-        default=7800.0,
-        help="Piezo density in kg/m^3.",
+        default=None,
+        help="Piezo density in kg/m^3. Defaults to the shared problem spec when available.",
     )
     parser.add_argument(
         "--problem-spec",
@@ -1046,15 +1054,22 @@ def main() -> None:
 
     if problem_spec is not None:
         mechanical_kwargs = build_mechanical_config_kwargs(problem_spec)
-        mechanical_kwargs["substrate_rho"] = float(args.substrate_rho)
-        mechanical_kwargs["piezo_rho"] = float(args.piezo_rho)
+        runtime_defaults = build_runtime_defaults(problem_spec)
+        if args.substrate_rho is not None:
+            mechanical_kwargs["substrate_rho"] = float(args.substrate_rho)
+        else:
+            mechanical_kwargs["substrate_rho"] = float(runtime_defaults["substrate_rho"])
+        if args.piezo_rho is not None:
+            mechanical_kwargs["piezo_rho"] = float(args.piezo_rho)
+        else:
+            mechanical_kwargs["piezo_rho"] = float(runtime_defaults["piezo_rho"])
         piezo_kwargs = build_piezo_config_kwargs(problem_spec)
         mechanical = MechanicalConfig(**mechanical_kwargs)
         piezo = PiezoConfig(**piezo_kwargs)
     else:
         mechanical = MechanicalConfig(
-            substrate_rho=float(args.substrate_rho),
-            piezo_rho=float(args.piezo_rho),
+            substrate_rho=MechanicalConfig.substrate_rho if args.substrate_rho is None else float(args.substrate_rho),
+            piezo_rho=MechanicalConfig.piezo_rho if args.piezo_rho is None else float(args.piezo_rho),
         )
         piezo = PiezoConfig()
 

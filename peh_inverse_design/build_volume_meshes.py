@@ -190,6 +190,33 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ansys-step-strategy",
+        default=VolumeMeshConfig().ansys_step_strategy,
+        choices=["partitioned_interface", "single_face_assembly"],
+        help=(
+            "Primary one-file ANSYS STEP strategy. single_face_assembly keeps the piezo bottom continuous; "
+            "partitioned_interface keeps a conformal imprinted interface."
+        ),
+    )
+    parser.add_argument(
+        "--cad-planform-simplify-scale",
+        type=float,
+        default=VolumeMeshConfig().cad_planform_simplify_relative_to_reference,
+        help=(
+            "CAD-only boundary simplification strength, relative to the CAD reference size. "
+            "Larger values export a more mesh-friendly STEP without changing the Python solver mesh geometry."
+        ),
+    )
+    parser.add_argument(
+        "--cad-min-hole-area-scale",
+        type=float,
+        default=VolumeMeshConfig().cad_min_hole_area_relative_to_reference_squared,
+        help=(
+            "CAD-only minimum retained hole area, relative to the squared CAD reference size. "
+            "Larger values remove more substrate holes from the STEP export without changing the Python solver mesh geometry."
+        ),
+    )
+    parser.add_argument(
         "--substrate-layers",
         type=int,
         default=2,
@@ -200,6 +227,15 @@ def main() -> None:
         type=int,
         default=1,
         help="Number of swept layers through the piezo thickness for the fast layered_tet solver mesh.",
+    )
+    parser.add_argument(
+        "--solver-max-q2-vector-dofs",
+        type=int,
+        default=VolumeMeshConfig().max_solver_vector_dofs,
+        help=(
+            "Estimated quadratic vector-DOF cap for the layered_tet solver mesh. "
+            "The mesh is coarsened automatically until it falls below this limit."
+        ),
     )
     parser.add_argument(
         "--write-native-msh",
@@ -217,6 +253,14 @@ def main() -> None:
         help=(
             "Restore the old behavior that caps the solver mesh size by the total thickness. "
             "Disabled by default because it explodes the in-plane element count for thin plates."
+        ),
+    )
+    parser.add_argument(
+        "--export-inspection-single-face-step",
+        action="store_true",
+        help=(
+            "Also export the optional inspection-only STEP whose piezo bottom stays a single continuous face. "
+            "Disabled by default because it adds an extra OCC export/roundtrip validation pass per sample."
         ),
     )
     parser.add_argument(
@@ -264,12 +308,19 @@ def main() -> None:
         substrate_layers=int(args.substrate_layers),
         piezo_layers=int(args.piezo_layers),
         solver_mesh_backend=str(args.solver_mesh_backend),
+        ansys_step_strategy=str(args.ansys_step_strategy),
         write_native_msh=bool(args.write_native_msh),
         write_xdmf=bool(args.write_xdmf),
         require_connected_substrate=True,
         exact_cad=not bool(args.repair_cad),
         repair_cad=bool(args.repair_cad),
         repair_bridge_width_m=None if args.repair_bridge_width_m is None else float(args.repair_bridge_width_m),
+        max_solver_vector_dofs=(
+            None if args.solver_max_q2_vector_dofs is None else int(args.solver_max_q2_vector_dofs)
+        ),
+        export_inspection_single_face_step=bool(args.export_inspection_single_face_step),
+        cad_planform_simplify_relative_to_reference=float(args.cad_planform_simplify_scale),
+        cad_min_hole_area_relative_to_reference_squared=float(args.cad_min_hole_area_scale),
     )
 
     mesh_dir = Path(args.mesh_dir)
@@ -296,7 +347,8 @@ def main() -> None:
                 "Resolved plate dimensions: "
                 f"cell=({geometry_config.cell_size_m[0]:.6g}, {geometry_config.cell_size_m[1]:.6g}) m, "
                 f"tiles={geometry_config.tile_counts[0]} x {geometry_config.tile_counts[1]}, "
-                f"plate=({plate_lx:.6g}, {plate_ly:.6g}) m"
+                f"plate=({plate_lx:.6g}, {plate_ly:.6g}) m",
+                flush=True,
             )
             last_geometry_signature = geometry_signature
         examined += 1
@@ -320,16 +372,22 @@ def main() -> None:
                 )
             else:
                 if problem_spec is not None:
+                    combined_step_path = mesh_dir / f"plate3d_{sample_id:04d}.step"
+                    inspection_step_path = mesh_dir / f"plate3d_{sample_id:04d}_single_face_probe.step"
+                    face_selection_manifest_path = mesh_dir / f"plate3d_{sample_id:04d}_ansys_face_groups.json"
                     write_ansys_workbench_handoff(
                         sample_id=sample_id,
                         output_path=mesh_dir / f"plate3d_{sample_id:04d}_ansys_workbench.json",
-                        step_path=mesh_dir / f"plate3d_{sample_id:04d}.step",
+                        step_path=combined_step_path if combined_step_path.exists() else None,
                         msh_path=None,
                         cad_report_path=mesh_dir / f"plate3d_{sample_id:04d}_cad.json",
                         solver_mesh_path=path,
                         geometry_config=geometry_config,
                         volume_config=volume_config,
                         problem_spec=problem_spec,
+                        inspection_single_face_step_path=inspection_step_path if inspection_step_path.exists() else None,
+                        face_selection_manifest_path=
+                            face_selection_manifest_path if face_selection_manifest_path.exists() else None,
                     )
                 ok += 1
                 selected_source_indices.append(int(idx))
@@ -343,8 +401,8 @@ def main() -> None:
                     "error": str(exc),
                 }
             )
-            print(f"[sample {sample_id:04d}] CAD export failed: {exc}", file=sys.stderr)
-        print(f"[{idx + 1:4d}/{n_candidates}] ok={ok} fail={fail}")
+            print(f"[sample {sample_id:04d}] CAD export failed: {exc}", file=sys.stderr, flush=True)
+        print(f"[{idx + 1:4d}/{n_candidates}] ok={ok} fail={fail}", flush=True)
 
     summary_path = mesh_dir / "mesh_build_summary.json"
     summary_path.write_text(
@@ -358,8 +416,16 @@ def main() -> None:
                 "cad_mode": "repair" if volume_config.repair_cad else "exact",
                 "solver_mesh_size_relative_to_cell": float(volume_config.mesh_size_relative_to_cell),
                 "cad_reference_size_relative_to_cell": float(volume_config.cad_reference_size_relative_to_cell),
+                "cad_planform_simplify_relative_to_reference": float(volume_config.cad_planform_simplify_relative_to_reference),
+                "cad_min_hole_area_relative_to_reference_squared": float(
+                    volume_config.cad_min_hole_area_relative_to_reference_squared
+                ),
                 "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
                 "solver_mesh_backend": str(volume_config.solver_mesh_backend),
+                "max_solver_vector_dofs": None
+                if volume_config.max_solver_vector_dofs is None
+                else int(volume_config.max_solver_vector_dofs),
+                "ansys_step_strategy": str(volume_config.ansys_step_strategy),
                 "substrate_layers": int(volume_config.substrate_layers),
                 "piezo_layers": int(volume_config.piezo_layers),
                 "problem_spec_path": "" if problem_spec is None else str(problem_spec.get("_metadata", {}).get("source_path", "")),
@@ -372,8 +438,8 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    print(f"Saved {ok} ANSYS STEP exports and Python solver meshes to {mesh_dir}")
-    print(f"Saved mesh build summary to {summary_path}")
+    print(f"Saved {ok} ANSYS STEP exports and Python solver meshes to {mesh_dir}", flush=True)
+    print(f"Saved mesh build summary to {summary_path}", flush=True)
     if target_ok is not None and ok < target_ok:
         raise SystemExit(
             "Could not generate the requested number of solid exports. "

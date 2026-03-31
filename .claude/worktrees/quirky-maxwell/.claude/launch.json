@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jupyter-lab",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["-e", "bash", "-c", "cd /home/gijeong/'Inverse Design' && .venv/bin/jupyter lab --port=8888 --no-browser --ip=0.0.0.0"],
+      "port": 8888
+    },
+    {
+      "name": "jupyter-notebook",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["-e", "bash", "-c", "cd /home/gijeong/'Inverse Design' && .venv/bin/jupyter notebook --port=8888 --no-browser --ip=0.0.0.0"],
+      "port": 8888
+    }
+  ]
+}

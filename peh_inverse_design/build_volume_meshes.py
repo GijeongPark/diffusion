@@ -11,6 +11,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.geometry_pipeline import GeometryBuildConfig
     from peh_inverse_design.problem_spec import (
+        build_runtime_defaults,
         default_problem_spec_path,
         geometry_defaults_from_problem_spec,
         load_problem_spec,
@@ -24,6 +25,7 @@ if __package__ in (None, ""):
 else:
     from .geometry_pipeline import GeometryBuildConfig
     from .problem_spec import (
+        build_runtime_defaults,
         default_problem_spec_path,
         geometry_defaults_from_problem_spec,
         load_problem_spec,
@@ -156,14 +158,14 @@ def main() -> None:
     parser.add_argument(
         "--substrate-thickness",
         type=float,
-        default=1.0e-3,
-        help="Substrate thickness in meters.",
+        default=None,
+        help="Substrate thickness in meters. Defaults to the shared problem spec when available.",
     )
     parser.add_argument(
         "--piezo-thickness",
         type=float,
-        default=2.667e-4,
-        help="Piezo thickness in meters.",
+        default=None,
+        help="Piezo thickness in meters. Defaults to the shared problem spec when available.",
     )
     parser.add_argument(
         "--mesh-size-scale",
@@ -291,6 +293,7 @@ def main() -> None:
     else:
         default_spec_path = default_problem_spec_path(project_root)
         problem_spec = load_problem_spec(default_spec_path, project_root=project_root) if default_spec_path.exists() else None
+    runtime_defaults = build_runtime_defaults(problem_spec) if problem_spec is not None else {}
 
     data = np.load(args.unit_cell_npz, allow_pickle=True)
     n_total = int(data["grf"].shape[0])
@@ -300,8 +303,16 @@ def main() -> None:
         raise ValueError("--target-ok must be strictly positive when provided.")
 
     volume_config = VolumeMeshConfig(
-        substrate_thickness_m=float(args.substrate_thickness),
-        piezo_thickness_m=float(args.piezo_thickness),
+        substrate_thickness_m=float(
+            runtime_defaults.get("substrate_thickness_m", 1.0e-3)
+            if args.substrate_thickness is None
+            else args.substrate_thickness
+        ),
+        piezo_thickness_m=float(
+            runtime_defaults.get("piezo_thickness_m", 1.0e-4)
+            if args.piezo_thickness is None
+            else args.piezo_thickness
+        ),
         mesh_size_relative_to_cell=float(args.mesh_size_scale),
         cad_reference_size_relative_to_cell=float(args.cad_reference_size_scale),
         limit_solver_mesh_by_thickness=bool(args.limit_solver_mesh_by_thickness),

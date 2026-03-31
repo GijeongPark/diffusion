@@ -22,6 +22,7 @@ materials:
     poisson_ratio: 0.30
     density_kg_per_m3: 7930.0
   piezoelectric:
+    density_kg_per_m3: 7500.0
     polarization_axis: z
     reduced_plate_constants:
       e31_c_per_m2: -23.38

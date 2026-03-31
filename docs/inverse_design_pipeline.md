@@ -18,7 +18,7 @@ This is **not** an infinite periodic-cell problem. The final forward model shoul
 | Number of repeated cells | `10 x 10` |
 | Total plate size | `1.00 m x 1.00 m` |
 | Substrate thickness `h_s` | `1.0 mm` |
-| Piezo patch thickness `h_pz` | `0.2667 mm` |
+| Piezo patch thickness `h_pz` | `0.1 mm` |
 | Piezo coverage | Fully covered patch |
 
 ### Substrate material
@@ -33,6 +33,7 @@ This is **not** an infinite periodic-cell problem. The final forward model shoul
 
 | Quantity | Value |
 | --- | --- |
+| Density `rho` | `7500 kg/m^3` |
 | Reduced piezoelectric constant `e_31` | `-23.38 C/m^2` |
 | Dielectric permittivity at constant strain `eps_33^S` | `17.29e-09 F/m` |
 | Polarization direction | Thickness direction (`z`, axis 3) |
@@ -233,7 +234,7 @@ The current FEniCSx implementation in this repository uses a 3D layered mesh and
 
 Current implementation note:
 
-- the solver currently assumes `piezo density = 7800 kg/m^3` unless overridden at runtime
+- the fixed machine-readable problem spec uses `piezo density = 7500 kg/m^3` and `piezo thickness = 0.1 mm`, and the runtime defaults are aligned with that spec
 - the mesh builder now emits a **combined one-file** ANSYS handoff by default:
   - `plate3d_XXXX.step`: combined metaplate + piezo STEP with a conformal, meshable interface
   - `plate3d_XXXX_single_face_probe.step`: optional legacy combined-file probe when explicitly requested

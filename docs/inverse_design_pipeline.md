@@ -234,12 +234,22 @@ The current FEniCSx implementation in this repository uses a 3D layered mesh and
 Current implementation note:
 
 - the solver currently assumes `piezo density = 7800 kg/m^3` unless overridden at runtime
-- the mesh builder also emits `plate3d_*.step` files so the same repeated geometry can be imported through the ANSYS Workbench Geometry cell as CAD geometry
+- the mesh builder now emits a **combined one-file** ANSYS handoff by default:
+  - `plate3d_XXXX.step`: combined metaplate + piezo STEP with a conformal, meshable interface
+  - `plate3d_XXXX_single_face_probe.step`: optional legacy combined-file probe when explicitly requested
+  - `plate3d_XXXX_ansys_face_groups.json`: face-selection recipe for bottom electrode/interface grouping in Workbench
 - the CAD STEP export now defaults to `exact` mode: preserve the tiled substrate topology, reject disconnected or under-resolved planforms, and require exactly two watertight solids after STEP round-trip validation
+- for Workbench meshing, prefer `plate3d_XXXX.step`; if the piezo bottom imports as many CAD regions, use the face-group recipe instead of manually selecting every fragment
 - if disconnected samples must still be exported for manufacturing-style repair, use the explicit `repair` mode to add real connector geometry rather than a global morphological closing
-- each CAD export writes `plate3d_XXXX_cad.json`, and each run writes `mesh_build_summary.json`, so rejected samples are traceable instead of failing later in the solver stage
+- each CAD export writes `plate3d_XXXX_cad.json`, `plate3d_XXXX_ansys_workbench.json`, and `plate3d_XXXX_ansys_face_groups.json`, and each run writes `mesh_build_summary.json`, so rejected samples and Workbench scoping rules are traceable instead of failing later in the solver stage
 - the in-house 3D solver mesh is now intentionally decoupled from the total thickness: CAD validation uses a small reference size, while the FEniCSx mesh uses the requested in-plane scale unless you explicitly restore thickness-limited meshing
 - the default FEniCSx batch solve now runs all samples in one container invocation, skips already-finished outputs, and uses quadratic solid interpolation for better thin-plate bending accuracy at practical mesh sizes
+
+Result-visualization note:
+
+- the report strain panel is the **piezo top-surface** strain field, not the exposed metaplate top surface
+- because the piezo patch fully covers the plate, the raw top view can look almost solid even when the substrate contains a strong unit-cell pattern underneath
+- the visualizer therefore overlays the tiled substrate footprint on top of the piezo-surface strain/mesh plot so the geometry and the response panel stay interpretable together
 
 ## 6. Recommended ML Pipeline
 

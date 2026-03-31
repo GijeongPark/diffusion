@@ -833,6 +833,7 @@ def solve_modal_voltage_frf(
         modes_output_dir.mkdir(parents=True, exist_ok=True)
         modal_save = {
             "sample_id": np.asarray(sample_id, dtype=np.int32),
+            "element_order": np.asarray([int(element_order)], dtype=np.int32),
             "eigenfreq_hz": modal_model["eigenfreq_hz"],
             "modal_force": modal_model["modal_force"],
             "modal_theta": modal_model["modal_theta"],

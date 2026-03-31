@@ -38,6 +38,7 @@ class PipelineConfig:
     cad_reference_size_scale: float = 0.01
     limit_solver_mesh_by_thickness: bool = False
     solver_mesh_backend: str = "layered_tet"
+    ansys_step_strategy: str = "single_face_assembly"
     substrate_layers: int = 2
     piezo_layers: int = 1
     solver_num_modes: int = 8
@@ -45,6 +46,8 @@ class PipelineConfig:
     solver_element_order: int = 2
     solver_store_mode_shapes: bool = False
     skip_existing_solver_outputs: bool = True
+    solver_max_q2_vector_dofs: int | None = 5_000_000
+    solver_oom_fallback_element_order: int | None = 1
     cell_size_x_m: float | None = None
     cell_size_y_m: float | None = None
     tile_count_x: int | None = None
@@ -54,6 +57,7 @@ class PipelineConfig:
     exact_cad: bool = True
     repair_cad: bool = False
     repair_bridge_width_m: float | None = None
+    export_inspection_single_face_step: bool = False
     create_reports: bool = True
     build_integrated_dataset: bool = True
 
@@ -68,8 +72,14 @@ class PipelineConfig:
             )
         if str(self.solver_mesh_backend).strip().lower() not in {"layered_tet", "gmsh_volume"}:
             raise ValueError("solver_mesh_backend must be 'layered_tet' or 'gmsh_volume'.")
+        if str(self.ansys_step_strategy).strip().lower() not in {"partitioned_interface", "single_face_assembly"}:
+            raise ValueError("ansys_step_strategy must be 'partitioned_interface' or 'single_face_assembly'.")
         if int(self.substrate_layers) <= 0 or int(self.piezo_layers) <= 0:
             raise ValueError("substrate_layers and piezo_layers must be positive integers.")
+        if self.solver_max_q2_vector_dofs is not None and int(self.solver_max_q2_vector_dofs) <= 0:
+            raise ValueError("solver_max_q2_vector_dofs must be strictly positive when provided.")
+        if self.solver_oom_fallback_element_order is not None and int(self.solver_oom_fallback_element_order) <= 0:
+            raise ValueError("solver_oom_fallback_element_order must be strictly positive when provided.")
 
 
 @dataclass(frozen=True)
@@ -118,16 +128,20 @@ def _infer_run_name(config: PipelineConfig, source_path: Path) -> str:
 
 
 def _print_step(title: str) -> None:
-    print()
-    print("=" * 72)
-    print(title)
-    print("=" * 72)
+    print(flush=True)
+    print("=" * 72, flush=True)
+    print(title, flush=True)
+    print("=" * 72, flush=True)
 
 
 def _run_command(args: list[str | Path], cwd: Path, env: dict[str, str] | None = None) -> None:
     rendered = " ".join(shlex.quote(str(arg)) for arg in args)
-    print(f"$ {rendered}")
-    subprocess.run([str(arg) for arg in args], cwd=str(cwd), env=env, check=True)
+    print(f"$ {rendered}", flush=True)
+    merged_env = os.environ.copy()
+    if env is not None:
+        merged_env.update(env)
+    merged_env.setdefault("PYTHONUNBUFFERED", "1")
+    subprocess.run([str(arg) for arg in args], cwd=str(cwd), env=merged_env, check=True)
 
 
 def _load_mesh_build_summary(mesh_dir: Path) -> dict[str, object] | None:
@@ -211,6 +225,7 @@ def _build_solver_inner_args(
     runtime_problem_spec_path: Path | None,
     mesh_path: Path | None = None,
     mesh_dir: Path | None = None,
+    element_order: int | None = None,
 ) -> list[str]:
     solver_args = ["python3", "-m", "peh_inverse_design.fenicsx_modal_solver"]
     if mesh_path is not None:
@@ -232,7 +247,7 @@ def _build_solver_inner_args(
             "--search-points",
             str(config.solver_search_points),
             "--element-order",
-            str(config.solver_element_order),
+            str(config.solver_element_order if element_order is None else int(element_order)),
         ]
     )
     if config.solver_store_mode_shapes:
@@ -253,6 +268,7 @@ def _build_solver_docker_command(
     runtime_problem_spec_path: Path | None,
     mesh_path: Path | None = None,
     mesh_dir: Path | None = None,
+    element_order: int | None = None,
 ) -> list[str]:
     solver_args = _build_solver_inner_args(
         project_root=project_root,
@@ -262,6 +278,7 @@ def _build_solver_docker_command(
         runtime_problem_spec_path=runtime_problem_spec_path,
         mesh_path=mesh_path,
         mesh_dir=mesh_dir,
+        element_order=element_order,
     )
     solver_inner = " ".join(shlex.quote(str(arg)) for arg in solver_args)
     return [
@@ -326,10 +343,36 @@ def _run_solver_with_isolated_retry(
                 cwd=project_root,
             )
         except subprocess.CalledProcessError as mesh_exc:
+            fallback_order = config.solver_oom_fallback_element_order
+            if (
+                mesh_exc.returncode == 137
+                and fallback_order is not None
+                and int(fallback_order) < int(config.solver_element_order)
+            ):
+                print(
+                    f"{mesh_path.name} hit Docker exit 137 with element_order={config.solver_element_order}. "
+                    f"Retrying once with the lower-memory fallback element_order={int(fallback_order)}."
+                )
+                try:
+                    _run_command(
+                        _build_solver_docker_command(
+                            project_root=project_root,
+                            response_dir=response_dir,
+                            modal_dir=modal_dir,
+                            config=config,
+                            runtime_problem_spec_path=runtime_problem_spec_path,
+                            mesh_path=mesh_path,
+                            element_order=int(fallback_order),
+                        ),
+                        cwd=project_root,
+                    )
+                    continue
+                except subprocess.CalledProcessError as fallback_exc:
+                    mesh_exc = fallback_exc
             raise RuntimeError(
                 f"Isolated solver retry failed for {mesh_path.name} with exit status {mesh_exc.returncode}. "
-                "If this persists, coarsen the solver mesh, reduce the number of samples per run, or lower "
-                "--solver-element-order."
+                "If this persists, reduce the number of samples per run, lower solver_max_q2_vector_dofs, "
+                "or lower --solver-element-order."
             ) from mesh_exc
 
 
@@ -498,8 +541,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
     run_root = _resolve_path(Path(config.output_root) / run_name, project_root)
     run_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Notebook/kernel python : {sys.executable}")
-    print(f"Pipeline step python   : {project_python}")
+    print(f"Notebook/kernel python : {sys.executable}", flush=True)
+    print(f"Pipeline step python   : {project_python}", flush=True)
 
     problem_spec_path = _resolve_problem_spec_path(config, project_root)
     runtime_problem_spec_path: Path | None = None
@@ -549,7 +592,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"modes={config.solver_num_modes}, search_points={config.solver_search_points}, "
         f"element_order={config.solver_element_order}, skip_existing={config.skip_existing_solver_outputs}, "
         f"mesh_size_scale={config.mesh_size_scale:.6g}, cad_reference_scale={config.cad_reference_size_scale:.6g}, "
-        f"thickness_limited_mesh={config.limit_solver_mesh_by_thickness}"
+        f"max_q2_vector_dofs={config.solver_max_q2_vector_dofs}, "
+        f"oom_fallback_order={config.solver_oom_fallback_element_order}, "
+        f"ansys_step_strategy={config.ansys_step_strategy}, thickness_limited_mesh={config.limit_solver_mesh_by_thickness}"
     )
 
     _print_step("Step 1/5: Export ANSYS STEP geometry and build Python solver meshes")
@@ -574,17 +619,23 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         str(config.cad_reference_size_scale),
         "--solver-mesh-backend",
         str(config.solver_mesh_backend),
+        "--ansys-step-strategy",
+        str(config.ansys_step_strategy),
         "--substrate-layers",
         str(int(config.substrate_layers)),
         "--piezo-layers",
         str(int(config.piezo_layers)),
     ]
+    if config.solver_max_q2_vector_dofs is not None:
+        mesh_cmd.extend(["--solver-max-q2-vector-dofs", str(int(config.solver_max_q2_vector_dofs))])
     if config.limit_solver_mesh_by_thickness:
         mesh_cmd.append("--limit-solver-mesh-by-thickness")
     if config.repair_cad:
         mesh_cmd.append("--repair-cad")
     if config.repair_bridge_width_m is not None:
         mesh_cmd.extend(["--repair-bridge-width-m", str(float(config.repair_bridge_width_m))])
+    if config.export_inspection_single_face_step:
+        mesh_cmd.append("--export-inspection-single-face-step")
     if config.cell_size_x_m is not None:
         mesh_cmd.extend(["--cell-size-x-m", str(config.cell_size_x_m)])
     if config.cell_size_y_m is not None:
@@ -765,12 +816,25 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mesh-size-scale", type=float, default=0.08, help="Target in-plane solver element size as a fraction of one cell size.")
     parser.add_argument("--cad-reference-size-scale", type=float, default=0.01, help="Reference size for CAD feature checks as a fraction of one cell size.")
     parser.add_argument("--solver-mesh-backend", default="layered_tet", choices=["layered_tet", "gmsh_volume"], help="Python solver mesh backend. layered_tet is the fast default.")
+    parser.add_argument("--ansys-step-strategy", default="single_face_assembly", choices=["partitioned_interface", "single_face_assembly"], help="Primary one-file ANSYS STEP strategy.")
     parser.add_argument("--substrate-layers", type=int, default=2, help="Number of swept layers through the substrate thickness for the fast layered_tet solver mesh.")
     parser.add_argument("--piezo-layers", type=int, default=1, help="Number of swept layers through the piezo thickness for the fast layered_tet solver mesh.")
     parser.add_argument("--limit-solver-mesh-by-thickness", action="store_true", help="Restore thickness-limited solver meshing. Disabled by default for thin plates.")
     parser.add_argument("--solver-num-modes", type=int, default=8, help="Number of modes retained by the in-house modal solver.")
     parser.add_argument("--solver-search-points", type=int, default=301, help="Coarse FRF search points used before local peak refinement.")
     parser.add_argument("--solver-element-order", type=int, default=2, help="Solid displacement interpolation order for the in-house modal solver.")
+    parser.add_argument(
+        "--solver-max-q2-vector-dofs",
+        type=int,
+        default=5_000_000,
+        help="Estimated quadratic vector-DOF cap for layered_tet solver meshes. Lower this if Docker solves hit OOM.",
+    )
+    parser.add_argument(
+        "--solver-oom-fallback-element-order",
+        type=int,
+        default=1,
+        help="Retry isolated Docker OOM failures once with this lower displacement order. Set 0 to disable the fallback.",
+    )
     parser.add_argument("--solver-store-mode-shapes", action="store_true", help="Store per-mode nodal diagnostics from the in-house solver.")
     parser.add_argument("--no-skip-existing-solver-outputs", action="store_true", help="Recompute responses even when per-sample outputs already exist.")
     parser.add_argument("--cell-size-x-m", type=float, default=None, help="Unit-cell size in x in meters.")
@@ -805,11 +869,16 @@ def main() -> None:
         cad_reference_size_scale=float(args.cad_reference_size_scale),
         limit_solver_mesh_by_thickness=bool(args.limit_solver_mesh_by_thickness),
         solver_mesh_backend=str(args.solver_mesh_backend),
+        ansys_step_strategy=str(args.ansys_step_strategy),
         substrate_layers=int(args.substrate_layers),
         piezo_layers=int(args.piezo_layers),
         solver_num_modes=int(args.solver_num_modes),
         solver_search_points=int(args.solver_search_points),
         solver_element_order=int(args.solver_element_order),
+        solver_max_q2_vector_dofs=args.solver_max_q2_vector_dofs,
+        solver_oom_fallback_element_order=(
+            None if int(args.solver_oom_fallback_element_order) <= 0 else int(args.solver_oom_fallback_element_order)
+        ),
         solver_store_mode_shapes=bool(args.solver_store_mode_shapes),
         skip_existing_solver_outputs=not bool(args.no_skip_existing_solver_outputs),
         cell_size_x_m=args.cell_size_x_m,

@@ -15,6 +15,7 @@ import matplotlib.colors as mcolors
 import numpy as np
 import matplotlib.tri as mtri
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from skimage.measure import find_contours
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,11 +35,42 @@ def _infer_sample_ids(response_dir: Path) -> list[int]:
 
 def _load_dataset_row(dataset_path: Path, sample_id: int) -> dict[str, np.ndarray]:
     data = np.load(dataset_path, allow_pickle=True)
+    if "sample_id" in data.files:
+        sample_ids = np.asarray(data["sample_id"], dtype=np.int64).reshape(-1)
+        matches = np.flatnonzero(sample_ids == int(sample_id))
+        if matches.size == 0:
+            raise KeyError(f"sample_id {sample_id} was not found in {dataset_path}.")
+        dataset_index = int(matches[0])
+    else:
+        dataset_index = int(sample_id)
+
+    if "tile_counts" in data.files:
+        tile_counts_raw = np.asarray(data["tile_counts"])
+        tile_counts = (
+            np.asarray(tile_counts_raw, dtype=np.int32)
+            if tile_counts_raw.ndim == 1
+            else np.asarray(tile_counts_raw[dataset_index], dtype=np.int32)
+        )
+    else:
+        tile_counts = np.asarray([10, 10], dtype=np.int32)
+
+    if "cell_size_m" in data.files:
+        cell_size_raw = np.asarray(data["cell_size_m"])
+        cell_size_m = (
+            np.asarray(cell_size_raw, dtype=np.float64)
+            if cell_size_raw.ndim == 1
+            else np.asarray(cell_size_raw[dataset_index], dtype=np.float64)
+        )
+    else:
+        cell_size_m = np.asarray([1.0, 1.0], dtype=np.float64)
     return {
-        "binary": np.asarray(data["binary"][sample_id], dtype=bool),
-        "sdf": np.asarray(data["sdf"][sample_id], dtype=np.float64),
-        "threshold": np.asarray(data["threshold"][sample_id]),
-        "volume_fraction": np.asarray(data["volume_fraction"][sample_id]),
+        "dataset_index": np.asarray(dataset_index, dtype=np.int32),
+        "binary": np.asarray(data["binary"][dataset_index], dtype=bool),
+        "sdf": np.asarray(data["sdf"][dataset_index], dtype=np.float64),
+        "threshold": np.asarray(data["threshold"][dataset_index]),
+        "volume_fraction": np.asarray(data["volume_fraction"][dataset_index]),
+        "tile_counts": tile_counts,
+        "cell_size_m": cell_size_m,
     }
 
 
@@ -86,6 +118,37 @@ def _plot_tiled_geometry(ax: plt.Axes, binary: np.ndarray, repeat: tuple[int, in
     ax.set_xlabel("cell index x")
     ax.set_ylabel("cell index y")
     ax.set_aspect("equal")
+
+
+def _dataset_plate_size_m(dataset_row: dict[str, np.ndarray]) -> tuple[float, float]:
+    tile_counts = np.asarray(dataset_row.get("tile_counts", [10, 10]), dtype=np.int32).reshape(2)
+    cell_size_m = np.asarray(dataset_row.get("cell_size_m", [1.0, 1.0]), dtype=np.float64).reshape(2)
+    return float(tile_counts[0] * cell_size_m[0]), float(tile_counts[1] * cell_size_m[1])
+
+
+def _overlay_substrate_footprint(
+    ax: plt.Axes,
+    dataset_row: dict[str, np.ndarray],
+    plate_size_m: tuple[float, float],
+    line_color: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 0.75),
+    line_width: float = 0.35,
+) -> None:
+    binary = np.asarray(dataset_row["binary"], dtype=np.float64)
+    tile_counts = np.asarray(dataset_row.get("tile_counts", [10, 10]), dtype=np.int32).reshape(2)
+    tiled = np.tile(binary, tuple(int(v) for v in tile_counts)).T
+    if tiled.size == 0:
+        return
+
+    contours = find_contours(tiled, level=0.5)
+    if not contours:
+        return
+
+    scale_x = float(plate_size_m[0]) / float(tiled.shape[1])
+    scale_y = float(plate_size_m[1]) / float(tiled.shape[0])
+    for contour in contours:
+        x = np.asarray(contour[:, 1], dtype=np.float64) * scale_x
+        y = np.asarray(contour[:, 0], dtype=np.float64) * scale_y
+        ax.plot(x, y, color=line_color, linewidth=line_width)
 
 
 def _extract_top_surface_mesh(mesh: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
@@ -138,6 +201,7 @@ def _plot_mesh_detail(
     triangles: np.ndarray,
     title: str = "Mesh Detail",
     show_ticks: bool = True,
+    dataset_row: dict[str, np.ndarray] | None = None,
 ) -> bool:
     zoom = _extract_mesh_zoom(points, triangles)
     if zoom is None:
@@ -172,6 +236,14 @@ def _plot_mesh_detail(
         ax.set_yticks([])
     ax.set_title(title)
     ax.grid(alpha=0.12)
+    if dataset_row is not None:
+        _overlay_substrate_footprint(
+            ax=ax,
+            dataset_row=dataset_row,
+            plate_size_m=_dataset_plate_size_m(dataset_row),
+            line_color=(0.15, 0.05, 0.25, 0.75),
+            line_width=0.28,
+        )
     return True
 
 
@@ -179,9 +251,10 @@ def _add_mesh_zoom_inset(
     parent_ax: plt.Axes,
     points: np.ndarray,
     triangles: np.ndarray,
+    dataset_row: dict[str, np.ndarray] | None = None,
 ) -> None:
     inset = parent_ax.inset_axes([0.60, 0.04, 0.36, 0.36])
-    if not _plot_mesh_detail(inset, points, triangles, title="mesh detail", show_ticks=False):
+    if not _plot_mesh_detail(inset, points, triangles, title="mesh detail", show_ticks=False, dataset_row=dataset_row):
         return
     for spine in inset.spines.values():
         spine.set_color("white")
@@ -193,10 +266,12 @@ def _plot_surface_mesh_or_strain(
     ax: plt.Axes,
     mesh: dict[str, np.ndarray],
     modal: dict[str, np.ndarray] | None,
+    dataset_row: dict[str, np.ndarray],
     include_mesh_inset: bool = True,
 ) -> float:
     points, triangles = _extract_top_surface_mesh(mesh)
     triangulation = mtri.Triangulation(points[:, 0], points[:, 1], triangles)
+    plate_size_m = _dataset_plate_size_m(dataset_row)
 
     strain = None
     if modal is not None and "top_surface_strain_eqv" in modal:
@@ -219,7 +294,7 @@ def _plot_surface_mesh_or_strain(
         )
         ax.triplot(triangulation, color=(1.0, 1.0, 1.0, 0.16), linewidth=0.10)
         f_field = float(np.asarray(modal["field_frequency_hz"], dtype=np.float64)) if "field_frequency_hz" in modal else np.nan
-        title = "Top-Surface Equivalent Strain"
+        title = "Piezo Top-Surface Equivalent Strain"
         if np.isfinite(f_field):
             title += f" @ {f_field:.3f} Hz"
         ax.set_title(title)
@@ -227,7 +302,7 @@ def _plot_surface_mesh_or_strain(
         cbar.set_label(r"$\varepsilon_{eq}$")
         strain_max = float(np.max(strain))
         if include_mesh_inset:
-            _add_mesh_zoom_inset(ax, points, triangles)
+            _add_mesh_zoom_inset(ax, points, triangles, dataset_row=dataset_row)
     else:
         collection = ax.tripcolor(
             triangulation,
@@ -239,10 +314,18 @@ def _plot_surface_mesh_or_strain(
         )
         ax.triplot(triangulation, color=(0.15, 0.25, 0.55, 0.45), linewidth=0.12)
         collection.set_alpha(0.95)
-        ax.set_title("Top Surface FEM Mesh")
+        ax.set_title("Piezo Top Surface FEM Mesh")
         strain_max = float("nan")
         if include_mesh_inset:
-            _add_mesh_zoom_inset(ax, points, triangles)
+            _add_mesh_zoom_inset(ax, points, triangles, dataset_row=dataset_row)
+
+    _overlay_substrate_footprint(
+        ax=ax,
+        dataset_row=dataset_row,
+        plate_size_m=plate_size_m,
+        line_color=(1.0, 1.0, 1.0, 0.85),
+        line_width=0.32,
+    )
 
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
@@ -326,8 +409,9 @@ def _plot_sample_summary(
     ax_stats = fig.add_subplot(gs[1, 1])
 
     _plot_unit_cell(ax_unit, dataset_row["binary"])
-    _plot_tiled_geometry(ax_tiled, dataset_row["binary"])
-    strain_max = _plot_surface_mesh_or_strain(fig, ax_mesh, mesh, modal, include_mesh_inset=True)
+    tiled_repeat = tuple(int(v) for v in np.asarray(dataset_row.get("tile_counts", [10, 10]), dtype=np.int32).reshape(2))
+    _plot_tiled_geometry(ax_tiled, dataset_row["binary"], repeat=tiled_repeat)
+    strain_max = _plot_surface_mesh_or_strain(fig, ax_mesh, mesh, modal, dataset_row=dataset_row, include_mesh_inset=True)
     _plot_frf(ax_frf, response, modal)
     stats = _plot_stats(ax_stats, sample_id, dataset_row, mesh, response, modal, strain_max)
 
@@ -361,7 +445,8 @@ def _save_individual_plots(
     _save_figure(fig, sample_output_dir / "unit_cell_geometry.png", dpi=320)
 
     fig, ax = plt.subplots(figsize=(5.6, 5.0))
-    _plot_tiled_geometry(ax, dataset_row["binary"])
+    tiled_repeat = tuple(int(v) for v in np.asarray(dataset_row.get("tile_counts", [10, 10]), dtype=np.int32).reshape(2))
+    _plot_tiled_geometry(ax, dataset_row["binary"], repeat=tiled_repeat)
     _save_figure(fig, sample_output_dir / "repeated_plate_geometry.png", dpi=320)
 
     fig, ax = plt.subplots(figsize=(6.0, 4.2))
@@ -369,7 +454,7 @@ def _save_individual_plots(
     _save_figure(fig, sample_output_dir / "voltage_frf.svg", dpi=220)
 
     fig, ax = plt.subplots(figsize=(7.2, 5.6))
-    strain_max = _plot_surface_mesh_or_strain(fig, ax, mesh, modal, include_mesh_inset=False)
+    strain_max = _plot_surface_mesh_or_strain(fig, ax, mesh, modal, dataset_row=dataset_row, include_mesh_inset=False)
     _save_figure(fig, sample_output_dir / "top_surface_equivalent_strain.png", dpi=320)
 
     fig, ax = plt.subplots(figsize=(4.8, 3.6))
@@ -378,7 +463,7 @@ def _save_individual_plots(
 
     fig, ax = plt.subplots(figsize=(5.2, 5.2))
     points, triangles = _extract_top_surface_mesh(mesh)
-    _plot_mesh_detail(ax, points, triangles, title="Mesh Detail", show_ticks=True)
+    _plot_mesh_detail(ax, points, triangles, title="Mesh Detail", show_ticks=True, dataset_row=dataset_row)
     _save_figure(fig, sample_output_dir / "mesh_detail.svg", dpi=220)
     return stats
 

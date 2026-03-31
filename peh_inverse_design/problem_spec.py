@@ -132,13 +132,15 @@ def write_problem_spec_snapshot(problem_spec: Mapping[str, Any], output_path: st
 def write_ansys_workbench_handoff(
     sample_id: int,
     output_path: str | Path,
-    step_path: str | Path,
+    step_path: str | Path | None,
     msh_path: str | Path | None,
     cad_report_path: str | Path | None,
     solver_mesh_path: str | Path | None,
     geometry_config: Any,
     volume_config: Any,
     problem_spec: Mapping[str, Any],
+    inspection_single_face_step_path: str | Path | None = None,
+    face_selection_manifest_path: str | Path | None = None,
 ) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +152,53 @@ def write_ansys_workbench_handoff(
     cell_size_m = getattr(geometry_config, "cell_size_m")
     tile_counts = getattr(geometry_config, "tile_counts")
 
+    ansys_step_strategy = str(getattr(volume_config, "ansys_step_strategy", "single_face_assembly")).strip().lower()
+    files_payload = {
+        "step_path": "" if step_path is None else str(Path(step_path)),
+        "inspection_single_face_step_path": ""
+        if inspection_single_face_step_path is None
+        else str(Path(inspection_single_face_step_path)),
+        "face_selection_manifest_path": ""
+        if face_selection_manifest_path is None
+        else str(Path(face_selection_manifest_path)),
+        "gmsh_volume_mesh_path": "" if msh_path is None else str(Path(msh_path)),
+        "python_solver_mesh_path": "" if solver_mesh_path is None else str(Path(solver_mesh_path)),
+        "cad_report_path": "" if cad_report_path is None else str(Path(cad_report_path)),
+    }
+    geometry_import_payload = {
+        "import_via": "Geometry cell",
+        "geometry_format": "STEP",
+        "recommended_step_variant": "step_path",
+        "expected_body_type": "solid",
+        "expected_solid_body_count": 2,
+        "allow_surface_bodies": False,
+        "allow_line_bodies": False,
+        "body_roles": [
+            {
+                "name": "substrate",
+                "kind": "solid",
+                "z_range_m": [0.0, substrate_thickness_m],
+            },
+            {
+                "name": "piezo",
+                "kind": "solid",
+                "z_range_m": [substrate_thickness_m, total_thickness_m],
+            },
+        ],
+    }
+    if ansys_step_strategy == "partitioned_interface":
+        geometry_import_payload["recommended_import_sequence"] = [
+            "Import files.step_path into the Geometry cell as one combined CAD file.",
+            "Use the combined, conformal interface STEP for meshing; this keeps the substrate and piezo interface imprinted into matching CAD regions.",
+            "If you need electrode or interface scoping, use files.face_selection_manifest_path as the face-group recipe instead of manual clicking.",
+        ]
+    else:
+        geometry_import_payload["recommended_import_sequence"] = [
+            "Import files.step_path into the Geometry cell as one combined CAD file.",
+            "Use the single-file, two-body assembly STEP whose piezo bottom stays continuous; this is intended for Workbench cases where the partitioned interface makes the piezo body fail meshing.",
+            "If you need electrode or interface scoping, use files.face_selection_manifest_path as the face-group recipe instead of manual clicking.",
+        ]
+
     payload = {
         "sample_id": int(sample_id),
         "geometry": {
@@ -160,32 +209,8 @@ def write_ansys_workbench_handoff(
             "piezo_thickness_m": piezo_thickness_m,
             "total_thickness_m": total_thickness_m,
         },
-        "files": {
-            "step_path": str(Path(step_path)),
-            "gmsh_volume_mesh_path": "" if msh_path is None else str(Path(msh_path)),
-            "python_solver_mesh_path": "" if solver_mesh_path is None else str(Path(solver_mesh_path)),
-            "cad_report_path": "" if cad_report_path is None else str(Path(cad_report_path)),
-        },
-        "ansys_workbench_geometry_import": {
-            "import_via": "Geometry cell",
-            "geometry_format": "STEP",
-            "expected_body_type": "solid",
-            "expected_solid_body_count": 2,
-            "allow_surface_bodies": False,
-            "allow_line_bodies": False,
-            "body_roles": [
-                {
-                    "name": "substrate",
-                    "kind": "solid",
-                    "z_range_m": [0.0, substrate_thickness_m],
-                },
-                {
-                    "name": "piezo",
-                    "kind": "solid",
-                    "z_range_m": [substrate_thickness_m, total_thickness_m],
-                },
-            ],
-        },
+        "files": files_payload,
+        "ansys_workbench_geometry_import": geometry_import_payload,
         "shared_problem_definition": {
             "mechanical_boundary_condition": {
                 "type": "cantilever_clamped_edge",
@@ -213,11 +238,29 @@ def write_ansys_workbench_handoff(
             },
         },
         "problem_spec": summarize_problem_spec(problem_spec),
-        "notes": [
-            "Use the STEP geometry as a 3D solid model in Workbench; do not replace it with a 2D or reduced-order representation.",
-            "The Python path uses its own Gmsh-derived solver mesh; ANSYS should import the STEP assembly directly and mesh it inside Workbench.",
-            "Keep the ANSYS setup synchronized with the FEniCS path through the shared problem specification embedded in this handoff file.",
-        ],
+        "notes": [],
     }
+    payload["notes"] = [
+        "Use files.step_path as the recommended one-file Workbench geometry handoff.",
+    ]
+    if ansys_step_strategy == "partitioned_interface":
+        payload["notes"].append(
+            "The combined STEP keeps a conformal, meshable substrate/piezo interface. That can fragment the piezo bottom into multiple CAD faces, so use files.face_selection_manifest_path to build electrode/interface groups without manual clicking."
+        )
+    else:
+        payload["notes"].append(
+            "The combined STEP keeps the piezo bottom continuous as a one-file, two-body assembly. This is intended for Workbench cases where the conformal partitioned interface causes the piezo body to fail meshing."
+        )
+        payload["notes"].append(
+            "If Workbench tries to merge or imprint the two bodies automatically, keep the imported substrate and piezo as separate solid bodies in the same Geometry cell and scope electrodes/interfaces through files.face_selection_manifest_path."
+        )
+    if inspection_single_face_step_path is not None:
+        payload["notes"].append(
+            "files.inspection_single_face_step_path is an optional alternate STEP variant for comparison during Workbench debugging."
+        )
+    payload["notes"].extend([
+        "The Python path uses its own Gmsh-derived solver mesh; ANSYS should import the combined STEP assembly directly and mesh it inside Workbench.",
+        "Keep the ANSYS setup synchronized with the FEniCS path through the shared problem specification embedded in this handoff file.",
+    ])
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
     return output_path

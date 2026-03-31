@@ -57,6 +57,10 @@ class VolumeMeshConfig:
     max_solver_vector_dofs: int | None = 5_000_000
     solver_mesh_growth_factor: float = 1.15
     solver_mesh_limit_retries: int = 5
+    ansys_step_strategy: str = "single_face_assembly"
+    export_inspection_single_face_step: bool = False
+    cad_planform_simplify_relative_to_reference: float = 1.5
+    cad_min_hole_area_relative_to_reference_squared: float = 100.0
 
     @property
     def total_thickness_m(self) -> float:
@@ -84,6 +88,11 @@ class VolumeMeshConfig:
         backend = str(self.solver_mesh_backend).strip().lower()
         if backend not in {"layered_tet", "gmsh_volume"}:
             raise ValueError("solver_mesh_backend must be 'layered_tet' or 'gmsh_volume'.")
+        ansys_step_strategy = str(self.ansys_step_strategy).strip().lower()
+        if ansys_step_strategy not in {"partitioned_interface", "single_face_assembly"}:
+            raise ValueError(
+                "ansys_step_strategy must be 'partitioned_interface' or 'single_face_assembly'."
+            )
         if bool(self.exact_cad) == bool(self.repair_cad):
             raise ValueError("Exactly one CAD mode must be active: exact_cad or repair_cad.")
         if self.repair_bridge_width_m is not None and float(self.repair_bridge_width_m) <= 0.0:
@@ -98,6 +107,10 @@ class VolumeMeshConfig:
             raise ValueError("solver_mesh_growth_factor must be greater than 1.0.")
         if int(self.solver_mesh_limit_retries) < 0:
             raise ValueError("solver_mesh_limit_retries must be non-negative.")
+        if float(self.cad_planform_simplify_relative_to_reference) < 0.0:
+            raise ValueError("cad_planform_simplify_relative_to_reference must be non-negative.")
+        if float(self.cad_min_hole_area_relative_to_reference_squared) < 0.0:
+            raise ValueError("cad_min_hole_area_relative_to_reference_squared must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -126,13 +139,37 @@ class _CadValidationReport:
 
 
 @dataclass(frozen=True)
+class _SingleBodyCadValidationReport:
+    stage: str
+    body_role: str
+    body_tag: int
+    solid_body_count: int
+    stray_surface_tags: tuple[int, ...]
+    stray_curve_tags: tuple[int, ...]
+    horizontal_face_count: int
+    volume_m3: float
+    expected_volume_m3: float
+    bounding_box_xyzxyz_m: tuple[float, float, float, float, float, float]
+
+
+@dataclass(frozen=True)
 class _CadExportArtifacts:
     solver_mesh_path: Path
-    step_path: Path
+    step_path: Path | None
     cad_report_path: Path
     planform: _CadPlanform
-    pre_export_report: _CadValidationReport
-    roundtrip_report: _CadValidationReport
+    selection_manifest_path: Path | None = None
+    pre_export_report: _CadValidationReport | None = None
+    roundtrip_report: _CadValidationReport | None = None
+    substrate_step_path: Path | None = None
+    piezo_step_path: Path | None = None
+    substrate_pre_export_report: _SingleBodyCadValidationReport | None = None
+    substrate_roundtrip_report: _SingleBodyCadValidationReport | None = None
+    piezo_pre_export_report: _SingleBodyCadValidationReport | None = None
+    piezo_roundtrip_report: _SingleBodyCadValidationReport | None = None
+    inspection_step_path: Path | None = None
+    inspection_pre_export_report: _CadValidationReport | None = None
+    inspection_roundtrip_report: _CadValidationReport | None = None
 
 
 @contextmanager
@@ -196,6 +233,16 @@ def _build_occ_surface_from_polygon(
         hole_loops.append(gmsh.model.occ.addCurveLoop(lines))
 
     return gmsh.model.occ.addPlaneSurface([exterior_loop] + hole_loops)
+
+
+def _normalize_step_length_units_to_metre(step_path: Path) -> None:
+    try:
+        payload = step_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    normalized = payload.replace("SI_UNIT(.MILLI.,.METRE.)", "SI_UNIT($,.METRE.)")
+    if normalized != payload:
+        step_path.write_text(normalized, encoding="utf-8")
 
 
 def _export_occ_geometry_to_step(step_path: Path) -> Path | None:
@@ -280,6 +327,10 @@ def _resolve_solver_mesh_size_m(
     return min(in_plane_target_m, thickness_target_m)
 
 
+def _ansys_step_strategy(volume_config: VolumeMeshConfig) -> str:
+    return str(getattr(volume_config, "ansys_step_strategy", "single_face_assembly")).strip().lower()
+
+
 def _classify_volume_entities_by_z(
     substrate_thickness_m: float,
     total_thickness_m: float,
@@ -353,6 +404,65 @@ def _surface_classification_tolerance(
     )
 
 
+def _safe_set_entity_name(dim: int, tag: int, name: str) -> None:
+    try:
+        gmsh.model.setEntityName(int(dim), int(tag), str(name))
+    except Exception:
+        pass
+
+
+def _safe_set_color(dimtags: Iterable[tuple[int, int]], rgb: tuple[int, int, int]) -> None:
+    dimtags = [(int(dim), int(tag)) for dim, tag in dimtags]
+    if not dimtags:
+        return
+    try:
+        gmsh.model.setColor(dimtags, int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except Exception:
+        pass
+
+
+def _annotate_current_occ_entities_for_ansys(
+    report: _CadValidationReport,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    mesh_size_m: float,
+) -> None:
+    _safe_set_entity_name(3, int(report.substrate_tag), "substrate")
+    _safe_set_entity_name(3, int(report.piezo_tag), "piezo")
+    _safe_set_color([(3, int(report.substrate_tag))], (120, 160, 220))
+    _safe_set_color([(3, int(report.piezo_tag))], (235, 185, 90))
+
+    tol = _surface_classification_tolerance(geometry_config, volume_config, mesh_size_m)
+    surface_groups = _classify_boundary_surfaces(
+        plate_size_m=geometry_config.plate_size_m,
+        total_thickness_m=volume_config.total_thickness_m,
+        substrate_thickness_m=volume_config.substrate_thickness_m,
+        tol=tol,
+    )
+    named_surfaces: dict[str, list[int]] = {
+        "clamped_edge": surface_groups["clamped"],
+        "free_x_max": surface_groups["free_x_max"],
+        "free_y_min": surface_groups["free_y_min"],
+        "free_y_max": surface_groups["free_y_max"],
+        "piezo_top_electrode": surface_groups["top_electrode"],
+        "bottom_plate": surface_groups["bottom_plate"],
+    }
+    piezo_bottom_faces = _collect_horizontal_face_tags_for_volume(
+        volume_tag=int(report.piezo_tag),
+        z_value_m=volume_config.substrate_thickness_m,
+        tol=tol,
+    )
+    named_surfaces["piezo_bottom_electrode"] = list(piezo_bottom_faces)
+
+    for name, tags in named_surfaces.items():
+        for tag in sorted(set(int(value) for value in tags)):
+            _safe_set_entity_name(2, int(tag), name)
+
+    _safe_set_color([(2, int(tag)) for tag in surface_groups["top_electrode"]], (255, 210, 110))
+    _safe_set_color([(2, int(tag)) for tag in piezo_bottom_faces], (255, 180, 90))
+    _safe_set_color([(2, int(tag)) for tag in surface_groups["clamped"]], (180, 70, 70))
+
+
 def _resolve_repair_bridge_width_m(
     geometry_config: GeometryBuildConfig,
     volume_config: VolumeMeshConfig,
@@ -379,6 +489,114 @@ def _normalize_planform_precision(
     grid_size_m = max(1.0e-12, min(1.0e-9, 1.0e-6 * float(mesh_size_m)))
     normalized = set_precision(geometry, grid_size=grid_size_m)
     return normalized.buffer(0)
+
+
+def _cad_planform_simplify_tolerance_m(
+    mesh_size_m: float,
+    volume_config: VolumeMeshConfig,
+) -> float:
+    return max(
+        0.0,
+        float(volume_config.cad_planform_simplify_relative_to_reference) * float(mesh_size_m),
+    )
+
+
+def _minimum_cad_hole_area_m2(
+    mesh_size_m: float,
+    volume_config: VolumeMeshConfig,
+) -> float:
+    return max(
+        0.0,
+        float(volume_config.cad_min_hole_area_relative_to_reference_squared) * float(mesh_size_m) ** 2,
+    )
+
+
+def _prune_small_holes(
+    polygon: Polygon,
+    min_hole_area_m2: float,
+) -> Polygon:
+    if min_hole_area_m2 <= 0.0 or not polygon.interiors:
+        return polygon
+    kept_holes: list[list[tuple[float, float]]] = []
+    for interior in polygon.interiors:
+        hole_poly = Polygon(interior)
+        if hole_poly.is_empty:
+            continue
+        if float(hole_poly.area) >= float(min_hole_area_m2):
+            kept_holes.append([(float(x), float(y)) for x, y in interior.coords])
+    return Polygon(polygon.exterior.coords, holes=kept_holes)
+
+
+def _simplify_planform_for_cad(
+    planform: Polygon,
+    mesh_size_m: float,
+    volume_config: VolumeMeshConfig,
+) -> Polygon:
+    simplify_tol_m = _cad_planform_simplify_tolerance_m(mesh_size_m, volume_config)
+    min_hole_area_m2 = _minimum_cad_hole_area_m2(mesh_size_m, volume_config)
+
+    working: Polygon | MultiPolygon = planform
+    if simplify_tol_m > 0.0:
+        working = working.simplify(float(simplify_tol_m), preserve_topology=True)
+        working = _normalize_planform_precision(working, mesh_size_m)
+
+    simplified = _require_single_polygon(working, context="Substrate planform")
+    simplified = _prune_small_holes(simplified, min_hole_area_m2)
+    simplified = _require_single_polygon(
+        _normalize_planform_precision(simplified, mesh_size_m),
+        context="Substrate planform",
+    )
+    return simplified
+
+
+def _finalize_planform(
+    polygon: Polygon,
+    *,
+    was_repaired: bool,
+    initial_component_count: int,
+    mesh_size_m: float,
+    volume_config: VolumeMeshConfig,
+    invalid_message: str,
+) -> _CadPlanform:
+    if not polygon.is_valid:
+        raise RuntimeError(invalid_message)
+
+    minimum_clearance = float(polygon.minimum_clearance)
+    min_feature_size_m = _minimum_planform_feature_size_m(mesh_size_m, volume_config)
+    if np.isfinite(minimum_clearance) and minimum_clearance < min_feature_size_m:
+        raise RuntimeError(
+            "The substrate planform is under-resolved for CAD export: "
+            f"minimum clearance {minimum_clearance:.6g} m is below the "
+            f"{min_feature_size_m:.6g} m tolerance."
+        )
+
+    return _CadPlanform(
+        polygon=polygon,
+        was_repaired=was_repaired,
+        initial_component_count=initial_component_count,
+        hole_count=len(polygon.interiors),
+        area_m2=float(polygon.area),
+    )
+
+
+def _prepare_planform_for_cad_export(
+    planform: _CadPlanform,
+    mesh_size_m: float,
+    volume_config: VolumeMeshConfig,
+) -> _CadPlanform:
+    simplified = _simplify_planform_for_cad(
+        planform=planform.polygon,
+        mesh_size_m=mesh_size_m,
+        volume_config=volume_config,
+    )
+    return _finalize_planform(
+        polygon=simplified,
+        was_repaired=planform.was_repaired,
+        initial_component_count=planform.initial_component_count,
+        mesh_size_m=mesh_size_m,
+        volume_config=volume_config,
+        invalid_message="The CAD-simplified substrate planform is invalid and cannot be exported as CAD.",
+    )
 
 
 def _require_single_polygon(
@@ -447,24 +665,13 @@ def _build_substrate_planform(
 
     planform = _require_single_polygon(working, context="Substrate planform")
     planform = _require_single_polygon(_normalize_planform_precision(planform, mesh_size_m), context="Substrate planform")
-    if not planform.is_valid:
-        raise RuntimeError("The cleaned substrate planform is invalid and cannot be exported as CAD.")
-
-    minimum_clearance = float(planform.minimum_clearance)
-    min_feature_size_m = _minimum_planform_feature_size_m(mesh_size_m, volume_config)
-    if np.isfinite(minimum_clearance) and minimum_clearance < min_feature_size_m:
-        raise RuntimeError(
-            "The substrate planform is under-resolved for CAD export: "
-            f"minimum clearance {minimum_clearance:.6g} m is below the "
-            f"{min_feature_size_m:.6g} m tolerance."
-        )
-
-    return _CadPlanform(
+    return _finalize_planform(
         polygon=planform,
         was_repaired=was_repaired,
         initial_component_count=len(initial_components),
-        hole_count=len(planform.interiors),
-        area_m2=float(planform.area),
+        mesh_size_m=mesh_size_m,
+        volume_config=volume_config,
+        invalid_message="The cleaned substrate planform is invalid and cannot be exported as CAD.",
     )
 
 
@@ -665,6 +872,138 @@ def _validate_current_occ_model(
     )
 
 
+def _validate_single_body_occ_model(
+    stage: str,
+    body_role: str,
+    planform: _CadPlanform,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    mesh_size_m: float,
+) -> _SingleBodyCadValidationReport:
+    solids = [tag for dim, tag in gmsh.model.getEntities(3) if dim == 3]
+    if len(solids) != 1:
+        raise RuntimeError(f"{stage}: expected exactly 1 solid body for the {body_role} export, found {len(solids)}.")
+
+    stray_surface_tags = _find_stray_surface_tags()
+    stray_curve_tags = _find_stray_curve_tags()
+    if stray_surface_tags:
+        raise RuntimeError(f"{stage}: found stray surface bodies {list(stray_surface_tags)}.")
+    if stray_curve_tags:
+        raise RuntimeError(f"{stage}: found stray line bodies {list(stray_curve_tags)}.")
+
+    body_tag = int(solids[0])
+    bbox = tuple(float(value) for value in gmsh.model.getBoundingBox(3, body_tag))
+    volume_m3 = float(gmsh.model.occ.getMass(3, body_tag))
+    tol = _surface_classification_tolerance(geometry_config, volume_config, mesh_size_m)
+    horizontal_faces = _collect_horizontal_face_tags_for_volume(
+        volume_tag=body_tag,
+        z_value_m=bbox[2],
+        tol=tol,
+    )
+
+    plate_lx, plate_ly = geometry_config.plate_size_m
+    if str(body_role) == "substrate":
+        expected_volume_m3 = float(planform.area_m2) * float(volume_config.substrate_thickness_m)
+        if not (
+            abs(bbox[0]) <= tol
+            and abs(bbox[1]) <= tol
+            and abs(bbox[2]) <= tol
+            and abs(bbox[3] - float(plate_lx)) <= tol
+            and abs(bbox[4] - float(plate_ly)) <= tol
+            and abs(bbox[5] - float(volume_config.substrate_thickness_m)) <= tol
+        ):
+            raise RuntimeError(f"{stage}: the standalone substrate STEP has an unexpected bounding box {bbox}.")
+    elif str(body_role) == "piezo":
+        expected_volume_m3 = (
+            float(geometry_config.plate_size_m[0])
+            * float(geometry_config.plate_size_m[1])
+            * float(volume_config.piezo_thickness_m)
+        )
+        if not (
+            abs(bbox[0]) <= tol
+            and abs(bbox[1]) <= tol
+            and abs(bbox[2] - float(volume_config.substrate_thickness_m)) <= tol
+            and abs(bbox[3] - float(plate_lx)) <= tol
+            and abs(bbox[4] - float(plate_ly)) <= tol
+            and abs(bbox[5] - float(volume_config.total_thickness_m)) <= tol
+        ):
+            raise RuntimeError(f"{stage}: the standalone piezo STEP has an unexpected bounding box {bbox}.")
+    else:
+        raise ValueError(f"Unknown body_role for standalone STEP export: {body_role}")
+
+    volume_tol = _volume_tolerance_m3(
+        expected_volume_m3=expected_volume_m3,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+    )
+    if abs(volume_m3 - expected_volume_m3) > volume_tol:
+        raise RuntimeError(
+            f"{stage}: {body_role} volume {volume_m3:.8e} m^3 does not match the expected {expected_volume_m3:.8e} m^3."
+        )
+
+    return _SingleBodyCadValidationReport(
+        stage=stage,
+        body_role=str(body_role),
+        body_tag=body_tag,
+        solid_body_count=len(solids),
+        stray_surface_tags=stray_surface_tags,
+        stray_curve_tags=stray_curve_tags,
+        horizontal_face_count=len(horizontal_faces),
+        volume_m3=volume_m3,
+        expected_volume_m3=expected_volume_m3,
+        bounding_box_xyzxyz_m=bbox,
+    )
+
+
+def _prepare_single_body_occ_model(
+    body_role: str,
+    planform: _CadPlanform,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    mesh_size_m: float,
+) -> _SingleBodyCadValidationReport:
+    point_cache: dict[tuple[float, float, float], int] = {}
+    if str(body_role) == "substrate":
+        surface_tag = _build_occ_surface_from_polygon(
+            polygon=planform.polygon,
+            mesh_size_m=mesh_size_m,
+            point_cache=point_cache,
+        )
+        if surface_tag is None:
+            raise RuntimeError("No OCC substrate surface could be created from the cleaned planform polygon.")
+        extruded = gmsh.model.occ.extrude([(2, int(surface_tag))], 0.0, 0.0, float(volume_config.substrate_thickness_m))
+        volume_tags = [tag for dim, tag in extruded if dim == 3]
+        if len(volume_tags) != 1:
+            raise RuntimeError(
+                f"Expected one standalone substrate solid from extrusion, but OpenCASCADE produced {len(volume_tags)}."
+            )
+    elif str(body_role) == "piezo":
+        plate_lx, plate_ly = geometry_config.plate_size_m
+        gmsh.model.occ.addBox(
+            0.0,
+            0.0,
+            float(volume_config.substrate_thickness_m),
+            float(plate_lx),
+            float(plate_ly),
+            float(volume_config.piezo_thickness_m),
+        )
+    else:
+        raise ValueError(f"Unknown body_role for standalone STEP export: {body_role}")
+
+    gmsh.model.occ.synchronize()
+    _heal_current_occ_model(volume_config.occ_heal_tolerance_m)
+    _remove_stray_occ_entities()
+    _set_mesh_size_on_all_points(mesh_size_m)
+    return _validate_single_body_occ_model(
+        stage="pre_export",
+        body_role=str(body_role),
+        planform=planform,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+        mesh_size_m=mesh_size_m,
+    )
+
+
 def _prepare_cad_occ_model(
     planform: _CadPlanform,
     geometry_config: GeometryBuildConfig,
@@ -723,6 +1062,9 @@ def _write_cad_report(
     planform: _CadPlanform,
     pre_export_report: _CadValidationReport,
     roundtrip_report: _CadValidationReport,
+    inspection_step_path: Path | None = None,
+    inspection_pre_export_report: _CadValidationReport | None = None,
+    inspection_roundtrip_report: _CadValidationReport | None = None,
 ) -> Path:
     payload = {
         "sample_id": int(sample_id),
@@ -740,12 +1082,229 @@ def _write_cad_report(
         "substrate_layers": int(volume_config.substrate_layers),
         "piezo_layers": int(volume_config.piezo_layers),
         "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
+        "cad_planform_simplify_relative_to_reference": float(volume_config.cad_planform_simplify_relative_to_reference),
+        "cad_min_hole_area_relative_to_reference_squared": float(
+            volume_config.cad_min_hole_area_relative_to_reference_squared
+        ),
+        "ansys_step_strategy": _ansys_step_strategy(volume_config),
         "pre_export": asdict(pre_export_report),
         "step_roundtrip": asdict(roundtrip_report),
     }
+    if inspection_step_path is not None:
+        payload["inspection_single_face_step_path"] = str(inspection_step_path)
+    if inspection_pre_export_report is not None:
+        payload["inspection_pre_export"] = asdict(inspection_pre_export_report)
+    if inspection_roundtrip_report is not None:
+        payload["inspection_single_face_step_roundtrip"] = asdict(inspection_roundtrip_report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return report_path
+
+
+def _write_ansys_face_selection_manifest(
+    manifest_path: Path,
+    sample_id: int,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    roundtrip_report: _CadValidationReport,
+) -> Path:
+    tol_m = _surface_classification_tolerance(
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+        mesh_size_m=_resolve_cad_reference_size_m(geometry_config, volume_config),
+    )
+    ansys_step_strategy = _ansys_step_strategy(volume_config)
+    piezo_bottom_region_count = int(roundtrip_report.piezo_bottom_face_count)
+    if ansys_step_strategy == "partitioned_interface":
+        notes = [
+            "The combined STEP keeps a conformal, meshable interface. The piezo bottom can therefore be split into multiple CAD faces.",
+            "Instead of clicking every fragment manually in Workbench, build a Named Selection by filtering faces on the piezo body whose centroid or bounding-box z value equals the interface plane within the tolerance below.",
+        ]
+    else:
+        notes = [
+            "The combined STEP keeps the piezo bottom continuous as a one-file, two-body assembly, so the piezo-bottom electrode should resolve to one face on the piezo body.",
+            "If Workbench re-imprints or otherwise changes the imported topology, rebuild the Named Selection by filtering faces on the piezo body whose centroid or bounding-box z value equals the interface plane within the tolerance below.",
+        ]
+    payload = {
+        "sample_id": int(sample_id),
+        "selection_strategy": "worksheet_by_body_and_z_plane",
+        "notes": notes,
+        "geometry": {
+            "plate_size_m": [float(geometry_config.plate_size_m[0]), float(geometry_config.plate_size_m[1])],
+            "substrate_thickness_m": float(volume_config.substrate_thickness_m),
+            "piezo_thickness_m": float(volume_config.piezo_thickness_m),
+            "total_thickness_m": float(volume_config.total_thickness_m),
+            "selection_tolerance_m": float(tol_m),
+        },
+        "named_selection_recipes": {
+            "piezo_body": {
+                "entity_kind": "body",
+                "body_role": "piezo",
+                "expected_solid_count": 1,
+            },
+            "substrate_body": {
+                "entity_kind": "body",
+                "body_role": "substrate",
+                "expected_solid_count": 1,
+            },
+            "piezo_bottom_electrode": {
+                "entity_kind": "face",
+                "body_role": "piezo",
+                "z_plane_m": float(volume_config.substrate_thickness_m),
+                "tolerance_m": float(tol_m),
+                "expected_region_count": piezo_bottom_region_count,
+            },
+            "piezo_top_electrode": {
+                "entity_kind": "face",
+                "body_role": "piezo",
+                "z_plane_m": float(volume_config.total_thickness_m),
+                "tolerance_m": float(tol_m),
+                "expected_region_count": 1,
+            },
+            "clamped_edge": {
+                "entity_kind": "face",
+                "x_plane_m": 0.0,
+                "tolerance_m": float(tol_m),
+            },
+        },
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest_path
+
+
+def _write_split_body_cad_report(
+    report_path: Path,
+    sample_id: int,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    planform: _CadPlanform,
+    substrate_step_path: Path,
+    substrate_pre_export_report: _SingleBodyCadValidationReport,
+    substrate_roundtrip_report: _SingleBodyCadValidationReport,
+    piezo_step_path: Path,
+    piezo_pre_export_report: _SingleBodyCadValidationReport,
+    piezo_roundtrip_report: _SingleBodyCadValidationReport,
+    inspection_step_path: Path | None = None,
+    inspection_pre_export_report: _CadValidationReport | None = None,
+    inspection_roundtrip_report: _CadValidationReport | None = None,
+) -> Path:
+    payload = {
+        "sample_id": int(sample_id),
+        "cad_mode": "repair" if volume_config.repair_cad else "exact",
+        "repair_applied": bool(planform.was_repaired),
+        "initial_component_count": int(planform.initial_component_count),
+        "hole_count": int(planform.hole_count),
+        "planform_area_m2": float(planform.area_m2),
+        "plate_size_m": [float(geometry_config.plate_size_m[0]), float(geometry_config.plate_size_m[1])],
+        "substrate_thickness_m": float(volume_config.substrate_thickness_m),
+        "piezo_thickness_m": float(volume_config.piezo_thickness_m),
+        "solver_mesh_size_relative_to_cell": float(volume_config.mesh_size_relative_to_cell),
+        "cad_reference_size_relative_to_cell": float(volume_config.cad_reference_size_relative_to_cell),
+        "solver_mesh_backend": str(volume_config.solver_mesh_backend),
+        "substrate_layers": int(volume_config.substrate_layers),
+        "piezo_layers": int(volume_config.piezo_layers),
+        "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
+        "ansys_step_strategy": "split_body_steps",
+        "substrate_step_path": str(substrate_step_path),
+        "piezo_step_path": str(piezo_step_path),
+        "substrate_pre_export": asdict(substrate_pre_export_report),
+        "substrate_step_roundtrip": asdict(substrate_roundtrip_report),
+        "piezo_pre_export": asdict(piezo_pre_export_report),
+        "piezo_step_roundtrip": asdict(piezo_roundtrip_report),
+    }
+    if inspection_step_path is not None:
+        payload["legacy_single_face_probe_step_path"] = str(inspection_step_path)
+    if inspection_pre_export_report is not None:
+        payload["legacy_single_face_probe_pre_export"] = asdict(inspection_pre_export_report)
+    if inspection_roundtrip_report is not None:
+        payload["legacy_single_face_probe_step_roundtrip"] = asdict(inspection_roundtrip_report)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return report_path
+
+
+def _build_step_export_variant(
+    step_path: Path,
+    planform: _CadPlanform,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    mesh_size_m: float,
+    partition_interface: bool,
+    require_single_piezo_bottom_face: bool = False,
+) -> tuple[_CadValidationReport, _CadValidationReport]:
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+    gmsh.model.add("plate3d")
+    try:
+        pre_export_report = _prepare_cad_occ_model(
+            planform=planform,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=mesh_size_m,
+            partition_interface=partition_interface,
+        )
+        _annotate_current_occ_entities_for_ansys(
+            report=pre_export_report,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=mesh_size_m,
+        )
+        if _export_occ_geometry_to_step(step_path) is None:
+            raise RuntimeError(f"Could not export STEP geometry to {step_path}.")
+        _reload_occ_geometry_from_step(step_path)
+        roundtrip_report = _validate_current_occ_model(
+            stage="step_roundtrip",
+            planform=planform,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=mesh_size_m,
+        )
+        if require_single_piezo_bottom_face and int(roundtrip_report.piezo_bottom_face_count) != 1:
+            raise RuntimeError(
+                "step_roundtrip: expected exactly 1 continuous piezo bottom face for the single-face probe STEP, "
+                f"found {int(roundtrip_report.piezo_bottom_face_count)}."
+            )
+        _normalize_step_length_units_to_metre(step_path)
+        return pre_export_report, roundtrip_report
+    finally:
+        gmsh.finalize()
+
+
+def _build_single_body_step_export_variant(
+    step_path: Path,
+    body_role: str,
+    planform: _CadPlanform,
+    geometry_config: GeometryBuildConfig,
+    volume_config: VolumeMeshConfig,
+    mesh_size_m: float,
+) -> tuple[_SingleBodyCadValidationReport, _SingleBodyCadValidationReport]:
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+    gmsh.model.add(f"plate3d_{body_role}")
+    try:
+        pre_export_report = _prepare_single_body_occ_model(
+            body_role=str(body_role),
+            planform=planform,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=mesh_size_m,
+        )
+        if _export_occ_geometry_to_step(step_path) is None:
+            raise RuntimeError(f"Could not export {body_role} STEP geometry to {step_path}.")
+        _reload_occ_geometry_from_step(step_path, model_name=f"plate3d_{body_role}_mesh")
+        roundtrip_report = _validate_single_body_occ_model(
+            stage="step_roundtrip",
+            body_role=str(body_role),
+            planform=planform,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=mesh_size_m,
+        )
+        _normalize_step_length_units_to_metre(step_path)
+        return pre_export_report, roundtrip_report
+    finally:
+        gmsh.finalize()
 
 
 def _extract_linear_triangles_from_current_gmsh_model() -> tuple[np.ndarray, np.ndarray]:
@@ -1102,6 +1661,7 @@ def _mesh_polygons_volume_sample_gmsh_volume(
     msh_path = output_dir / f"plate3d_{int(sample_id):04d}.msh"
     step_path = output_dir / f"plate3d_{int(sample_id):04d}.step"
     cad_report_path = output_dir / f"plate3d_{int(sample_id):04d}_cad.json"
+    selection_manifest_path = output_dir / f"plate3d_{int(sample_id):04d}_ansys_face_groups.json"
     solver_mesh_path = output_dir / f"plate3d_{int(sample_id):04d}_fenicsx.npz"
 
     gmsh.initialize()
@@ -1122,12 +1682,23 @@ def _mesh_polygons_volume_sample_gmsh_volume(
             volume_config=volume_config,
             mesh_size_m=cad_reference_size_m,
         )
-        pre_export_report = _prepare_cad_occ_model(
+        cad_planform = _prepare_planform_for_cad_export(
             planform=planform,
+            mesh_size_m=cad_reference_size_m,
+            volume_config=volume_config,
+        )
+        pre_export_report = _prepare_cad_occ_model(
+            planform=cad_planform,
             geometry_config=geometry_config,
             volume_config=volume_config,
             mesh_size_m=cad_reference_size_m,
             partition_interface=True,
+        )
+        _annotate_current_occ_entities_for_ansys(
+            report=pre_export_report,
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=cad_reference_size_m,
         )
 
         if _export_occ_geometry_to_step(step_path) is None:
@@ -1137,7 +1708,7 @@ def _mesh_polygons_volume_sample_gmsh_volume(
         _set_mesh_size_on_all_points(solver_mesh_size_m)
         roundtrip_report = _validate_current_occ_model(
             stage="step_roundtrip",
-            planform=planform,
+            planform=cad_planform,
             geometry_config=geometry_config,
             volume_config=volume_config,
             mesh_size_m=cad_reference_size_m,
@@ -1190,15 +1761,23 @@ def _mesh_polygons_volume_sample_gmsh_volume(
         sample_id=sample_id,
         geometry_config=geometry_config,
         volume_config=volume_config,
-        planform=planform,
+        planform=cad_planform,
         pre_export_report=pre_export_report,
+        roundtrip_report=roundtrip_report,
+    )
+    _write_ansys_face_selection_manifest(
+        manifest_path=selection_manifest_path,
+        sample_id=sample_id,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
         roundtrip_report=roundtrip_report,
     )
     return _CadExportArtifacts(
         solver_mesh_path=solver_mesh_path,
         step_path=step_path,
         cad_report_path=cad_report_path,
-        planform=planform,
+        planform=cad_planform,
+        selection_manifest_path=selection_manifest_path,
         pre_export_report=pre_export_report,
         roundtrip_report=roundtrip_report,
     )
@@ -1213,49 +1792,52 @@ def _mesh_polygons_volume_sample_layered_tet(
     volume_config: VolumeMeshConfig,
 ) -> _CadExportArtifacts | None:
     step_path = output_dir / f"plate3d_{int(sample_id):04d}.step"
+    inspection_step_path = None
     cad_report_path = output_dir / f"plate3d_{int(sample_id):04d}_cad.json"
+    selection_manifest_path = output_dir / f"plate3d_{int(sample_id):04d}_ansys_face_groups.json"
 
-    gmsh.initialize()
-    gmsh.option.setNumber("General.Verbosity", 0)
-    gmsh.model.add("plate3d")
-    try:
-        cad_reference_size_m = _resolve_cad_reference_size_m(
-            geometry_config=geometry_config,
-            volume_config=volume_config,
-        )
-        planform = _build_substrate_planform(
-            polygons=polygons,
-            geometry_config=geometry_config,
-            volume_config=volume_config,
-            mesh_size_m=cad_reference_size_m,
-        )
-        pre_export_report = _prepare_cad_occ_model(
-            planform=planform,
+    cad_reference_size_m = _resolve_cad_reference_size_m(
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+    )
+    solver_planform = _build_substrate_planform(
+        polygons=polygons,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+        mesh_size_m=cad_reference_size_m,
+    )
+    cad_planform = _prepare_planform_for_cad_export(
+        planform=solver_planform,
+        mesh_size_m=cad_reference_size_m,
+        volume_config=volume_config,
+    )
+    primary_strategy = _ansys_step_strategy(volume_config)
+    primary_partition_interface = primary_strategy == "partitioned_interface"
+    pre_export_report, roundtrip_report = _build_step_export_variant(
+        step_path=step_path,
+        planform=cad_planform,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+        mesh_size_m=cad_reference_size_m,
+        partition_interface=primary_partition_interface,
+        require_single_piezo_bottom_face=not primary_partition_interface,
+    )
+    inspection_pre_export_report = None
+    inspection_roundtrip_report = None
+    if bool(volume_config.export_inspection_single_face_step) and primary_partition_interface:
+        inspection_step_path = output_dir / f"plate3d_{int(sample_id):04d}_single_face_probe.step"
+        inspection_pre_export_report, inspection_roundtrip_report = _build_step_export_variant(
+            step_path=inspection_step_path,
+            planform=cad_planform,
             geometry_config=geometry_config,
             volume_config=volume_config,
             mesh_size_m=cad_reference_size_m,
             partition_interface=False,
+            require_single_piezo_bottom_face=True,
         )
-        if _export_occ_geometry_to_step(step_path) is None:
-            return None
-        _reload_occ_geometry_from_step(step_path)
-        roundtrip_report = _validate_current_occ_model(
-            stage="step_roundtrip",
-            planform=planform,
-            geometry_config=geometry_config,
-            volume_config=volume_config,
-            mesh_size_m=cad_reference_size_m,
-        )
-        if int(roundtrip_report.piezo_bottom_face_count) != 1:
-            raise RuntimeError(
-                "step_roundtrip: expected exactly 1 continuous piezo bottom face for the ANSYS STEP handoff, "
-                f"found {int(roundtrip_report.piezo_bottom_face_count)}."
-            )
-    finally:
-        gmsh.finalize()
 
     solver_mesh_path = _build_layered_tet_solver_mesh(
-        planform=planform,
+        planform=solver_planform,
         sample_id=sample_id,
         output_dir=output_dir,
         geometry_config=geometry_config,
@@ -1267,17 +1849,31 @@ def _mesh_polygons_volume_sample_layered_tet(
         sample_id=sample_id,
         geometry_config=geometry_config,
         volume_config=volume_config,
-        planform=planform,
+        planform=cad_planform,
         pre_export_report=pre_export_report,
+        roundtrip_report=roundtrip_report,
+        inspection_step_path=inspection_step_path,
+        inspection_pre_export_report=inspection_pre_export_report,
+        inspection_roundtrip_report=inspection_roundtrip_report,
+    )
+    _write_ansys_face_selection_manifest(
+        manifest_path=selection_manifest_path,
+        sample_id=sample_id,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
         roundtrip_report=roundtrip_report,
     )
     return _CadExportArtifacts(
         solver_mesh_path=solver_mesh_path,
         step_path=step_path,
         cad_report_path=cad_report_path,
-        planform=planform,
+        planform=cad_planform,
+        selection_manifest_path=selection_manifest_path,
         pre_export_report=pre_export_report,
         roundtrip_report=roundtrip_report,
+        inspection_step_path=inspection_step_path,
+        inspection_pre_export_report=inspection_pre_export_report,
+        inspection_roundtrip_report=inspection_roundtrip_report,
     )
 
 

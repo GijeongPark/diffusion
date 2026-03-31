@@ -89,13 +89,22 @@ Export solid STEP geometry for ANSYS and build the fast Python solver meshes fro
 
 This writes one set of files per sample under `meshes/volumes/`, including:
 
-- `plate3d_XXXX.step` for CAD-style geometry import into the ANSYS Workbench Geometry cell
+- `plate3d_XXXX.step` as the **recommended** combined STEP for ANSYS Workbench
+- `plate3d_XXXX_single_face_probe.step` as an optional legacy inspection-only combined STEP when explicitly requested
+- `plate3d_XXXX_ansys_face_groups.json` as the face-selection recipe for Workbench electrode/interface grouping
 - `plate3d_XXXX_fenicsx.npz` for the in-house solver
 - `plate3d_XXXX_cad.json` for the CAD validation report
 - `plate3d_XXXX_ansys_workbench.json` for the ANSYS Workbench handoff bundle, including the shared problem specification and expected solid-body layout
 - `mesh_build_summary.json` for per-run mesh/CAD success and rejection reasons
 
 By default the ANSYS path stays STEP-only and solid, while the Python path uses the faster `layered_tet` solver mesh backend. That backend meshes a partitioned 2D plate surface with gmsh and extrudes it into a layered tetrahedral mesh for FEniCSx, which is much faster than tetrahedralizing the full 3D STEP body for every sample.
+
+Important ANSYS note:
+
+- use `plate3d_XXXX.step` as the default Workbench geometry; it keeps the substrate/piezo interface conformal so the combined solid is meshable in one file
+- the piezo bottom can therefore be split into multiple CAD regions when the substrate pattern is complex; use `plate3d_XXXX_ansys_face_groups.json` instead of manually clicking every fragment for the bottom electrode/interface selection
+- `plate3d_XXXX_single_face_probe.step` is off by default because it is inspection-only and can still trigger piezo meshing failures in Workbench
+- the CAD report and the Workbench handoff JSON now record the combined-file handoff plus the face-selection recipe explicitly
 
 If you explicitly want the old full 3D gmsh volume-mesh route for the Python solver, switch to the legacy backend:
 
@@ -154,6 +163,8 @@ MPLCONFIGDIR=/tmp/mpl ./.venv/bin/python peh_inverse_design/visualize_run_output
 ```
 
 This generates per-sample summary PNGs, a gallery image, and `summary.csv`.
+
+The surface-strain panel in those figures is now explicitly the **piezo top-surface** strain field. Because the patch fully covers the metaplate, that panel is expected to look almost solid in plan view; the visualizer now overlays the tiled substrate footprint so the underlying unit-cell pattern remains visible.
 
 ## Quick Test Run
 

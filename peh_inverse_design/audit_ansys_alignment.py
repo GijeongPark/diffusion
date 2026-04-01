@@ -12,10 +12,12 @@ if __package__ in (None, ""):
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from peh_inverse_design.modal_surface_fields import available_surface_strain_fields, preferred_surface_strain_field
     from peh_inverse_design.problem_spec import build_runtime_defaults, load_problem_spec
 else:
-    from .mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from .modal_surface_fields import available_surface_strain_fields, preferred_surface_strain_field
     from .problem_spec import build_runtime_defaults, load_problem_spec
 
 
@@ -37,22 +39,105 @@ def _load_run_problem_spec(run_dir: Path) -> tuple[dict[str, Any] | None, Path |
     return None, None
 
 
-def _load_top_surface(mesh_path: Path, modal_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    with np.load(mesh_path) as mesh, np.load(modal_path) as modal:
+def _load_top_surface(mesh_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    with np.load(mesh_path) as mesh:
         points = np.asarray(mesh["points"], dtype=np.float64)
         triangles = np.asarray(mesh["triangle_cells"], dtype=np.int64)
         triangle_tags = np.asarray(mesh["triangle_tags"], dtype=np.int32)
         top_triangles = triangles[triangle_tags == FACET_TOP_ELECTRODE_TAG]
         if top_triangles.shape[0] == 0:
             top_triangles = triangles
-        strain = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64).reshape(-1)
-    if strain.shape[0] != top_triangles.shape[0]:
-        raise ValueError(
-            f"Top-surface strain length mismatch for {modal_path}: "
-            f"{strain.shape[0]} values for {top_triangles.shape[0]} top triangles."
-        )
     centroids = np.mean(points[top_triangles], axis=1)
-    return points, top_triangles, centroids, strain
+    return points, top_triangles, centroids
+
+
+def _surface_strain_summary(
+    *,
+    strain: np.ndarray,
+    centroids: np.ndarray,
+    plate_size_x_m: float,
+    label: str,
+    field_name: str,
+    frequency_hz: float,
+) -> tuple[dict[str, Any], list[str]]:
+    max_idx = int(np.argmax(strain))
+    top_1pct_threshold = float(np.percentile(strain, 99.0))
+    top_1pct_mask = strain >= top_1pct_threshold
+    root_mask = centroids[:, 0] <= 0.1 * float(plate_size_x_m)
+    tip_mask = centroids[:, 0] >= 0.9 * float(plate_size_x_m)
+    warnings: list[str] = []
+    if top_1pct_mask.any():
+        top_1pct_x_mean = float(np.mean(centroids[top_1pct_mask, 0]))
+        if top_1pct_x_mean > 0.6 * float(plate_size_x_m):
+            warnings.append(
+                f"{label} is biased toward the free-edge side; verify this against ANSYS on the matching piezo face."
+            )
+    else:
+        top_1pct_x_mean = float("nan")
+
+    summary = {
+        "field_name": field_name,
+        "label": label,
+        "frequency_hz": float(frequency_hz),
+        "triangle_count": int(strain.shape[0]),
+        "max_strain_eqv": float(strain[max_idx]),
+        "max_strain_centroid_m": [float(value) for value in centroids[max_idx]],
+        "top_1pct_x_mean_m": float(top_1pct_x_mean),
+        "root_mean_strain_eqv": float(np.mean(strain[root_mask])) if root_mask.any() else float("nan"),
+        "tip_mean_strain_eqv": float(np.mean(strain[tip_mask])) if tip_mask.any() else float("nan"),
+        "root_max_strain_eqv": float(np.max(strain[root_mask])) if root_mask.any() else float("nan"),
+        "tip_max_strain_eqv": float(np.max(strain[tip_mask])) if tip_mask.any() else float("nan"),
+    }
+    return summary, warnings
+
+
+def _load_surface_fields(
+    mesh_path: Path,
+    modal_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], list[dict[str, Any]]]:
+    points, top_triangles, centroids = _load_top_surface(mesh_path)
+    with np.load(modal_path) as modal:
+        available_fields = [
+            {
+                "key": field.key,
+                "kind": field.kind,
+                "label": field.label,
+                "frequency_hz": field.frequency_hz,
+                "strain": np.asarray(field.strain, dtype=np.float64),
+            }
+            for field in available_surface_strain_fields(modal, top_triangles.shape[0])
+        ]
+        preferred = preferred_surface_strain_field(modal, top_triangles.shape[0])
+    if preferred is None:
+        raise ValueError(f"No compatible top-surface strain field was found in {modal_path}.")
+    preferred_summary = {
+        "key": preferred.key,
+        "kind": preferred.kind,
+        "label": preferred.label,
+        "frequency_hz": preferred.frequency_hz,
+        "strain": np.asarray(preferred.strain, dtype=np.float64),
+    }
+    return points, top_triangles, centroids, preferred_summary, available_fields
+
+
+def _mesh_material_summary(mesh_path: Path) -> dict[str, Any]:
+    with np.load(mesh_path) as mesh:
+        points = np.asarray(mesh["points"], dtype=np.float64)
+        tetra_cells = np.asarray(mesh["tetra_cells"], dtype=np.int64)
+        tetra_tags = np.asarray(mesh["tetra_tags"], dtype=np.int32)
+    tet_points = points[tetra_cells]
+    edge_a = tet_points[:, 1] - tet_points[:, 0]
+    edge_b = tet_points[:, 2] - tet_points[:, 0]
+    edge_c = tet_points[:, 3] - tet_points[:, 0]
+    volumes = np.abs(np.einsum("ij,ij->i", edge_a, np.cross(edge_b, edge_c))) / 6.0
+    substrate_mask = tetra_tags == VOLUME_SUBSTRATE_TAG
+    piezo_mask = tetra_tags == VOLUME_PIEZO_TAG
+    return {
+        "substrate_volume_m3": float(np.sum(volumes[substrate_mask])),
+        "piezo_volume_m3": float(np.sum(volumes[piezo_mask])),
+        "substrate_cell_count": int(np.count_nonzero(substrate_mask)),
+        "piezo_cell_count": int(np.count_nonzero(piezo_mask)),
+    }
 
 
 def _export_top_surface_data(
@@ -128,33 +213,61 @@ def audit_run_sample(
         peak_voltage = float(np.max(voltage_mag))
         argmax_freq_hz = float(freq_hz[int(np.argmax(voltage_mag))])
         eigenfreq_hz = np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)
-        field_frequency_hz = float(np.asarray(modal["field_frequency_hz"], dtype=np.float64))
+        mode1_frequency_hz = (
+            float(np.asarray(modal["mode1_frequency_hz"], dtype=np.float64))
+            if "mode1_frequency_hz" in modal
+            else (float(eigenfreq_hz[0]) if eigenfreq_hz.size > 0 else float("nan"))
+        )
+        harmonic_field_frequency_hz = (
+            float(np.asarray(modal["harmonic_field_frequency_hz"], dtype=np.float64))
+            if "harmonic_field_frequency_hz" in modal
+            else (float(np.asarray(modal["field_frequency_hz"], dtype=np.float64)) if "field_frequency_hz" in modal else float("nan"))
+        )
+        modal_theta = np.asarray(modal["modal_theta"], dtype=np.float64).reshape(-1) if "modal_theta" in modal else np.zeros(0, dtype=np.float64)
+        modal_force = np.asarray(modal["modal_force"], dtype=np.float64).reshape(-1) if "modal_force" in modal else np.zeros(0, dtype=np.float64)
+        modal_mass = np.asarray(modal["modal_mass"], dtype=np.float64).reshape(-1) if "modal_mass" in modal else np.zeros(0, dtype=np.float64)
+        capacitance_f = (
+            float(np.asarray(modal["capacitance_f"], dtype=np.float64).reshape(-1)[0])
+            if "capacitance_f" in modal
+            else float("nan")
+        )
 
     handoff = _load_json(handoff_path)
     face_groups = _load_json(face_groups_path) if face_groups_path.exists() else None
     problem_spec, problem_spec_path = _load_run_problem_spec(run_dir)
     runtime_defaults = build_runtime_defaults(problem_spec) if problem_spec is not None else {}
-    points, top_triangles, centroids, strain = _load_top_surface(mesh_path, modal_path)
+    points, top_triangles, centroids, preferred_surface_field, available_surface_fields = _load_surface_fields(mesh_path, modal_path)
+    mesh_materials = _mesh_material_summary(mesh_path)
 
     plate_size = np.asarray(handoff["geometry"]["plate_size_m"], dtype=np.float64).reshape(2)
-    max_idx = int(np.argmax(strain))
-    top_1pct_threshold = float(np.percentile(strain, 99.0))
-    top_1pct_mask = strain >= top_1pct_threshold
-    root_mask = centroids[:, 0] <= 0.1 * float(plate_size[0])
-    tip_mask = centroids[:, 0] >= 0.9 * float(plate_size[0])
     warnings: list[str] = []
-    if top_1pct_mask.any():
-        top_1pct_x_mean = float(np.mean(centroids[top_1pct_mask, 0]))
-        if top_1pct_x_mean > 0.6 * float(plate_size[0]):
-            warnings.append(
-                "Top 1% of the stored piezo top-surface strain is biased toward the free-edge side; "
-                "verify this against ANSYS on the piezo top face at the same field frequency."
-            )
-    else:
-        top_1pct_x_mean = float("nan")
-
     if abs(argmax_freq_hz - f_peak_hz) > 1.0e-9:
         warnings.append("The saved FRF peak frequency does not match the stored f_peak_hz exactly.")
+    top_surface_strain, surface_warnings = _surface_strain_summary(
+        strain=preferred_surface_field["strain"],
+        centroids=centroids,
+        plate_size_x_m=float(plate_size[0]),
+        label=str(preferred_surface_field["label"]),
+        field_name=str(preferred_surface_field["key"]),
+        frequency_hz=float(preferred_surface_field["frequency_hz"]),
+    )
+    warnings.extend(surface_warnings)
+    harmonic_surface_strain = None
+    for field in available_surface_fields:
+        if field["kind"] != "harmonic":
+            continue
+        if str(field["key"]) == str(preferred_surface_field["key"]):
+            break
+        harmonic_surface_strain, harmonic_warnings = _surface_strain_summary(
+            strain=np.asarray(field["strain"], dtype=np.float64),
+            centroids=centroids,
+            plate_size_x_m=float(plate_size[0]),
+            label=str(field["label"]),
+            field_name=str(field["key"]),
+            frequency_hz=float(field["frequency_hz"]),
+        )
+        warnings.extend(harmonic_warnings)
+        break
 
     summary: dict[str, Any] = {
         "run_dir": str(run_dir),
@@ -169,24 +282,24 @@ def audit_run_sample(
         "effective_problem_defaults": runtime_defaults,
         "frequency_comparison": {
             "ansys_modal_target_hz": float(eigenfreq_hz[0]) if eigenfreq_hz.size > 0 else float("nan"),
+            "mode1_frequency_hz": float(mode1_frequency_hz),
             "f_peak_hz": float(f_peak_hz),
-            "field_frequency_hz": float(field_frequency_hz),
+            "harmonic_field_frequency_hz": float(harmonic_field_frequency_hz),
+            "field_frequency_hz": float(harmonic_field_frequency_hz),
             "saved_voltage_peak_freq_hz": float(argmax_freq_hz),
         },
         "voltage_comparison": {
             "peak_voltage_v": float(peak_voltage),
             "external_load_resistance_ohm": float(runtime_defaults.get("resistance_ohm", np.nan)),
         },
-        "top_surface_strain": {
-            "triangle_count": int(strain.shape[0]),
-            "max_strain_eqv": float(strain[max_idx]),
-            "max_strain_centroid_m": [float(value) for value in centroids[max_idx]],
-            "top_1pct_x_mean_m": float(top_1pct_x_mean),
-            "root_mean_strain_eqv": float(np.mean(strain[root_mask])) if root_mask.any() else float("nan"),
-            "tip_mean_strain_eqv": float(np.mean(strain[tip_mask])) if tip_mask.any() else float("nan"),
-            "root_max_strain_eqv": float(np.max(strain[root_mask])) if root_mask.any() else float("nan"),
-            "tip_max_strain_eqv": float(np.max(strain[tip_mask])) if tip_mask.any() else float("nan"),
+        "electromechanical": {
+            "modal_theta_mode1": float(modal_theta[0]) if modal_theta.size > 0 else float("nan"),
+            "modal_force_mode1": float(modal_force[0]) if modal_force.size > 0 else float("nan"),
+            "modal_mass_mode1": float(modal_mass[0]) if modal_mass.size > 0 else float("nan"),
+            "capacitance_f": float(capacitance_f),
         },
+        "mesh_materials": mesh_materials,
+        "top_surface_strain": top_surface_strain,
         "ansys_face_groups": {
             "path": str(face_groups_path) if face_groups_path.exists() else "",
             "piezo_bottom_expected_region_count": (
@@ -198,6 +311,8 @@ def audit_run_sample(
         },
         "warnings": warnings,
     }
+    if harmonic_surface_strain is not None:
+        summary["harmonic_top_surface_strain"] = harmonic_surface_strain
 
     if output_dir is not None:
         output_dir = Path(output_dir)
@@ -207,8 +322,8 @@ def audit_run_sample(
             points=points,
             top_triangles=top_triangles,
             centroids=centroids,
-            strain=strain,
-            field_frequency_hz=field_frequency_hz,
+            strain=np.asarray(preferred_surface_field["strain"], dtype=np.float64),
+            field_frequency_hz=float(preferred_surface_field["frequency_hz"]),
         )
         summary["exports"] = {
             "top_surface_csv_path": str(csv_path),
@@ -233,8 +348,9 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print(
         "frequency_comparison: "
         f"eigenfreq_hz[0]={summary['frequency_comparison']['ansys_modal_target_hz']:.12g}, "
+        f"mode1_frequency_hz={summary['frequency_comparison']['mode1_frequency_hz']:.12g}, "
         f"f_peak_hz={summary['frequency_comparison']['f_peak_hz']:.12g}, "
-        f"field_frequency_hz={summary['frequency_comparison']['field_frequency_hz']:.12g}"
+        f"harmonic_field_frequency_hz={summary['frequency_comparison']['harmonic_field_frequency_hz']:.12g}"
     )
     print(
         "voltage_comparison: "
@@ -242,12 +358,34 @@ def _print_summary(summary: dict[str, Any]) -> None:
         f"load_ohm={summary['voltage_comparison']['external_load_resistance_ohm']:.12g}"
     )
     print(
+        "electromechanical: "
+        f"modal_theta_mode1={summary['electromechanical']['modal_theta_mode1']:.12g}, "
+        f"modal_force_mode1={summary['electromechanical']['modal_force_mode1']:.12g}, "
+        f"capacitance_f={summary['electromechanical']['capacitance_f']:.12g}"
+    )
+    print(
+        "mesh_materials: "
+        f"substrate_volume_m3={summary['mesh_materials']['substrate_volume_m3']:.12g}, "
+        f"piezo_volume_m3={summary['mesh_materials']['piezo_volume_m3']:.12g}, "
+        f"substrate_cells={summary['mesh_materials']['substrate_cell_count']}, "
+        f"piezo_cells={summary['mesh_materials']['piezo_cell_count']}"
+    )
+    print(
         "top_surface_strain: "
+        f"{summary['top_surface_strain']['label']} "
         f"max={summary['top_surface_strain']['max_strain_eqv']:.12g} "
         f"at {tuple(summary['top_surface_strain']['max_strain_centroid_m'])}, "
         f"root_mean={summary['top_surface_strain']['root_mean_strain_eqv']:.12g}, "
-        f"tip_mean={summary['top_surface_strain']['tip_mean_strain_eqv']:.12g}"
+        f"tip_mean={summary['top_surface_strain']['tip_mean_strain_eqv']:.12g}, "
+        f"top_1pct_x_mean_m={summary['top_surface_strain']['top_1pct_x_mean_m']:.12g}"
     )
+    if "harmonic_top_surface_strain" in summary:
+        print(
+            "harmonic_top_surface_strain: "
+            f"max={summary['harmonic_top_surface_strain']['max_strain_eqv']:.12g}, "
+            f"root_mean={summary['harmonic_top_surface_strain']['root_mean_strain_eqv']:.12g}, "
+            f"tip_mean={summary['harmonic_top_surface_strain']['tip_mean_strain_eqv']:.12g}"
+        )
     print(
         "ansys_face_groups: "
         f"path={summary['ansys_face_groups']['path']}, "

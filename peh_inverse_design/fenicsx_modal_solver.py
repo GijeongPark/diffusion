@@ -14,6 +14,7 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from peh_inverse_design.modal_surface_fields import has_explicit_surface_strain_fields
     from peh_inverse_design.problem_spec import (
         build_runtime_defaults,
         build_mechanical_config_kwargs,
@@ -24,6 +25,7 @@ if __package__ in (None, ""):
     from peh_inverse_design.response_dataset import save_fem_response
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
+    from .modal_surface_fields import has_explicit_surface_strain_fields
     from .problem_spec import (
         build_runtime_defaults,
         build_mechanical_config_kwargs,
@@ -107,6 +109,45 @@ def _build_top_surface_point_cell_map(
     return top_point_ids, point_cells
 
 
+def _cell_vertex_signature(vertices: np.ndarray) -> tuple[int, ...]:
+    return tuple(sorted(int(value) for value in np.asarray(vertices, dtype=np.int64).reshape(-1)))
+
+
+def _build_created_to_raw_cell_index_map(
+    raw_tetra_cells: np.ndarray,
+    created_cell_geometry_dofs: np.ndarray,
+    input_global_indices: np.ndarray,
+) -> np.ndarray:
+    raw_lookup: dict[tuple[int, ...], int] = {}
+    raw_tetra_cells = np.asarray(raw_tetra_cells, dtype=np.int64)
+    created_cell_geometry_dofs = np.asarray(created_cell_geometry_dofs, dtype=np.int64)
+    input_global_indices = np.asarray(input_global_indices, dtype=np.int64).reshape(-1)
+    for raw_cell_idx, raw_cell in enumerate(raw_tetra_cells):
+        signature = _cell_vertex_signature(raw_cell)
+        if signature in raw_lookup:
+            raise ValueError(f"Duplicate raw tetra connectivity detected for signature {signature}.")
+        raw_lookup[signature] = int(raw_cell_idx)
+
+    created_to_raw = np.full(created_cell_geometry_dofs.shape[0], -1, dtype=np.int64)
+    for created_cell_idx, geometry_dofs in enumerate(created_cell_geometry_dofs):
+        signature = _cell_vertex_signature(input_global_indices[geometry_dofs])
+        raw_cell_idx = raw_lookup.get(signature)
+        if raw_cell_idx is None:
+            raise KeyError(
+                "Could not match a created tetra cell back to the raw NPZ cell ordering: "
+                f"created_cell={created_cell_idx}, raw_vertices={signature}."
+            )
+        created_to_raw[created_cell_idx] = int(raw_cell_idx)
+
+    unique_raw = np.unique(created_to_raw)
+    if unique_raw.shape[0] != raw_tetra_cells.shape[0]:
+        raise ValueError(
+            "Created-to-raw tetra mapping is incomplete or duplicated: "
+            f"matched={unique_raw.shape[0]} raw_cells={raw_tetra_cells.shape[0]}."
+        )
+    return created_to_raw
+
+
 def _mode_to_nodal_displacement(
     mode,
     raw_points: np.ndarray,
@@ -123,50 +164,225 @@ def _mode_to_nodal_displacement(
     return nodal
 
 
-def _equivalent_surface_strain_from_displacement(
+def _remap_raw_cell_tags_to_created_mesh(
+    raw_tetra_cells: np.ndarray,
+    raw_tetra_tags: np.ndarray,
+    created_cell_geometry_dofs: np.ndarray,
+    input_global_indices: np.ndarray,
+) -> np.ndarray:
+    created_to_raw = _build_created_to_raw_cell_index_map(
+        raw_tetra_cells=raw_tetra_cells,
+        created_cell_geometry_dofs=created_cell_geometry_dofs,
+        input_global_indices=input_global_indices,
+    )
+    return np.asarray(raw_tetra_tags, dtype=np.int32)[created_to_raw]
+
+
+def _invert_created_to_raw_cell_index_map(created_to_raw: np.ndarray, n_raw_cells: int) -> np.ndarray:
+    created_to_raw = np.asarray(created_to_raw, dtype=np.int64).reshape(-1)
+    raw_to_created = np.full(int(n_raw_cells), -1, dtype=np.int64)
+    for created_cell_idx, raw_cell_idx in enumerate(created_to_raw):
+        if raw_cell_idx < 0 or raw_cell_idx >= int(n_raw_cells):
+            raise IndexError(f"Raw cell index {raw_cell_idx} is out of bounds for n_raw_cells={n_raw_cells}.")
+        if raw_to_created[raw_cell_idx] >= 0:
+            raise ValueError(f"Raw cell {raw_cell_idx} maps to multiple created cells.")
+        raw_to_created[raw_cell_idx] = int(created_cell_idx)
+    if np.any(raw_to_created < 0):
+        missing = np.flatnonzero(raw_to_created < 0)
+        raise ValueError(f"Missing created-cell mapping for raw tetra cell(s): {missing[:8].tolist()}.")
+    return raw_to_created
+
+
+def _build_top_surface_triangle_cell_map(
+    raw_tetra_cells: np.ndarray,
+    raw_triangle_cells: np.ndarray,
+    raw_triangle_tags: np.ndarray,
+) -> np.ndarray:
+    top_triangles = np.asarray(raw_triangle_cells[raw_triangle_tags == FACET_TOP_ELECTRODE_TAG], dtype=np.int64)
+    raw_tetra_cells = np.asarray(raw_tetra_cells, dtype=np.int64)
+    if top_triangles.shape[0] == 0 or raw_tetra_cells.shape[0] == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    n_points = int(max(np.max(raw_tetra_cells), np.max(top_triangles))) + 1
+    point_is_top = np.zeros(n_points, dtype=bool)
+    point_is_top[np.unique(top_triangles.reshape(-1))] = True
+    point_cells: list[list[int]] = [[] for _ in range(n_points)]
+    for cell_idx, tetra in enumerate(raw_tetra_cells):
+        for point_id in tetra:
+            if point_is_top[int(point_id)]:
+                point_cells[int(point_id)].append(int(cell_idx))
+
+    point_cell_sets = {point_id: set(point_cells[point_id]) for point_id in np.flatnonzero(point_is_top)}
+    triangle_cell_ids = np.full(top_triangles.shape[0], -1, dtype=np.int64)
+    for triangle_idx, triangle in enumerate(top_triangles):
+        vertex_ids = [int(vertex) for vertex in triangle]
+        shortest_vertex = min(vertex_ids, key=lambda vertex: len(point_cells[vertex]))
+        candidate_cells = point_cells[shortest_vertex]
+        other_vertices = [vertex for vertex in vertex_ids if vertex != shortest_vertex]
+        for cell_idx in candidate_cells:
+            if all(cell_idx in point_cell_sets[vertex] for vertex in other_vertices):
+                triangle_cell_ids[triangle_idx] = int(cell_idx)
+                break
+        if triangle_cell_ids[triangle_idx] < 0:
+            raise KeyError(
+                "Could not match a top-surface triangle to an owning tetra cell: "
+                f"triangle={triangle.tolist()}."
+            )
+    return triangle_cell_ids
+
+
+def _equivalent_volume_strain_from_displacement(
     points: np.ndarray,
-    triangle: np.ndarray,
+    tetra: np.ndarray,
     displacement: np.ndarray,
 ) -> float:
-    xy = np.asarray(points[triangle, :2], dtype=np.float64)
-    uv = np.asarray(displacement[triangle, :2], dtype=np.complex128)
-    A = np.column_stack([np.ones(3), xy])
-    invA = np.linalg.inv(A)
-    grads = invA[1:, :].T
+    xyz = np.asarray(points[tetra], dtype=np.float64)
+    uvw = np.asarray(displacement[tetra], dtype=np.complex128)
+    A = np.column_stack([np.ones(4, dtype=np.float64), xyz])
+    coefficients = np.linalg.solve(A, uvw)
+    grad = np.asarray(coefficients[1:, :].T, dtype=np.complex128)
+    eps = 0.5 * (grad + grad.T)
 
-    grad_u = uv[:, 0] @ grads
-    grad_v = uv[:, 1] @ grads
-    eps_xx = grad_u[0]
-    eps_yy = grad_v[1]
-    eps_xy = 0.5 * (grad_u[1] + grad_v[0])
-
-    eq = np.sqrt(
-        np.real(
-            eps_xx * np.conj(eps_xx)
-            - eps_xx * np.conj(eps_yy)
-            + eps_yy * np.conj(eps_yy)
-            + 3.0 * eps_xy * np.conj(eps_xy)
+    eq_sq = (
+        0.5
+        * (
+            (eps[0, 0] - eps[1, 1]) * np.conj(eps[0, 0] - eps[1, 1])
+            + (eps[1, 1] - eps[2, 2]) * np.conj(eps[1, 1] - eps[2, 2])
+            + (eps[2, 2] - eps[0, 0]) * np.conj(eps[2, 2] - eps[0, 0])
+        )
+        + 3.0
+        * (
+            eps[0, 1] * np.conj(eps[0, 1])
+            + eps[1, 2] * np.conj(eps[1, 2])
+            + eps[0, 2] * np.conj(eps[0, 2])
         )
     )
-    return float(eq)
+    return float(np.sqrt(max(float(np.real(eq_sq)), 0.0)))
 
 
-def _compute_top_surface_strain(
+def _compute_top_surface_cellwise_strain(
     points: np.ndarray,
+    tetra_cells: np.ndarray,
     triangle_cells: np.ndarray,
     triangle_tags: np.ndarray,
     nodal_displacement: np.ndarray,
+    top_triangle_cell_ids: np.ndarray | None = None,
 ) -> np.ndarray:
     top_triangles = np.asarray(triangle_cells[triangle_tags == FACET_TOP_ELECTRODE_TAG], dtype=np.int64)
     if top_triangles.shape[0] == 0:
         return np.zeros(0, dtype=np.float64)
-    return np.asarray(
+    if top_triangle_cell_ids is None:
+        top_triangle_cell_ids = _build_top_surface_triangle_cell_map(
+            raw_tetra_cells=tetra_cells,
+            raw_triangle_cells=triangle_cells,
+            raw_triangle_tags=triangle_tags,
+        )
+    top_triangle_cell_ids = np.asarray(top_triangle_cell_ids, dtype=np.int64).reshape(-1)
+    if top_triangle_cell_ids.shape[0] != top_triangles.shape[0]:
+        raise ValueError(
+            "Top-surface triangle-to-cell mapping length mismatch: "
+            f"{top_triangle_cell_ids.shape[0]} cells for {top_triangles.shape[0]} triangles."
+        )
+    unique_cell_ids, inverse = np.unique(top_triangle_cell_ids, return_inverse=True)
+    cell_strain = np.asarray(
         [
-            _equivalent_surface_strain_from_displacement(points, tri, nodal_displacement)
-            for tri in top_triangles
+            _equivalent_volume_strain_from_displacement(points, np.asarray(tetra_cells[cell_id], dtype=np.int64), nodal_displacement)
+            for cell_id in unique_cell_ids
         ],
         dtype=np.float64,
     )
+    return cell_strain[inverse]
+
+
+def _equivalent_volume_strain_from_tensor_values(strain_tensor: np.ndarray) -> np.ndarray:
+    strain_tensor = np.asarray(strain_tensor, dtype=np.complex128)
+    eq_sq = (
+        0.5
+        * (
+            (strain_tensor[..., 0, 0] - strain_tensor[..., 1, 1]) * np.conj(strain_tensor[..., 0, 0] - strain_tensor[..., 1, 1])
+            + (strain_tensor[..., 1, 1] - strain_tensor[..., 2, 2]) * np.conj(strain_tensor[..., 1, 1] - strain_tensor[..., 2, 2])
+            + (strain_tensor[..., 2, 2] - strain_tensor[..., 0, 0]) * np.conj(strain_tensor[..., 2, 2] - strain_tensor[..., 0, 0])
+        )
+        + 3.0
+        * (
+            strain_tensor[..., 0, 1] * np.conj(strain_tensor[..., 0, 1])
+            + strain_tensor[..., 1, 2] * np.conj(strain_tensor[..., 1, 2])
+            + strain_tensor[..., 0, 2] * np.conj(strain_tensor[..., 0, 2])
+        )
+    )
+    return np.sqrt(np.maximum(np.real(eq_sq), 0.0))
+
+
+def _compute_top_surface_fe_strain_from_mode_dofs(
+    *,
+    raw_points: np.ndarray,
+    raw_tetra_cells: np.ndarray,
+    raw_triangle_cells: np.ndarray,
+    raw_triangle_tags: np.ndarray,
+    mode_dof_vectors: np.ndarray,
+    element_order: int,
+    modal_coefficients: np.ndarray | None = None,
+) -> np.ndarray:
+    raw_points = np.asarray(raw_points, dtype=np.float64)
+    raw_tetra_cells = np.asarray(raw_tetra_cells, dtype=np.int64)
+    raw_triangle_cells = np.asarray(raw_triangle_cells, dtype=np.int32)
+    raw_triangle_tags = np.asarray(raw_triangle_tags, dtype=np.int32)
+    mode_dof_vectors = np.asarray(mode_dof_vectors, dtype=np.float64)
+    if raw_points.size == 0 or raw_tetra_cells.size == 0 or mode_dof_vectors.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    top_triangle_raw_cell_ids = _build_top_surface_triangle_cell_map(
+        raw_tetra_cells=raw_tetra_cells,
+        raw_triangle_cells=raw_triangle_cells,
+        raw_triangle_tags=raw_triangle_tags,
+    )
+    if top_triangle_raw_cell_ids.size == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    MPI, PETSc, _, fem, _, _, _, ufl = _load_fenicsx()
+    import basix.ufl  # type: ignore
+    import dolfinx.mesh as dmesh  # type: ignore
+
+    comm = MPI.COMM_WORLD
+    domain = ufl.Mesh(basix.ufl.element("Lagrange", "tetrahedron", 1, shape=(3,), dtype=np.float64))
+    mesh = dmesh.create_mesh(comm, raw_tetra_cells, domain, raw_points)
+    created_cell_geometry_dofs = np.asarray(mesh.geometry.dofmap, dtype=np.int64)
+    input_global_indices = np.asarray(mesh.geometry.input_global_indices, dtype=np.int64)
+    created_to_raw = _build_created_to_raw_cell_index_map(
+        raw_tetra_cells=raw_tetra_cells,
+        created_cell_geometry_dofs=created_cell_geometry_dofs,
+        input_global_indices=input_global_indices,
+    )
+    raw_to_created = _invert_created_to_raw_cell_index_map(created_to_raw, n_raw_cells=raw_tetra_cells.shape[0])
+    top_triangle_created_cell_ids = np.asarray(raw_to_created[top_triangle_raw_cell_ids], dtype=np.int32)
+    unique_created_cells, inverse = np.unique(top_triangle_created_cell_ids, return_inverse=True)
+
+    V = fem.functionspace(mesh, ("Lagrange", int(element_order), (mesh.geometry.dim,)))
+    reference_points = np.asarray([[0.25, 0.25, 0.25]], dtype=np.float64)
+    strain_expression = lambda field: fem.Expression(ufl.sym(ufl.grad(field)), reference_points)
+
+    if modal_coefficients is None:
+        displacement = fem.Function(V)
+        displacement.x.array[:] = np.asarray(mode_dof_vectors[0], dtype=np.float64)
+        strain_values = np.asarray(strain_expression(displacement).eval(mesh, unique_created_cells), dtype=np.float64)
+        equivalent = _equivalent_volume_strain_from_tensor_values(strain_values[:, 0, :, :])
+        return np.asarray(equivalent, dtype=np.float64)[inverse]
+
+    modal_coefficients = np.asarray(modal_coefficients, dtype=np.complex128).reshape(-1)
+    if modal_coefficients.shape[0] != mode_dof_vectors.shape[0]:
+        raise ValueError(
+            "modal_coefficients length does not match the number of stored mode vectors: "
+            f"{modal_coefficients.shape[0]} vs {mode_dof_vectors.shape[0]}."
+        )
+    displacement_real = fem.Function(V)
+    displacement_imag = fem.Function(V)
+    displacement_real.x.array[:] = np.tensordot(np.real(modal_coefficients), mode_dof_vectors, axes=(0, 0))
+    displacement_imag.x.array[:] = np.tensordot(np.imag(modal_coefficients), mode_dof_vectors, axes=(0, 0))
+    strain_real = np.asarray(strain_expression(displacement_real).eval(mesh, unique_created_cells), dtype=np.float64)
+    strain_imag = np.asarray(strain_expression(displacement_imag).eval(mesh, unique_created_cells), dtype=np.float64)
+    strain_complex = strain_real[:, 0, :, :] + 1j * strain_imag[:, 0, :, :]
+    equivalent = _equivalent_volume_strain_from_tensor_values(strain_complex)
+    return np.asarray(equivalent, dtype=np.float64)[inverse]
 
 
 def _load_fenicsx():
@@ -228,6 +444,7 @@ def _assemble_modal_model(
     raw_tetra_tags = np.zeros((0,), dtype=np.int32)
     raw_triangle_cells = np.zeros((0, 3), dtype=np.int32)
     raw_triangle_tags = np.zeros((0,), dtype=np.int32)
+    created_to_raw_cell_map = np.zeros((0,), dtype=np.int64)
     if mesh_path.suffix == ".npz":
         raw = np.load(mesh_path)
         raw_points = np.asarray(raw["points"], dtype=np.float64)
@@ -238,8 +455,16 @@ def _assemble_modal_model(
 
         domain = ufl.Mesh(basix.ufl.element("Lagrange", "tetrahedron", 1, shape=(3,), dtype=np.float64))
         mesh = dmesh.create_mesh(comm, raw_tetra_cells, domain, raw_points)
-        cell_entities = np.arange(raw_tetra_cells.shape[0], dtype=np.int32)
-        cell_tags = dmesh.meshtags(mesh, mesh.topology.dim, cell_entities, raw_tetra_tags)
+        created_cell_geometry_dofs = np.asarray(mesh.geometry.dofmap, dtype=np.int64)
+        input_global_indices = np.asarray(mesh.geometry.input_global_indices, dtype=np.int64)
+        created_to_raw_cell_map = _build_created_to_raw_cell_index_map(
+            raw_tetra_cells=raw_tetra_cells,
+            created_cell_geometry_dofs=created_cell_geometry_dofs,
+            input_global_indices=input_global_indices,
+        )
+        remapped_cell_tags = np.asarray(raw_tetra_tags, dtype=np.int32)[created_to_raw_cell_map]
+        cell_entities = np.arange(remapped_cell_tags.shape[0], dtype=np.int32)
+        cell_tags = dmesh.meshtags(mesh, mesh.topology.dim, cell_entities, remapped_cell_tags)
     elif mesh_path.suffix == ".xdmf":
         with io.XDMFFile(comm, str(mesh_path), "r") as xdmf:
             mesh = xdmf.read_mesh(name="Grid")
@@ -255,15 +480,6 @@ def _assemble_modal_model(
         and raw_tetra_cells.size > 0
         and raw_triangle_cells.size > 0
     )
-    top_surface_point_ids = np.zeros((0,), dtype=np.int64)
-    top_surface_point_cells = np.full(raw_points.shape[0], -1, dtype=np.int32)
-    if store_surface_mode_shapes:
-        top_surface_point_ids, top_surface_point_cells = _build_top_surface_point_cell_map(
-            raw_points=raw_points,
-            raw_tetra_cells=raw_tetra_cells,
-            raw_triangle_cells=raw_triangle_cells,
-            raw_triangle_tags=raw_triangle_tags,
-        )
     plate_dimensions_m = np.asarray(
         [
             float(np.max(x_coords[:, 0]) - np.min(x_coords[:, 0])),
@@ -362,12 +578,16 @@ def _assemble_modal_model(
         substrate_volume_local = fem.assemble_scalar(fem.form(one * dx(VOLUME_SUBSTRATE_TAG)))
         substrate_volume = comm.allreduce(substrate_volume_local, op=MPI.SUM)
         capacitance = piezo.eps33s_f_per_m * piezo_volume / (piezo.thickness_m ** 2)
+        cell_tag_values = np.asarray(cell_tags.values, dtype=np.int32).reshape(-1)
+        substrate_cell_count = int(np.count_nonzero(cell_tag_values == VOLUME_SUBSTRATE_TAG))
+        piezo_cell_count = int(np.count_nonzero(cell_tag_values == VOLUME_PIEZO_TAG))
 
         eigenfreq_hz: list[float] = []
         modal_force: list[float] = []
         modal_theta: list[float] = []
         modal_mass: list[float] = []
         mode_nodal_displacements: list[np.ndarray] = []
+        mode_dof_vectors: list[np.ndarray] = []
 
         vr, _ = K.getVecs()
         vi, _ = K.getVecs()
@@ -407,10 +627,8 @@ def _assemble_modal_model(
             modal_force.append(-gamma_value * mechanical.base_acceleration_m_per_s2)
             modal_theta.append(theta_value)
             modal_mass.append(1.0)
-            if top_surface_point_ids.size > 0:
-                mode_nodal_displacements.append(
-                    _mode_to_nodal_displacement(mode, raw_points, top_surface_point_ids, top_surface_point_cells)
-                )
+            if store_surface_mode_shapes:
+                mode_dof_vectors.append(np.asarray(mode.x.array, dtype=np.float64).copy())
 
         if not eigenfreq_hz:
             raise RuntimeError("No positive eigenfrequencies were extracted from the mesh.")
@@ -423,6 +641,7 @@ def _assemble_modal_model(
             "modal_mass": np.asarray(modal_mass, dtype=np.float64),
             "capacitance_f": np.asarray([capacitance], dtype=np.float64),
             "mode_nodal_displacements": np.asarray(mode_nodal_displacements, dtype=np.float64),
+            "mode_dof_vectors": np.asarray(mode_dof_vectors, dtype=np.float64),
             "raw_points": np.asarray(raw_points, dtype=np.float64),
             "raw_tetra_cells": np.asarray(raw_tetra_cells, dtype=np.int64),
             "raw_tetra_tags": np.asarray(raw_tetra_tags, dtype=np.int32),
@@ -432,6 +651,8 @@ def _assemble_modal_model(
             "total_thickness_m": np.asarray([total_thickness_m], dtype=np.float64),
             "substrate_volume_m3": np.asarray([substrate_volume], dtype=np.float64),
             "piezo_volume_m3": np.asarray([piezo_volume], dtype=np.float64),
+            "substrate_cell_count": np.asarray([substrate_cell_count], dtype=np.int32),
+            "piezo_cell_count": np.asarray([piezo_cell_count], dtype=np.int32),
         }
     finally:
         _destroy_petsc_object(vi)
@@ -616,21 +837,27 @@ def _log_modal_diagnostics(
     total_thickness_m = float(np.asarray(modal_model.get("total_thickness_m", [np.nan]), dtype=np.float64)[0])
     substrate_volume = float(np.asarray(modal_model.get("substrate_volume_m3", [np.nan]), dtype=np.float64)[0])
     piezo_volume = float(np.asarray(modal_model.get("piezo_volume_m3", [np.nan]), dtype=np.float64)[0])
+    substrate_cell_count = int(np.asarray(modal_model.get("substrate_cell_count", [0]), dtype=np.int32)[0])
+    piezo_cell_count = int(np.asarray(modal_model.get("piezo_cell_count", [0]), dtype=np.int32)[0])
     capacitance = float(np.asarray(modal_model.get("capacitance_f", [np.nan]), dtype=np.float64)[0])
     eigenfreq_hz = np.asarray(modal_model.get("eigenfreq_hz", []), dtype=np.float64).reshape(-1)
     modal_theta = np.asarray(modal_model.get("modal_theta", []), dtype=np.float64).reshape(-1)
+    modal_force = np.asarray(modal_model.get("modal_force", []), dtype=np.float64).reshape(-1)
     print(
         "Modal diagnostics: "
         f"plate=({plate_dimensions[0]:.6g}, {plate_dimensions[1]:.6g}) m, "
         f"thickness={total_thickness_m:.6g} m, "
         f"substrate_volume={substrate_volume:.6g} m^3, "
         f"piezo_volume={piezo_volume:.6g} m^3, "
+        f"substrate_cells={substrate_cell_count}, "
+        f"piezo_cells={piezo_cell_count}, "
         f"capacitance={capacitance:.6g} F"
     )
     print(
         "Modal diagnostics: "
         f"eigenfreq_hz[:6]={np.array2string(eigenfreq_hz[:6], precision=6, separator=', ')}, "
-        f"modal_theta[:6]={np.array2string(modal_theta[:6], precision=6, separator=', ')}"
+        f"modal_theta[:6]={np.array2string(modal_theta[:6], precision=6, separator=', ')}, "
+        f"modal_force[:6]={np.array2string(modal_force[:6], precision=6, separator=', ')}"
     )
 
 
@@ -727,6 +954,46 @@ def _evaluate_voltage_frf(
     return voltage
 
 
+def _build_modal_save_payload(
+    *,
+    sample_id: int,
+    element_order: int,
+    mechanical: MechanicalConfig,
+    piezo: PiezoConfig,
+    modal_model: dict[str, np.ndarray],
+    mode1_top_surface_strain_eqv: np.ndarray,
+    harmonic_top_surface_strain_eqv: np.ndarray,
+    harmonic_field_frequency_hz: float,
+) -> dict[str, np.ndarray]:
+    mode1_frequency_hz = float(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1)[0])
+    harmonic_frequency_array = np.asarray(harmonic_field_frequency_hz, dtype=np.float64)
+    return {
+        "sample_id": np.asarray(sample_id, dtype=np.int32),
+        "element_order": np.asarray([int(element_order)], dtype=np.int32),
+        "eigenfreq_hz": modal_model["eigenfreq_hz"],
+        "modal_force": modal_model["modal_force"],
+        "modal_theta": modal_model["modal_theta"],
+        "modal_mass": modal_model["modal_mass"],
+        "capacitance_f": modal_model["capacitance_f"],
+        "substrate_volume_m3": modal_model["substrate_volume_m3"],
+        "piezo_volume_m3": modal_model["piezo_volume_m3"],
+        "substrate_cell_count": modal_model["substrate_cell_count"],
+        "piezo_cell_count": modal_model["piezo_cell_count"],
+        "substrate_rho": np.asarray(mechanical.substrate_rho, dtype=np.float64),
+        "piezo_rho": np.asarray(mechanical.piezo_rho, dtype=np.float64),
+        "damping_ratio": np.asarray(mechanical.damping_ratio, dtype=np.float64),
+        "base_acceleration_m_per_s2": np.asarray(mechanical.base_acceleration_m_per_s2, dtype=np.float64),
+        "piezo_thickness_m": np.asarray(piezo.thickness_m, dtype=np.float64),
+        "resistance_ohm": np.asarray(piezo.resistance_ohm, dtype=np.float64),
+        "mode1_frequency_hz": np.asarray(mode1_frequency_hz, dtype=np.float64),
+        "mode1_top_surface_strain_eqv": np.asarray(mode1_top_surface_strain_eqv, dtype=np.float64),
+        "harmonic_field_frequency_hz": harmonic_frequency_array,
+        "harmonic_top_surface_strain_eqv": np.asarray(harmonic_top_surface_strain_eqv, dtype=np.float64),
+        "field_frequency_hz": harmonic_frequency_array,
+        "top_surface_strain_eqv": np.asarray(harmonic_top_surface_strain_eqv, dtype=np.float64),
+    }
+
+
 def solve_modal_voltage_frf(
     mesh_path: str | Path,
     response_dir: str | Path,
@@ -805,21 +1072,32 @@ def solve_modal_voltage_frf(
         raise AssertionError(
             f"Saved FRF peak is not centered on f_peak_hz: saved_peak_ratio={saved_peak_ratio:.6g}."
         )
-    top_surface_strain = np.zeros(0, dtype=np.float64)
-    mode_nodal_displacements = np.asarray(modal_model["mode_nodal_displacements"], dtype=np.float64)
-    if mode_nodal_displacements.size > 0:
+    mode1_top_surface_strain = np.zeros(0, dtype=np.float64)
+    harmonic_top_surface_strain = np.zeros(0, dtype=np.float64)
+    mode_dof_vectors = np.asarray(modal_model["mode_dof_vectors"], dtype=np.float64)
+    if mode_dof_vectors.size > 0:
+        mode1_top_surface_strain = _compute_top_surface_fe_strain_from_mode_dofs(
+            raw_points=modal_model["raw_points"],
+            raw_tetra_cells=modal_model["raw_tetra_cells"],
+            raw_triangle_cells=modal_model["raw_triangle_cells"],
+            raw_triangle_tags=modal_model["raw_triangle_tags"],
+            mode_dof_vectors=mode_dof_vectors,
+            element_order=element_order,
+        )
         q_peak, _ = _solve_reduced_system(
             omega=2.0 * math.pi * f_peak_hz,
             modal_model=modal_model,
             damping_ratio=mechanical.damping_ratio,
             resistance_ohm=piezo.resistance_ohm,
         )
-        nodal_peak = np.tensordot(q_peak, mode_nodal_displacements, axes=(0, 0))
-        top_surface_strain = _compute_top_surface_strain(
-            points=modal_model["raw_points"],
-            triangle_cells=modal_model["raw_triangle_cells"],
-            triangle_tags=modal_model["raw_triangle_tags"],
-            nodal_displacement=nodal_peak,
+        harmonic_top_surface_strain = _compute_top_surface_fe_strain_from_mode_dofs(
+            raw_points=modal_model["raw_points"],
+            raw_tetra_cells=modal_model["raw_tetra_cells"],
+            raw_triangle_cells=modal_model["raw_triangle_cells"],
+            raw_triangle_tags=modal_model["raw_triangle_tags"],
+            mode_dof_vectors=mode_dof_vectors,
+            element_order=element_order,
+            modal_coefficients=q_peak,
         )
     response_path = save_fem_response(
         sample_id=sample_id,
@@ -833,23 +1111,16 @@ def solve_modal_voltage_frf(
     if modes_output_dir is not None:
         modes_output_dir = Path(modes_output_dir)
         modes_output_dir.mkdir(parents=True, exist_ok=True)
-        modal_save = {
-            "sample_id": np.asarray(sample_id, dtype=np.int32),
-            "element_order": np.asarray([int(element_order)], dtype=np.int32),
-            "eigenfreq_hz": modal_model["eigenfreq_hz"],
-            "modal_force": modal_model["modal_force"],
-            "modal_theta": modal_model["modal_theta"],
-            "modal_mass": modal_model["modal_mass"],
-            "capacitance_f": modal_model["capacitance_f"],
-            "substrate_rho": np.asarray(mechanical.substrate_rho, dtype=np.float64),
-            "piezo_rho": np.asarray(mechanical.piezo_rho, dtype=np.float64),
-            "damping_ratio": np.asarray(mechanical.damping_ratio, dtype=np.float64),
-            "base_acceleration_m_per_s2": np.asarray(mechanical.base_acceleration_m_per_s2, dtype=np.float64),
-            "piezo_thickness_m": np.asarray(piezo.thickness_m, dtype=np.float64),
-            "resistance_ohm": np.asarray(piezo.resistance_ohm, dtype=np.float64),
-            "field_frequency_hz": np.asarray(f_peak_hz, dtype=np.float64),
-            "top_surface_strain_eqv": top_surface_strain,
-        }
+        modal_save = _build_modal_save_payload(
+            sample_id=sample_id,
+            element_order=element_order,
+            mechanical=mechanical,
+            piezo=piezo,
+            modal_model=modal_model,
+            mode1_top_surface_strain_eqv=mode1_top_surface_strain,
+            harmonic_top_surface_strain_eqv=harmonic_top_surface_strain,
+            harmonic_field_frequency_hz=f_peak_hz,
+        )
         np.savez_compressed(
             modes_output_dir / f"sample_{sample_id:04d}_modal.npz",
             **modal_save,
@@ -867,17 +1138,14 @@ def _modal_output_path(modes_output_dir: str | Path | None, sample_id: int) -> P
     return Path(modes_output_dir) / f"sample_{int(sample_id):04d}_modal.npz"
 
 
-def _modal_output_has_top_surface_strain(modal_path: Path) -> bool:
+def _modal_output_has_explicit_surface_fields(modal_path: Path) -> bool:
     if not modal_path.exists():
         return False
     try:
         with np.load(modal_path) as modal:
-            if "top_surface_strain_eqv" not in modal:
-                return False
-            strain = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64).reshape(-1)
+            return has_explicit_surface_strain_fields(modal)
     except Exception:
         return False
-    return strain.size > 0 and bool(np.isfinite(strain).any())
 
 
 def solve_modal_voltage_frf_batch(
@@ -910,7 +1178,7 @@ def solve_modal_voltage_frf_batch(
         modal_ready = modal_path is None or modal_path.exists()
         modal_missing_strain = False
         if modal_path is not None and modal_path.exists() and store_mode_shapes:
-            modal_missing_strain = not _modal_output_has_top_surface_strain(modal_path)
+            modal_missing_strain = not _modal_output_has_explicit_surface_fields(modal_path)
             modal_ready = modal_ready and not modal_missing_strain
         if skip_existing and response_path.exists() and modal_ready:
             print(f"[{idx}/{total}] Skipping {mesh_path.name} (existing outputs found).")
@@ -918,7 +1186,7 @@ def solve_modal_voltage_frf_batch(
             gc.collect()
             continue
         if modal_missing_strain:
-            print(f"[{idx}/{total}] Solving {mesh_path.name} (refreshing missing top-surface strain data)")
+            print(f"[{idx}/{total}] Solving {mesh_path.name} (refreshing missing explicit modal/harmonic strain data)")
         else:
             print(f"[{idx}/{total}] Solving {mesh_path.name}")
         try:

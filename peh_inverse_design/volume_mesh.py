@@ -61,6 +61,7 @@ class VolumeMeshConfig:
     export_inspection_single_face_step: bool = False
     cad_planform_simplify_relative_to_reference: float = 1.5
     cad_min_hole_area_relative_to_reference_squared: float = 100.0
+    max_cad_planform_symdiff_relative_to_source: float = 1.0e-3
 
     @property
     def total_thickness_m(self) -> float:
@@ -111,6 +112,8 @@ class VolumeMeshConfig:
             raise ValueError("cad_planform_simplify_relative_to_reference must be non-negative.")
         if float(self.cad_min_hole_area_relative_to_reference_squared) < 0.0:
             raise ValueError("cad_min_hole_area_relative_to_reference_squared must be non-negative.")
+        if float(self.max_cad_planform_symdiff_relative_to_source) < 0.0:
+            raise ValueError("max_cad_planform_symdiff_relative_to_source must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -511,6 +514,17 @@ def _minimum_cad_hole_area_m2(
     )
 
 
+def _relative_planform_symdiff_from_source(
+    source_planform: Polygon,
+    cad_planform: Polygon,
+    mesh_size_m: float,
+) -> float:
+    normalized_source = _normalize_planform_precision(source_planform, mesh_size_m)
+    normalized_cad = _normalize_planform_precision(cad_planform, mesh_size_m)
+    source_area_m2 = max(float(normalized_source.area), 1.0e-15)
+    return float(normalized_source.symmetric_difference(normalized_cad).area) / source_area_m2
+
+
 def _prune_small_holes(
     polygon: Polygon,
     min_hole_area_m2: float,
@@ -589,7 +603,7 @@ def _prepare_planform_for_cad_export(
         mesh_size_m=mesh_size_m,
         volume_config=volume_config,
     )
-    return _finalize_planform(
+    candidate = _finalize_planform(
         polygon=simplified,
         was_repaired=planform.was_repaired,
         initial_component_count=planform.initial_component_count,
@@ -597,6 +611,16 @@ def _prepare_planform_for_cad_export(
         volume_config=volume_config,
         invalid_message="The CAD-simplified substrate planform is invalid and cannot be exported as CAD.",
     )
+    relative_symdiff = _relative_planform_symdiff_from_source(
+        source_planform=planform.polygon,
+        cad_planform=candidate.polygon,
+        mesh_size_m=mesh_size_m,
+    )
+    if relative_symdiff > float(volume_config.max_cad_planform_symdiff_relative_to_source):
+        # Keep the ANSYS STEP on the same metaplate footprint as the surrogate solver mesh
+        # when CAD-only cleanup would otherwise change the repeated-plate geometry materially.
+        return planform
+    return candidate
 
 
 def _require_single_polygon(
@@ -1062,6 +1086,7 @@ def _write_cad_report(
     planform: _CadPlanform,
     pre_export_report: _CadValidationReport,
     roundtrip_report: _CadValidationReport,
+    source_planform: _CadPlanform | None = None,
     inspection_step_path: Path | None = None,
     inspection_pre_export_report: _CadValidationReport | None = None,
     inspection_roundtrip_report: _CadValidationReport | None = None,
@@ -1086,10 +1111,24 @@ def _write_cad_report(
         "cad_min_hole_area_relative_to_reference_squared": float(
             volume_config.cad_min_hole_area_relative_to_reference_squared
         ),
+        "max_cad_planform_symdiff_relative_to_source": float(
+            volume_config.max_cad_planform_symdiff_relative_to_source
+        ),
         "ansys_step_strategy": _ansys_step_strategy(volume_config),
         "pre_export": asdict(pre_export_report),
         "step_roundtrip": asdict(roundtrip_report),
     }
+    if source_planform is not None:
+        cad_reference_size_m = _resolve_cad_reference_size_m(geometry_config, volume_config)
+        payload["source_hole_count"] = int(source_planform.hole_count)
+        payload["source_planform_area_m2"] = float(source_planform.area_m2)
+        payload["source_to_cad_planform_symdiff_relative"] = float(
+            _relative_planform_symdiff_from_source(
+                source_planform=source_planform.polygon,
+                cad_planform=planform.polygon,
+                mesh_size_m=cad_reference_size_m,
+            )
+        )
     if inspection_step_path is not None:
         payload["inspection_single_face_step_path"] = str(inspection_step_path)
     if inspection_pre_export_report is not None:
@@ -1762,6 +1801,7 @@ def _mesh_polygons_volume_sample_gmsh_volume(
         geometry_config=geometry_config,
         volume_config=volume_config,
         planform=cad_planform,
+        source_planform=planform,
         pre_export_report=pre_export_report,
         roundtrip_report=roundtrip_report,
     )
@@ -1850,6 +1890,7 @@ def _mesh_polygons_volume_sample_layered_tet(
         geometry_config=geometry_config,
         volume_config=volume_config,
         planform=cad_planform,
+        source_planform=solver_planform,
         pre_export_report=pre_export_report,
         roundtrip_report=roundtrip_report,
         inspection_step_path=inspection_step_path,

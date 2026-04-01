@@ -244,7 +244,7 @@ class VolumeMeshCadExportTests(unittest.TestCase):
         self.assertEqual(payload["step_roundtrip"]["solid_body_count"], 2)
         self.assertGreater(payload["step_roundtrip"]["piezo_bottom_face_count"], 1)
 
-    def test_layered_tet_solver_mesh_keeps_raw_planform_when_cad_prunes_small_hole(self) -> None:
+    def test_layered_tet_step_falls_back_to_raw_planform_when_cad_cleanup_changes_geometry_too_much(self) -> None:
         geometry_config = self._geometry_config(tile_counts=(4, 3))
         volume_config = VolumeMeshConfig(
             substrate_thickness_m=2.0e-3,
@@ -257,7 +257,6 @@ class VolumeMeshCadExportTests(unittest.TestCase):
             cad_min_hole_area_relative_to_reference_squared=4.0,
         )
         small_hole_planform = self._full_plate(geometry_config).difference(box(9.0e-3, 6.75e-3, 1.05e-2, 8.25e-3))
-        full_plate_area = geometry_config.plate_size_m[0] * geometry_config.plate_size_m[1]
         captured: dict[str, float] = {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -293,9 +292,8 @@ class VolumeMeshCadExportTests(unittest.TestCase):
                 )
 
         self.assertIsNotNone(artifacts)
-        self.assertAlmostEqual(captured["cad_planform_area_m2"], full_plate_area)
-        self.assertLess(captured["solver_planform_area_m2"], captured["cad_planform_area_m2"])
-        self.assertAlmostEqual(artifacts.planform.area_m2, captured["cad_planform_area_m2"])
+        self.assertAlmostEqual(captured["cad_planform_area_m2"], captured["solver_planform_area_m2"])
+        self.assertAlmostEqual(artifacts.planform.area_m2, captured["solver_planform_area_m2"])
 
 
     def test_single_face_manifest_reports_one_expected_bottom_region(self) -> None:

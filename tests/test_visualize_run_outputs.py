@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from peh_inverse_design.visualize_run_outputs import _dataset_plate_size_m, _load_dataset_row
+from peh_inverse_design.modal_surface_fields import preferred_surface_strain_field
 
 
 class VisualizeRunOutputsTests(unittest.TestCase):
@@ -51,6 +52,21 @@ class VisualizeRunOutputsTests(unittest.TestCase):
             "cell_size_m": np.asarray([0.3, 0.05], dtype=np.float64),
         }
         self.assertEqual(_dataset_plate_size_m(row), (1.5, 0.2))
+
+    def test_visualizer_prefers_true_mode1_surface_field_when_present(self) -> None:
+        modal = {
+            "mode1_frequency_hz": np.asarray(1.0, dtype=np.float64),
+            "mode1_top_surface_strain_eqv": np.asarray([1.0, 2.0], dtype=np.float64),
+            "harmonic_field_frequency_hz": np.asarray(0.98, dtype=np.float64),
+            "harmonic_top_surface_strain_eqv": np.asarray([5.0, 6.0], dtype=np.float64),
+            "top_surface_strain_eqv": np.asarray([5.0, 6.0], dtype=np.float64),
+        }
+
+        field = preferred_surface_strain_field(modal, triangle_count=2)
+
+        self.assertIsNotNone(field)
+        self.assertEqual(field.kind, "modal")
+        np.testing.assert_array_equal(field.strain, np.asarray([1.0, 2.0], dtype=np.float64))
 
 
 if __name__ == "__main__":

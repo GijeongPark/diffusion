@@ -19,6 +19,9 @@ from skimage.measure import find_contours
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from peh_inverse_design.modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
+else:
+    from .modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
 
 
 TOP_ELECTRODE_TAG = 105
@@ -268,16 +271,15 @@ def _plot_surface_mesh_or_strain(
     modal: dict[str, np.ndarray] | None,
     dataset_row: dict[str, np.ndarray],
     include_mesh_inset: bool = True,
+    surface_field: SurfaceStrainField | None = None,
 ) -> float:
     points, triangles = _extract_top_surface_mesh(mesh)
     triangulation = mtri.Triangulation(points[:, 0], points[:, 1], triangles)
     plate_size_m = _dataset_plate_size_m(dataset_row)
 
-    strain = None
-    if modal is not None and "top_surface_strain_eqv" in modal:
-        candidate = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64).reshape(-1)
-        if candidate.shape[0] == triangles.shape[0]:
-            strain = candidate
+    if surface_field is None and modal is not None:
+        surface_field = preferred_surface_strain_field(modal, triangles.shape[0])
+    strain = None if surface_field is None else np.asarray(surface_field.strain, dtype=np.float64).reshape(-1)
 
     if strain is not None and strain.size > 0:
         vmax = float(np.percentile(strain, 99.5))
@@ -293,8 +295,8 @@ def _plot_surface_mesh_or_strain(
             norm=mcolors.PowerNorm(gamma=0.45, vmin=0.0, vmax=vmax),
         )
         ax.triplot(triangulation, color=(1.0, 1.0, 1.0, 0.16), linewidth=0.10)
-        f_field = float(np.asarray(modal["field_frequency_hz"], dtype=np.float64)) if "field_frequency_hz" in modal else np.nan
-        title = "Piezo Top-Surface Equivalent Strain"
+        f_field = float(surface_field.frequency_hz) if surface_field is not None else float("nan")
+        title = "Piezo Top Surface FEM Mesh" if surface_field is None else surface_field.label
         if np.isfinite(f_field):
             title += f" @ {f_field:.3f} Hz"
         ax.set_title(title)
@@ -384,6 +386,10 @@ def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray]
         f"tetra: {n_tetra:,}",
         f"modes saved: {n_modes}",
     ]
+    points, triangles = _extract_top_surface_mesh(mesh)
+    preferred_field = preferred_surface_strain_field(modal, triangles.shape[0]) if modal is not None else None
+    if preferred_field is not None:
+        lines.append(f"strain panel: {preferred_field.kind}")
     if np.isfinite(strain_max):
         lines.append(f"max top strain: {strain_max:.4e}")
     ax.axis("off")
@@ -453,16 +459,47 @@ def _save_individual_plots(
     _plot_frf(ax, response, modal)
     _save_figure(fig, sample_output_dir / "voltage_frf.svg", dpi=220)
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.6))
-    strain_max = _plot_surface_mesh_or_strain(fig, ax, mesh, modal, dataset_row=dataset_row, include_mesh_inset=False)
-    _save_figure(fig, sample_output_dir / "top_surface_equivalent_strain.png", dpi=320)
+    points, triangles = _extract_top_surface_mesh(mesh)
+    surface_fields = available_surface_strain_fields(modal, triangles.shape[0]) if modal is not None else []
+    preferred_field = preferred_surface_strain_field(modal, triangles.shape[0]) if modal is not None else None
+    strain_max = float("nan")
+    if surface_fields:
+        for field in surface_fields:
+            fig, ax = plt.subplots(figsize=(7.2, 5.6))
+            field_max = _plot_surface_mesh_or_strain(
+                fig,
+                ax,
+                mesh,
+                modal,
+                dataset_row=dataset_row,
+                include_mesh_inset=False,
+                surface_field=field,
+            )
+            output_name = "mode1_top_surface_equivalent_strain.png" if field.kind == "modal" else "harmonic_top_surface_equivalent_strain.png"
+            _save_figure(fig, sample_output_dir / output_name, dpi=320)
+            if preferred_field is not None and field.key == preferred_field.key:
+                strain_max = field_max
+                fig, ax = plt.subplots(figsize=(7.2, 5.6))
+                _plot_surface_mesh_or_strain(
+                    fig,
+                    ax,
+                    mesh,
+                    modal,
+                    dataset_row=dataset_row,
+                    include_mesh_inset=False,
+                    surface_field=field,
+                )
+                _save_figure(fig, sample_output_dir / "top_surface_equivalent_strain.png", dpi=320)
+    else:
+        fig, ax = plt.subplots(figsize=(7.2, 5.6))
+        strain_max = _plot_surface_mesh_or_strain(fig, ax, mesh, modal, dataset_row=dataset_row, include_mesh_inset=False)
+        _save_figure(fig, sample_output_dir / "top_surface_equivalent_strain.png", dpi=320)
 
     fig, ax = plt.subplots(figsize=(4.8, 3.6))
     stats = _plot_stats(ax, sample_id, dataset_row, mesh, response, modal, strain_max=strain_max)
     _save_figure(fig, sample_output_dir / "run_summary.svg", dpi=220)
 
     fig, ax = plt.subplots(figsize=(5.2, 5.2))
-    points, triangles = _extract_top_surface_mesh(mesh)
     _plot_mesh_detail(ax, points, triangles, title="Mesh Detail", show_ticks=True, dataset_row=dataset_row)
     _save_figure(fig, sample_output_dir / "mesh_detail.svg", dpi=220)
     return stats

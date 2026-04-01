@@ -186,6 +186,8 @@ def build_integrated_dataset(
     modal_ok = np.zeros(n_samples, dtype=np.int32)
     modal_npz_path = np.full(n_samples, "", dtype=object)
     field_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
+    mode1_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
+    harmonic_field_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
     max_top_surface_strain = np.full(n_samples, np.nan, dtype=np.float64)
     eigenfreq_hz = None
     modal_force = None
@@ -194,6 +196,10 @@ def build_integrated_dataset(
     capacitance_f = None
     top_surface_strain_eqv = np.empty(n_samples, dtype=object)
     top_surface_strain_eqv[:] = None
+    mode1_top_surface_strain_eqv = np.empty(n_samples, dtype=object)
+    mode1_top_surface_strain_eqv[:] = None
+    harmonic_top_surface_strain_eqv = np.empty(n_samples, dtype=object)
+    harmonic_top_surface_strain_eqv[:] = None
     mesh_npz_path = np.full(n_samples, "", dtype=object)
     top_surface_points = np.empty(n_samples, dtype=object) if embed_top_surface_mesh else None
     top_surface_triangles = np.empty(n_samples, dtype=object) if embed_top_surface_mesh else None
@@ -243,20 +249,44 @@ def build_integrated_dataset(
             _assign_padded(modal_mass, idx, np.asarray(modal["modal_mass"], dtype=np.float64))
         if capacitance_f is not None and "capacitance_f" in modal:
             _assign_padded(capacitance_f, idx, np.asarray(modal["capacitance_f"], dtype=np.float64))
+        if "mode1_frequency_hz" in modal:
+            mode1_frequency_hz[idx] = float(np.asarray(modal["mode1_frequency_hz"], dtype=np.float64))
+        elif "eigenfreq_hz" in modal:
+            eigen = np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)
+            if eigen.size > 0:
+                mode1_frequency_hz[idx] = float(eigen[0])
+        if "harmonic_field_frequency_hz" in modal:
+            harmonic_field_frequency_hz[idx] = float(np.asarray(modal["harmonic_field_frequency_hz"], dtype=np.float64))
         if "field_frequency_hz" in modal:
             field_frequency_hz[idx] = float(np.asarray(modal["field_frequency_hz"], dtype=np.float64))
-        if "top_surface_strain_eqv" in modal:
-            strain = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64)
-            top_surface_strain_eqv[idx] = strain
+        if np.isnan(harmonic_field_frequency_hz[idx]) and np.isfinite(field_frequency_hz[idx]):
+            harmonic_field_frequency_hz[idx] = field_frequency_hz[idx]
+        if "mode1_top_surface_strain_eqv" in modal:
+            strain = np.asarray(modal["mode1_top_surface_strain_eqv"], dtype=np.float64)
+            mode1_top_surface_strain_eqv[idx] = strain
             if strain.size > 0:
+                max_top_surface_strain[idx] = float(np.max(strain))
+        if "harmonic_top_surface_strain_eqv" in modal:
+            strain = np.asarray(modal["harmonic_top_surface_strain_eqv"], dtype=np.float64)
+            harmonic_top_surface_strain_eqv[idx] = strain
+            top_surface_strain_eqv[idx] = strain
+        elif "top_surface_strain_eqv" in modal:
+            strain = np.asarray(modal["top_surface_strain_eqv"], dtype=np.float64)
+            harmonic_top_surface_strain_eqv[idx] = strain
+            top_surface_strain_eqv[idx] = strain
+            if np.isnan(max_top_surface_strain[idx]) and strain.size > 0:
                 max_top_surface_strain[idx] = float(np.max(strain))
 
     integrated["modal_ok"] = modal_ok
     integrated["modal_npz_path"] = modal_npz_path
     integrated["mesh_npz_path"] = mesh_npz_path
+    integrated["mode1_frequency_hz"] = mode1_frequency_hz
+    integrated["harmonic_field_frequency_hz"] = harmonic_field_frequency_hz
     integrated["field_frequency_hz"] = field_frequency_hz
     integrated["max_top_surface_strain"] = max_top_surface_strain
     integrated["top_surface_strain_eqv"] = top_surface_strain_eqv
+    integrated["mode1_top_surface_strain_eqv"] = mode1_top_surface_strain_eqv
+    integrated["harmonic_top_surface_strain_eqv"] = harmonic_top_surface_strain_eqv
     if eigenfreq_hz is not None:
         integrated["eigenfreq_hz"] = eigenfreq_hz
     if modal_force is not None:

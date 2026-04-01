@@ -219,6 +219,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-cad-planform-symdiff-relative-to-source",
+        type=float,
+        default=VolumeMeshConfig().max_cad_planform_symdiff_relative_to_source,
+        help=(
+            "Maximum relative symmetric-difference area allowed between the CAD-exported metaplate planform "
+            "and the raw source planform. If CAD-only cleanup exceeds this threshold, the raw planform is "
+            "exported so the ANSYS geometry stays aligned with the Python solver geometry."
+        ),
+    )
+    parser.add_argument(
         "--substrate-layers",
         type=int,
         default=2,
@@ -332,6 +342,7 @@ def main() -> None:
         export_inspection_single_face_step=bool(args.export_inspection_single_face_step),
         cad_planform_simplify_relative_to_reference=float(args.cad_planform_simplify_scale),
         cad_min_hole_area_relative_to_reference_squared=float(args.cad_min_hole_area_scale),
+        max_cad_planform_symdiff_relative_to_source=float(args.max_cad_planform_symdiff_relative_to_source),
     )
 
     mesh_dir = Path(args.mesh_dir)
@@ -430,6 +441,9 @@ def main() -> None:
                 "cad_planform_simplify_relative_to_reference": float(volume_config.cad_planform_simplify_relative_to_reference),
                 "cad_min_hole_area_relative_to_reference_squared": float(
                     volume_config.cad_min_hole_area_relative_to_reference_squared
+                ),
+                "max_cad_planform_symdiff_relative_to_source": float(
+                    volume_config.max_cad_planform_symdiff_relative_to_source
                 ),
                 "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
                 "solver_mesh_backend": str(volume_config.solver_mesh_backend),

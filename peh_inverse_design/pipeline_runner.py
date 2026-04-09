@@ -561,7 +561,7 @@ def _raise_solver_runtime_error_from_existing_diagnostics(
             exc=exc,
         )
         if diagnostic_error is not None:
-            raise diagnostic_error from exc
+            raise diagnostic_error from None
 
 
 def _solver_outputs_exist(mesh_path: Path, response_dir: Path, modal_dir: Path) -> bool:

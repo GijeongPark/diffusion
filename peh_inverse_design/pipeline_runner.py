@@ -51,6 +51,8 @@ class PipelineConfig:
     solver_eigensolver_backend: str = "auto"
     allow_eigensolver_fallback: bool = False
     strict_parity: bool = False
+    strict_ansys_parity: bool = False
+    peak_search_seed: str = "f1"
     solver_store_mode_shapes: bool = False
     skip_existing_solver_outputs: bool = True
     solver_max_q2_vector_dofs: int | None = None
@@ -98,6 +100,8 @@ class PipelineConfig:
             raise ValueError("solver_oom_fallback_element_order must be strictly positive when provided.")
         if str(self.solver_eigensolver_backend).strip().lower() not in {"shift_invert_lu", "iterative_gd", "auto"}:
             raise ValueError("solver_eigensolver_backend must be 'shift_invert_lu', 'iterative_gd', or 'auto'.")
+        if str(self.peak_search_seed).strip().lower() not in {"auto", "f1", "dominant_coupling"}:
+            raise ValueError("peak_search_seed must be one of: auto, f1, dominant_coupling.")
         if bool(self.strict_parity) and bool(self.allow_eigensolver_fallback):
             raise ValueError("allow_eigensolver_fallback cannot be enabled when strict_parity=True.")
         if bool(self.strict_parity) and str(self.solver_eigensolver_backend).strip().lower() == "iterative_gd":
@@ -221,6 +225,18 @@ def _apply_strict_ansys_parity_overrides(
     if not explicit_audit_voltage_form:
         args.audit_ansys_voltage_form = "peak"
     return args
+
+
+def apply_strict_ansys_parity_overrides_to_config(config: PipelineConfig) -> PipelineConfig:
+    if not bool(config.strict_ansys_parity):
+        return config
+    return replace(
+        config,
+        mesh_preset="ansys_parity",
+        strict_parity=True,
+        solver_eigensolver_backend="shift_invert_lu",
+        allow_eigensolver_fallback=False,
+    )
 
 
 def _build_mesh_command(
@@ -537,6 +553,8 @@ def _build_solver_inner_args(
             str(config.solver_num_modes),
             "--search-points",
             str(config.solver_search_points),
+            "--peak-search-seed",
+            str(config.peak_search_seed),
             "--element-order",
             str(actual_element_order),
             "--requested-element-order",
@@ -927,6 +945,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         problem_spec = load_problem_spec(problem_spec_path, project_root=project_root)
         write_problem_spec_snapshot(problem_spec, runtime_problem_spec_path)
     config = _resolve_runtime_config(config, problem_spec)
+    config = apply_strict_ansys_parity_overrides_to_config(config)
     candidate_unit_cell_npz = _prepare_candidate_unit_cell_dataset(config, run_root, project_root)
     cell_size_m, tile_counts, geometry_scale_source = _resolve_geometry_scale_summary(
         config,
@@ -981,6 +1000,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"backend={config.solver_mesh_backend}, mesh_preset={effective_mesh['mesh_preset']}, "
         f"layers={effective_mesh['substrate_layers']}+{effective_mesh['piezo_layers']}, "
         f"modes={config.solver_num_modes}, search_points={config.solver_search_points}, "
+        f"peak_search_seed={config.peak_search_seed}, "
         f"element_order={config.solver_element_order}, eigensolver_backend={_solver_requested_backend(config)}, "
         f"allow_eigensolver_fallback={config.allow_eigensolver_fallback}, strict_parity={config.strict_parity}, "
         f"skip_existing={config.skip_existing_solver_outputs}, "
@@ -1210,6 +1230,12 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-solver-mesh-by-thickness", action="store_true", help="Restore thickness-limited solver meshing. Disabled by default for thin plates.")
     parser.add_argument("--solver-num-modes", type=int, default=8, help="Number of modes retained by the in-house modal solver.")
     parser.add_argument("--solver-search-points", type=int, default=301, help="Coarse FRF search points used before local peak refinement.")
+    parser.add_argument(
+        "--peak-search-seed",
+        default="f1",
+        choices=["auto", "f1", "dominant_coupling"],
+        help="Seed forwarded to fenicsx_modal_solver. Production runs default to f1.",
+    )
     parser.add_argument("--solver-element-order", type=int, default=2, help="Solid displacement interpolation order for the in-house modal solver.")
     parser.add_argument(
         "--solver-eigensolver-backend",
@@ -1321,10 +1347,12 @@ def main() -> None:
         piezo_layers=None if args.piezo_layers is None else int(args.piezo_layers),
         solver_num_modes=int(args.solver_num_modes),
         solver_search_points=int(args.solver_search_points),
+        peak_search_seed=str(args.peak_search_seed),
         solver_element_order=int(args.solver_element_order),
         solver_eigensolver_backend=str(args.solver_eigensolver_backend),
         allow_eigensolver_fallback=bool(args.allow_eigensolver_fallback),
         strict_parity=bool(args.strict_parity),
+        strict_ansys_parity=bool(args.strict_ansys_parity),
         solver_max_q2_vector_dofs=args.solver_max_q2_vector_dofs,
         solver_oom_fallback_element_order=(
             None if int(args.solver_oom_fallback_element_order) <= 0 else int(args.solver_oom_fallback_element_order)

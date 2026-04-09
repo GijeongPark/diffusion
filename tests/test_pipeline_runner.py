@@ -9,9 +9,11 @@ from unittest import mock
 from peh_inverse_design.pipeline_runner import (
     PipelineConfig,
     _apply_strict_ansys_parity_overrides,
+    _build_solver_inner_args,
     _build_mesh_command,
     _cli_parser,
     _run_solver_with_isolated_retry,
+    apply_strict_ansys_parity_overrides_to_config,
 )
 
 
@@ -69,6 +71,7 @@ class PipelineRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(config.audit_ansys_voltage_form, "peak")
+        self.assertEqual(config.peak_search_seed, "f1")
 
     def test_strict_ansys_parity_overrides_pipeline_args(self) -> None:
         parser = _cli_parser()
@@ -114,6 +117,48 @@ class PipelineRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(updated.audit_ansys_voltage_form, "rms")
+
+    def test_strict_ansys_parity_overrides_pipeline_config(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            strict_ansys_parity=True,
+            mesh_preset="default",
+            solver_eigensolver_backend="auto",
+            allow_eigensolver_fallback=True,
+            audit_ansys_voltage_form="rms",
+        )
+
+        updated = apply_strict_ansys_parity_overrides_to_config(config)
+
+        self.assertEqual(updated.mesh_preset, "ansys_parity")
+        self.assertTrue(updated.strict_parity)
+        self.assertTrue(updated.strict_ansys_parity)
+        self.assertEqual(updated.solver_eigensolver_backend, "shift_invert_lu")
+        self.assertFalse(updated.allow_eigensolver_fallback)
+        self.assertEqual(updated.audit_ansys_voltage_form, "rms")
+
+    def test_build_solver_inner_args_threads_peak_search_seed(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            substrate_rho=7930.0,
+            piezo_rho=7500.0,
+            peak_search_seed="dominant_coupling",
+        )
+
+        args = _build_solver_inner_args(
+            project_root=Path("/tmp/project"),
+            response_dir=Path("/tmp/project/data/fem_responses"),
+            modal_dir=Path("/tmp/project/data/modal_data"),
+            config=config,
+            runtime_problem_spec_path=None,
+            mesh_path=Path("/tmp/project/meshes/plate3d_0000_fenicsx.npz"),
+        )
+
+        self.assertEqual(args[args.index("--peak-search-seed") + 1], "dominant_coupling")
 
     def test_isolated_retry_falls_back_to_lower_order_after_oom(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

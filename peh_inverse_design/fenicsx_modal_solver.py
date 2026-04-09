@@ -425,6 +425,64 @@ def _destroy_petsc_object(obj) -> None:
             pass
 
 
+def _is_mumps_factorization_failure(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        text = str(current)
+        if "MUMPS error in numerical factorization" in text or "INFOG(1)=-13" in text:
+            return True
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return False
+
+
+def _build_eps_solver(
+    *,
+    comm,
+    K,
+    M,
+    num_modes: int,
+    PETSc,
+    SLEPc,
+    backend: str,
+):
+    eps_solver = SLEPc.EPS().create(comm)
+    eps_solver.setOperators(K, M)
+    eps_solver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
+    eps_solver.setDimensions(num_modes)
+
+    normalized_backend = str(backend).strip().lower()
+    if normalized_backend == "shift_invert_lu":
+        eps_solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+        eps_solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
+        eps_solver.setTarget(0.0)
+        st = eps_solver.getST()
+        st.setType(SLEPc.ST.Type.SINVERT)
+        ksp = st.getKSP()
+        ksp.setType(PETSc.KSP.Type.PREONLY)
+        pc = ksp.getPC()
+        pc.setType(PETSc.PC.Type.LU)
+        pc.setFactorSolverType("mumps")
+        eps_solver.setFromOptions()
+        return eps_solver, "shift_invert_lu"
+
+    if normalized_backend == "iterative_gd":
+        eps_solver.setType(SLEPc.EPS.Type.GD)
+        eps_solver.setWhichEigenpairs(SLEPc.EPS.Which.SMALLEST_REAL)
+        st = eps_solver.getST()
+        st.setType(SLEPc.ST.Type.PRECOND)
+        ksp = st.getKSP()
+        ksp.setType(PETSc.KSP.Type.PREONLY)
+        pc = ksp.getPC()
+        pc.setType(PETSc.PC.Type.GAMG)
+        eps_solver.setTolerances(tol=1.0e-8, max_it=500)
+        eps_solver.setFromOptions()
+        return eps_solver, "iterative_gd"
+
+    raise ValueError(f"Unsupported eigensolver backend: {backend}")
+
+
 def _assemble_modal_model(
     mesh_path: Path,
     num_modes: int,
@@ -542,28 +600,43 @@ def _assemble_modal_model(
     eps_solver = None
     vr = None
     vi = None
+    eigensolver_backend = "shift_invert_lu"
     try:
         K = fem_petsc.assemble_matrix(a_form, bcs=bcs, diag=1.0)
         M = fem_petsc.assemble_matrix(m_form, bcs=bcs, diag=0.0)
         K.assemble()
         M.assemble()
 
-        eps_solver = SLEPc.EPS().create(comm)
-        eps_solver.setOperators(K, M)
-        eps_solver.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-        eps_solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-        eps_solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-        eps_solver.setTarget(0.0)
-        eps_solver.setDimensions(num_modes)
-        st = eps_solver.getST()
-        st.setType(SLEPc.ST.Type.SINVERT)
-        ksp = st.getKSP()
-        ksp.setType(PETSc.KSP.Type.PREONLY)
-        pc = ksp.getPC()
-        pc.setType(PETSc.PC.Type.LU)
-        pc.setFactorSolverType("mumps")
-        eps_solver.setFromOptions()
-        eps_solver.solve()
+        eps_solver, eigensolver_backend = _build_eps_solver(
+            comm=comm,
+            K=K,
+            M=M,
+            num_modes=num_modes,
+            PETSc=PETSc,
+            SLEPc=SLEPc,
+            backend="shift_invert_lu",
+        )
+        try:
+            eps_solver.solve()
+        except Exception as exc:
+            if not _is_mumps_factorization_failure(exc):
+                raise
+            print(
+                "Eigen solve fallback: shift-invert LU/MUMPS ran out of factorization memory; "
+                "retrying with the iterative generalized-Davidson backend.",
+                flush=True,
+            )
+            _destroy_petsc_object(eps_solver)
+            eps_solver, eigensolver_backend = _build_eps_solver(
+                comm=comm,
+                K=K,
+                M=M,
+                num_modes=num_modes,
+                PETSc=PETSc,
+                SLEPc=SLEPc,
+                backend="iterative_gd",
+            )
+            eps_solver.solve()
 
         nconv = eps_solver.getConverged()
         if nconv <= 0:
@@ -653,6 +726,7 @@ def _assemble_modal_model(
             "piezo_volume_m3": np.asarray([piezo_volume], dtype=np.float64),
             "substrate_cell_count": np.asarray([substrate_cell_count], dtype=np.int32),
             "piezo_cell_count": np.asarray([piezo_cell_count], dtype=np.int32),
+            "eigensolver_backend": np.asarray([str(eigensolver_backend)]),
         }
     finally:
         _destroy_petsc_object(vi)
@@ -843,6 +917,7 @@ def _log_modal_diagnostics(
     eigenfreq_hz = np.asarray(modal_model.get("eigenfreq_hz", []), dtype=np.float64).reshape(-1)
     modal_theta = np.asarray(modal_model.get("modal_theta", []), dtype=np.float64).reshape(-1)
     modal_force = np.asarray(modal_model.get("modal_force", []), dtype=np.float64).reshape(-1)
+    eigensolver_backend = str(np.asarray(modal_model.get("eigensolver_backend", ["unknown"])).reshape(-1)[0])
     print(
         "Modal diagnostics: "
         f"plate=({plate_dimensions[0]:.6g}, {plate_dimensions[1]:.6g}) m, "
@@ -851,7 +926,8 @@ def _log_modal_diagnostics(
         f"piezo_volume={piezo_volume:.6g} m^3, "
         f"substrate_cells={substrate_cell_count}, "
         f"piezo_cells={piezo_cell_count}, "
-        f"capacitance={capacitance:.6g} F"
+        f"capacitance={capacitance:.6g} F, "
+        f"eigensolver_backend={eigensolver_backend}"
     )
     print(
         "Modal diagnostics: "
@@ -975,6 +1051,7 @@ def _build_modal_save_payload(
         "modal_theta": modal_model["modal_theta"],
         "modal_mass": modal_model["modal_mass"],
         "capacitance_f": modal_model["capacitance_f"],
+        "eigensolver_backend": np.asarray(modal_model.get("eigensolver_backend", ["unknown"])),
         "substrate_volume_m3": modal_model["substrate_volume_m3"],
         "piezo_volume_m3": modal_model["piezo_volume_m3"],
         "substrate_cell_count": modal_model["substrate_cell_count"],

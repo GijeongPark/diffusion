@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import sys
 from pathlib import Path
@@ -59,10 +60,99 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
             "f_peak_hz": float(data["f_peak_hz"]),
             "freq_hz": freq_hz,
             "voltage_mag": voltage_mag,
+            "peak_voltage_peak_v": (
+                float(np.asarray(data["peak_voltage_peak_v"], dtype=np.float64))
+                if "peak_voltage_peak_v" in data.files
+                else (
+                    float(np.asarray(data["peak_voltage"], dtype=np.float64))
+                    if "peak_voltage" in data.files
+                    else float(np.nanmax(voltage_mag))
+                )
+            ),
+            "peak_voltage_rms_v": (
+                float(np.asarray(data["peak_voltage_rms_v"], dtype=np.float64))
+                if "peak_voltage_rms_v" in data.files
+                else float(np.nanmax(voltage_mag) / np.sqrt(2.0))
+            ),
+            "peak_voltage_form": (
+                str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0])
+                if "peak_voltage_form" in data.files
+                else "peak"
+            ),
             "quality_flag": int(data["quality_flag"]) if "quality_flag" in data.files else 1,
             "path": str(path),
         }
     return records, n_freq
+
+
+def _load_json(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _string_scalar_or_empty(
+    data: np.lib.npyio.NpzFile,
+    key: str,
+) -> str:
+    if key not in data.files:
+        return ""
+    return str(np.asarray(data[key]).reshape(-1)[0])
+
+
+def _float_scalar_or_nan(
+    data: np.lib.npyio.NpzFile,
+    key: str,
+) -> float:
+    if key not in data.files:
+        return float("nan")
+    return float(np.asarray(data[key], dtype=np.float64).reshape(-1)[0])
+
+
+def _int_scalar_or_none(
+    data: np.lib.npyio.NpzFile,
+    key: str,
+) -> int | None:
+    if key not in data.files:
+        return None
+    value = int(np.asarray(data[key], dtype=np.int64).reshape(-1)[0])
+    return None if value < 0 else int(value)
+
+
+def _load_mesh_record(mesh_path: Path) -> dict[str, object]:
+    cad_report_path = mesh_path.with_name(mesh_path.name.replace("_fenicsx.npz", "_cad.json"))
+    cad_report = _load_json(cad_report_path) if cad_report_path.exists() else {}
+    with np.load(mesh_path, allow_pickle=True) as mesh:
+        points = np.asarray(mesh["points"], dtype=np.float64)
+        tetra_cells = np.asarray(mesh["tetra_cells"], dtype=np.int64)
+        mesh_preset = _string_scalar_or_empty(mesh, "mesh_preset") or str(cad_report.get("mesh_preset", "default"))
+        solver_mesh_size_m = _float_scalar_or_nan(mesh, "solver_mesh_size_m")
+        max_solver_vector_dofs_known = False
+        max_solver_vector_dofs = None
+        if "max_solver_vector_dofs" in mesh.files:
+            max_solver_vector_dofs_known = True
+            max_solver_vector_dofs = _int_scalar_or_none(mesh, "max_solver_vector_dofs")
+        elif "max_solver_vector_dofs" in cad_report:
+            max_solver_vector_dofs_known = True
+            if cad_report.get("max_solver_vector_dofs") is not None:
+                max_solver_vector_dofs = int(cad_report["max_solver_vector_dofs"])
+        solver_mesh_coarsening_allowed = (
+            bool(int(np.asarray(mesh["solver_mesh_coarsening_allowed"], dtype=np.int32).reshape(-1)[0]))
+            if "solver_mesh_coarsening_allowed" in mesh.files
+            else bool(cad_report.get("allow_solver_mesh_coarsening", mesh_preset != "ansys_parity"))
+        )
+        substrate_layers = cad_report.get("substrate_layers")
+        piezo_layers = cad_report.get("piezo_layers")
+
+    return {
+        "mesh_preset": str(mesh_preset or "default"),
+        "substrate_layers": -1 if substrate_layers is None else int(substrate_layers),
+        "piezo_layers": -1 if piezo_layers is None else int(piezo_layers),
+        "solver_mesh_size_m": float(solver_mesh_size_m),
+        "mesh_point_count": int(points.shape[0]),
+        "mesh_tetra_count": int(tetra_cells.shape[0]),
+        "solver_max_q2_vector_dofs": -1 if max_solver_vector_dofs is None else int(max_solver_vector_dofs),
+        "solver_max_q2_vector_dofs_unlimited": bool(max_solver_vector_dofs_known and max_solver_vector_dofs is None),
+        "solver_mesh_coarsening_allowed": bool(solver_mesh_coarsening_allowed),
+    }
 
 
 def _load_modal_records(modal_dir: Path) -> dict[int, dict[str, np.ndarray | str | float]]:
@@ -147,6 +237,9 @@ def build_integrated_dataset(
     response_ok = np.zeros(n_samples, dtype=np.int32)
     f_peak_hz = np.full(n_samples, np.nan, dtype=np.float64)
     peak_voltage = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_peak_v = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_rms_v = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_form = np.full(n_samples, "", dtype="<U16")
     quality_flag = np.zeros(n_samples, dtype=np.int32)
     response_npz_path = np.full(n_samples, "", dtype=object)
     if n_freq > 0:
@@ -167,7 +260,10 @@ def build_integrated_dataset(
         f_peak = float(record["f_peak_hz"])
         response_ok[idx] = 1
         f_peak_hz[idx] = f_peak
-        peak_voltage[idx] = float(np.nanmax(voltage))
+        peak_voltage_peak_v[idx] = float(record["peak_voltage_peak_v"])
+        peak_voltage_rms_v[idx] = float(record["peak_voltage_rms_v"])
+        peak_voltage_form[idx] = str(record["peak_voltage_form"])
+        peak_voltage[idx] = float(record["peak_voltage_peak_v"])
         quality_flag[idx] = int(record["quality_flag"])
         freq_hz[idx, : freq.shape[0]] = freq
         freq_ratio[idx, : freq.shape[0]] = freq / f_peak
@@ -177,6 +273,9 @@ def build_integrated_dataset(
     integrated["response_ok"] = response_ok
     integrated["f_peak_hz"] = f_peak_hz
     integrated["peak_voltage"] = peak_voltage
+    integrated["peak_voltage_peak_v"] = peak_voltage_peak_v
+    integrated["peak_voltage_rms_v"] = peak_voltage_rms_v
+    integrated["peak_voltage_form"] = peak_voltage_form
     integrated["quality_flag"] = quality_flag
     integrated["freq_hz"] = freq_hz
     integrated["freq_ratio"] = freq_ratio
@@ -201,6 +300,15 @@ def build_integrated_dataset(
     harmonic_top_surface_strain_eqv = np.empty(n_samples, dtype=object)
     harmonic_top_surface_strain_eqv[:] = None
     mesh_npz_path = np.full(n_samples, "", dtype=object)
+    mesh_preset = np.full(n_samples, "", dtype="<U32")
+    substrate_layers = np.full(n_samples, -1, dtype=np.int32)
+    piezo_layers = np.full(n_samples, -1, dtype=np.int32)
+    solver_mesh_size_m = np.full(n_samples, np.nan, dtype=np.float64)
+    mesh_point_count = np.full(n_samples, -1, dtype=np.int64)
+    mesh_tetra_count = np.full(n_samples, -1, dtype=np.int64)
+    solver_max_q2_vector_dofs = np.full(n_samples, -1, dtype=np.int64)
+    solver_max_q2_vector_dofs_unlimited = np.zeros(n_samples, dtype=np.int32)
+    solver_mesh_coarsening_allowed = np.zeros(n_samples, dtype=np.int32)
     top_surface_points = np.empty(n_samples, dtype=object) if embed_top_surface_mesh else None
     top_surface_triangles = np.empty(n_samples, dtype=object) if embed_top_surface_mesh else None
     if embed_top_surface_mesh:
@@ -229,6 +337,16 @@ def build_integrated_dataset(
             mesh_path = mesh_dir / f"plate3d_{int(sid):04d}_fenicsx.npz"
             if mesh_path.exists():
                 mesh_npz_path[idx] = str(mesh_path)
+                mesh_record = _load_mesh_record(mesh_path)
+                mesh_preset[idx] = str(mesh_record["mesh_preset"])
+                substrate_layers[idx] = int(mesh_record["substrate_layers"])
+                piezo_layers[idx] = int(mesh_record["piezo_layers"])
+                solver_mesh_size_m[idx] = float(mesh_record["solver_mesh_size_m"])
+                mesh_point_count[idx] = int(mesh_record["mesh_point_count"])
+                mesh_tetra_count[idx] = int(mesh_record["mesh_tetra_count"])
+                solver_max_q2_vector_dofs[idx] = int(mesh_record["solver_max_q2_vector_dofs"])
+                solver_max_q2_vector_dofs_unlimited[idx] = int(bool(mesh_record["solver_max_q2_vector_dofs_unlimited"]))
+                solver_mesh_coarsening_allowed[idx] = int(bool(mesh_record["solver_mesh_coarsening_allowed"]))
                 if embed_top_surface_mesh and top_surface_points is not None and top_surface_triangles is not None:
                     points, triangles = _extract_top_surface_mesh(mesh_path)
                     top_surface_points[idx] = points
@@ -280,6 +398,15 @@ def build_integrated_dataset(
     integrated["modal_ok"] = modal_ok
     integrated["modal_npz_path"] = modal_npz_path
     integrated["mesh_npz_path"] = mesh_npz_path
+    integrated["mesh_preset"] = mesh_preset
+    integrated["substrate_layers"] = substrate_layers
+    integrated["piezo_layers"] = piezo_layers
+    integrated["solver_mesh_size_m"] = solver_mesh_size_m
+    integrated["mesh_point_count"] = mesh_point_count
+    integrated["mesh_tetra_count"] = mesh_tetra_count
+    integrated["solver_max_q2_vector_dofs"] = solver_max_q2_vector_dofs
+    integrated["solver_max_q2_vector_dofs_unlimited"] = solver_max_q2_vector_dofs_unlimited
+    integrated["solver_mesh_coarsening_allowed"] = solver_mesh_coarsening_allowed
     integrated["mode1_frequency_hz"] = mode1_frequency_hz
     integrated["harmonic_field_frequency_hz"] = harmonic_field_frequency_hz
     integrated["field_frequency_hz"] = field_frequency_hz
@@ -318,9 +445,30 @@ def build_integrated_dataset(
                 "modal_ok": str(int(modal_ok[idx])),
                 "f_peak_hz": "" if np.isnan(f_peak_hz[idx]) else f"{float(f_peak_hz[idx]):.12g}",
                 "peak_voltage": "" if np.isnan(peak_voltage[idx]) else f"{float(peak_voltage[idx]):.12g}",
+                "peak_voltage_peak_v": (
+                    "" if np.isnan(peak_voltage_peak_v[idx]) else f"{float(peak_voltage_peak_v[idx]):.12g}"
+                ),
+                "peak_voltage_rms_v": (
+                    "" if np.isnan(peak_voltage_rms_v[idx]) else f"{float(peak_voltage_rms_v[idx]):.12g}"
+                ),
+                "peak_voltage_form": str(peak_voltage_form[idx]),
                 "max_top_surface_strain": (
                     "" if np.isnan(max_top_surface_strain[idx]) else f"{float(max_top_surface_strain[idx]):.12g}"
                 ),
+                "mesh_preset": str(mesh_preset[idx]),
+                "substrate_layers": "" if int(substrate_layers[idx]) < 0 else str(int(substrate_layers[idx])),
+                "piezo_layers": "" if int(piezo_layers[idx]) < 0 else str(int(piezo_layers[idx])),
+                "solver_mesh_size_m": (
+                    "" if np.isnan(solver_mesh_size_m[idx]) else f"{float(solver_mesh_size_m[idx]):.12g}"
+                ),
+                "mesh_point_count": "" if int(mesh_point_count[idx]) < 0 else str(int(mesh_point_count[idx])),
+                "mesh_tetra_count": "" if int(mesh_tetra_count[idx]) < 0 else str(int(mesh_tetra_count[idx])),
+                "solver_max_q2_vector_dofs": (
+                    ""
+                    if int(solver_max_q2_vector_dofs[idx]) < 0
+                    else str(int(solver_max_q2_vector_dofs[idx]))
+                ),
+                "solver_max_q2_vector_dofs_unlimited": str(bool(solver_max_q2_vector_dofs_unlimited[idx])),
                 "mesh_npz_path": str(mesh_npz_path[idx]),
                 "response_npz_path": str(response_npz_path[idx]),
                 "modal_npz_path": str(modal_npz_path[idx]),
@@ -336,7 +484,18 @@ def build_integrated_dataset(
                 "modal_ok",
                 "f_peak_hz",
                 "peak_voltage",
+                "peak_voltage_peak_v",
+                "peak_voltage_rms_v",
+                "peak_voltage_form",
                 "max_top_surface_strain",
+                "mesh_preset",
+                "substrate_layers",
+                "piezo_layers",
+                "solver_mesh_size_m",
+                "mesh_point_count",
+                "mesh_tetra_count",
+                "solver_max_q2_vector_dofs",
+                "solver_max_q2_vector_dofs_unlimited",
                 "mesh_npz_path",
                 "response_npz_path",
                 "modal_npz_path",

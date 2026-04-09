@@ -6,10 +6,59 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from peh_inverse_design.pipeline_runner import PipelineConfig, _run_solver_with_isolated_retry
+from peh_inverse_design.pipeline_runner import (
+    PipelineConfig,
+    _build_mesh_command,
+    _run_solver_with_isolated_retry,
+)
 
 
 class PipelineRunnerTests(unittest.TestCase):
+    def test_build_mesh_command_uses_preset_without_explicit_overrides(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            mesh_preset="ansys_parity",
+        )
+
+        cmd = _build_mesh_command(
+            project_python=Path("/tmp/python"),
+            candidate_unit_cell_npz=Path("/tmp/unit_cell.npz"),
+            mesh_dir=Path("/tmp/meshes"),
+            config=config,
+            runtime_problem_spec_path=None,
+        )
+
+        self.assertIn("--mesh-preset", cmd)
+        self.assertIn("ansys_parity", cmd)
+        self.assertNotIn("--substrate-layers", cmd)
+        self.assertNotIn("--piezo-layers", cmd)
+        self.assertNotIn("--solver-max-q2-vector-dofs", cmd)
+
+    def test_build_mesh_command_keeps_explicit_overrides(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            mesh_preset="ansys_parity",
+            substrate_layers=6,
+            piezo_layers=2,
+            solver_max_q2_vector_dofs=4_000_000,
+        )
+
+        cmd = _build_mesh_command(
+            project_python=Path("/tmp/python"),
+            candidate_unit_cell_npz=Path("/tmp/unit_cell.npz"),
+            mesh_dir=Path("/tmp/meshes"),
+            config=config,
+            runtime_problem_spec_path=None,
+        )
+
+        self.assertEqual(cmd[cmd.index("--substrate-layers") + 1], "6")
+        self.assertEqual(cmd[cmd.index("--piezo-layers") + 1], "2")
+        self.assertEqual(cmd[cmd.index("--solver-max-q2-vector-dofs") + 1], "4000000")
+
     def test_isolated_retry_falls_back_to_lower_order_after_oom(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

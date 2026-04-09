@@ -1,0 +1,34 @@
+{
+  "sample_id": 0,
+  "unit_cell_npz": "/home/gijeong/Inverse Design/runs/0402/data/unit_cell_candidates.npz",
+  "problem_spec_path": "/home/gijeong/Inverse Design/configs/peh_inverse_design_spec.yaml",
+  "mesh_preset": "default",
+  "layer_sweep": [
+    [
+      2,
+      1
+    ]
+  ],
+  "mesh_size_scales": [
+    0.08
+  ],
+  "ansys_modal_hz": 0.58,
+  "ansys_frf_peak_hz": null,
+  "ansys_voltage_v": 242.96,
+  "ansys_voltage_form": "unknown",
+  "records": [
+    {
+      "case_name": "default_sub2_pz1_mesh0p08",
+      "case_dir": "/home/gijeong/Inverse Design/tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08",
+      "status": "solve_failed",
+      "sample_id": 0,
+      "mesh_preset": "default",
+      "substrate_layers": 2,
+      "piezo_layers": 1,
+      "mesh_size_scale": 0.08,
+      "element_order": 2,
+      "error_message": "Command '['docker', 'run', '--rm', '-v', '/home/gijeong/Inverse Design:/workspace', '-w', '/workspace', 'dolfinx/dolfinx:stable', 'bash', '-lc', 'pip install -q pyyaml && python3 -m peh_inverse_design.fenicsx_modal_solver --mesh /workspace/tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08/meshes/volumes/plate3d_0000_fenicsx.npz --response-dir /workspace/tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08/data/fem_responses --modes-dir /workspace/tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08/data/modal_data --substrate-rho 7930.0 --piezo-rho 7500.0 --num-modes 8 --search-points 301 --element-order 2 --store-mode-shapes --problem-spec /workspace/configs/peh_inverse_design_spec.yaml']' returned non-zero exit status 126.",
+      "frequency_match_score_percent": Infinity
+    }
+  ]
+}

@@ -24,6 +24,8 @@ def save_fem_response(
         raise ValueError("freq_hz and voltage_mag must be 1-D arrays.")
     if f_peak_hz <= 0.0:
         raise ValueError("f_peak_hz must be positive.")
+    peak_voltage_peak_v = float(np.nanmax(voltage_mag))
+    peak_voltage_rms_v = float(peak_voltage_peak_v / np.sqrt(2.0))
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -34,6 +36,10 @@ def save_fem_response(
         f_peak_hz=np.asarray(float(f_peak_hz), dtype=np.float64),
         freq_hz=freq_hz,
         voltage_mag=voltage_mag,
+        peak_voltage=np.asarray(peak_voltage_peak_v, dtype=np.float64),
+        peak_voltage_peak_v=np.asarray(peak_voltage_peak_v, dtype=np.float64),
+        peak_voltage_rms_v=np.asarray(peak_voltage_rms_v, dtype=np.float64),
+        peak_voltage_form=np.asarray("peak"),
         quality_flag=np.asarray(int(quality_flag), dtype=np.int32),
     )
     return path
@@ -76,6 +82,25 @@ def aggregate_response_directory(
         freq_hz = np.asarray(data["freq_hz"], dtype=np.float64).reshape(-1)
         voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64).reshape(-1)
         quality_flag = int(data["quality_flag"]) if "quality_flag" in data.files else 1
+        peak_voltage_peak_v = (
+            float(np.asarray(data["peak_voltage_peak_v"], dtype=np.float64))
+            if "peak_voltage_peak_v" in data.files
+            else (
+                float(np.asarray(data["peak_voltage"], dtype=np.float64))
+                if "peak_voltage" in data.files
+                else float(np.nanmax(voltage_mag))
+            )
+        )
+        peak_voltage_rms_v = (
+            float(np.asarray(data["peak_voltage_rms_v"], dtype=np.float64))
+            if "peak_voltage_rms_v" in data.files
+            else float(peak_voltage_peak_v / np.sqrt(2.0))
+        )
+        peak_voltage_form = (
+            str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0])
+            if "peak_voltage_form" in data.files
+            else "peak"
+        )
 
         if freq_hz.shape != voltage_mag.shape:
             raise ValueError(f"Mismatched frequency/response shapes in {path}.")
@@ -90,6 +115,9 @@ def aggregate_response_directory(
             "f_peak_hz": f_peak_hz,
             "freq_hz": freq_hz,
             "voltage_mag": voltage_mag,
+            "peak_voltage_peak_v": peak_voltage_peak_v,
+            "peak_voltage_rms_v": peak_voltage_rms_v,
+            "peak_voltage_form": peak_voltage_form,
             "quality_flag": quality_flag,
         }
 
@@ -112,6 +140,9 @@ def aggregate_response_directory(
     freq_ratio = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
     voltage_mag = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
     peak_voltage = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_peak_v = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_rms_v = np.full(n_samples, np.nan, dtype=np.float64)
+    peak_voltage_form = np.full(n_samples, "", dtype="<U16")
     quality_flag = np.zeros(n_samples, dtype=np.int32)
 
     for idx, sample_id in enumerate(sample_ids):
@@ -127,7 +158,10 @@ def aggregate_response_directory(
         freq_hz[idx] = freq
         freq_ratio[idx] = freq / f_peak
         voltage_mag[idx] = voltage
-        peak_voltage[idx] = float(np.nanmax(voltage))
+        peak_voltage_peak_v[idx] = float(record["peak_voltage_peak_v"])
+        peak_voltage_rms_v[idx] = float(record["peak_voltage_rms_v"])
+        peak_voltage_form[idx] = str(record["peak_voltage_form"])
+        peak_voltage[idx] = float(record["peak_voltage_peak_v"])
         quality_flag[idx] = qflag
 
     response_dataset = {
@@ -137,6 +171,9 @@ def aggregate_response_directory(
         "freq_hz": freq_hz,
         "voltage_mag": voltage_mag,
         "peak_voltage": peak_voltage,
+        "peak_voltage_peak_v": peak_voltage_peak_v,
+        "peak_voltage_rms_v": peak_voltage_rms_v,
+        "peak_voltage_form": peak_voltage_form,
         "quality_flag": quality_flag,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

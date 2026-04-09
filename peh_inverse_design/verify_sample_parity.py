@@ -23,6 +23,7 @@ if __package__ in (None, ""):
         write_problem_spec_snapshot,
     )
     from peh_inverse_design.volume_mesh import VolumeMeshConfig, mesh_tiled_plate_volume_sample
+    from peh_inverse_design.volume_mesh import volume_mesh_preset_overrides
 else:
     from .audit_ansys_alignment import audit_run_sample
     from .build_volume_meshes import _resolve_geometry_config_for_sample, _resolve_sample_id
@@ -33,7 +34,7 @@ else:
         write_ansys_workbench_handoff,
         write_problem_spec_snapshot,
     )
-    from .volume_mesh import VolumeMeshConfig, mesh_tiled_plate_volume_sample
+    from .volume_mesh import VolumeMeshConfig, mesh_tiled_plate_volume_sample, volume_mesh_preset_overrides
 
 
 def _parse_layer_sweep(value: str) -> list[tuple[int, int]]:
@@ -54,6 +55,13 @@ def _parse_layer_sweep(value: str) -> list[tuple[int, int]]:
     if not parsed:
         raise ValueError("layer sweep must contain at least one substrate_layers:piezo_layers entry.")
     return parsed
+
+
+def _single_case_for_preset(mesh_preset: str) -> list[tuple[int, int]]:
+    normalized = str(mesh_preset).strip().lower()
+    if normalized == "ansys_parity":
+        return [(8, 3)]
+    return [(2, 1)]
 
 
 def _parse_float_sweep(value: str, default: float) -> list[float]:
@@ -411,6 +419,7 @@ def verify_sample_parity(
         threshold = float(data["threshold"][sample_idx])
 
     records: list[dict[str, Any]] = []
+    preset_overrides = volume_mesh_preset_overrides(str(mesh_preset))
     for mesh_size_scale in mesh_size_scales:
         for substrate_layers, piezo_layers in layer_sweep:
             case_name = _case_slug(
@@ -443,8 +452,12 @@ def verify_sample_parity(
                 require_connected_substrate=True,
                 exact_cad=True,
                 repair_cad=False,
-                max_solver_vector_dofs=None,
-                allow_solver_mesh_coarsening=False,
+                max_solver_vector_dofs=(
+                    None
+                    if preset_overrides["max_solver_vector_dofs"] is None
+                    else int(preset_overrides["max_solver_vector_dofs"])
+                ),
+                allow_solver_mesh_coarsening=bool(preset_overrides["allow_solver_mesh_coarsening"]),
                 mesh_preset=str(mesh_preset),
                 ansys_step_strategy="single_face_assembly",
             )
@@ -618,9 +631,14 @@ def main() -> None:
         help="Mesh preset used for the sweep cases.",
     )
     parser.add_argument(
+        "--parity-sweep",
+        action="store_true",
+        help="Run the dedicated parity sweep over multiple through-thickness layer settings.",
+    )
+    parser.add_argument(
         "--layer-sweep",
-        default="2:1,4:2,6:2,8:3",
-        help="Comma-separated substrate_layers:piezo_layers cases.",
+        default="",
+        help="Comma-separated substrate_layers:piezo_layers cases. Without --parity-sweep this defaults to one case.",
     )
     parser.add_argument(
         "--mesh-size-scales",
@@ -650,13 +668,22 @@ def main() -> None:
         help="Disable extra mode-shape storage. Leave this off only if you need the lightest possible parity run.",
     )
     args = parser.parse_args()
+    layer_sweep = (
+        _parse_layer_sweep(args.layer_sweep)
+        if str(args.layer_sweep).strip()
+        else (
+            [(2, 1), (4, 2), (6, 2), (8, 3)]
+            if bool(args.parity_sweep)
+            else _single_case_for_preset(str(args.mesh_preset))
+        )
+    )
 
     verify_sample_parity(
         sample_id=int(args.sample_id),
         unit_cell_npz=args.unit_cell_npz,
         output_dir=args.output_dir,
         problem_spec_path=args.problem_spec or None,
-        layer_sweep=_parse_layer_sweep(args.layer_sweep),
+        layer_sweep=layer_sweep,
         mesh_size_scales=_parse_float_sweep(args.mesh_size_scales, default=0.08),
         mesh_preset=str(args.mesh_preset),
         ansys_modal_hz=args.ansys_modal_hz,

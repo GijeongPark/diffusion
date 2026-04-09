@@ -15,10 +15,12 @@ if __package__ in (None, ""):
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from peh_inverse_design.modal_surface_fields import available_surface_strain_fields, preferred_surface_strain_field
     from peh_inverse_design.problem_spec import build_runtime_defaults, load_problem_spec
+    from peh_inverse_design.solver_diagnostics import load_modal_diagnostics, load_solver_provenance
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from .modal_surface_fields import available_surface_strain_fields, preferred_surface_strain_field
     from .problem_spec import build_runtime_defaults, load_problem_spec
+    from .solver_diagnostics import load_modal_diagnostics, load_solver_provenance
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -128,7 +130,15 @@ def _load_surface_fields(
         ]
         preferred = preferred_surface_strain_field(modal, top_triangles.shape[0])
     if preferred is None:
-        raise ValueError(f"No compatible top-surface strain field was found in {modal_path}.")
+        empty = np.full(top_triangles.shape[0], np.nan, dtype=np.float64)
+        preferred_summary = {
+            "key": "surface_strain_unavailable",
+            "kind": "unavailable",
+            "label": "surface strain unavailable",
+            "frequency_hz": float("nan"),
+            "strain": empty,
+        }
+        return points, top_triangles, centroids, preferred_summary, available_fields
     preferred_summary = {
         "key": preferred.key,
         "kind": preferred.kind,
@@ -234,8 +244,16 @@ def audit_run_sample(
         freq_hz = np.asarray(response["freq_hz"], dtype=np.float64).reshape(-1)
         voltage_mag = np.asarray(response["voltage_mag"], dtype=np.float64).reshape(-1)
         f_peak_hz = float(np.asarray(response["f_peak_hz"], dtype=np.float64))
-        peak_voltage_peak_v = float(np.max(voltage_mag))
-        peak_voltage_rms_v = float(peak_voltage_peak_v / np.sqrt(2.0))
+        peak_voltage_peak_v = (
+            float(np.asarray(response["peak_voltage_peak_v"], dtype=np.float64))
+            if "peak_voltage_peak_v" in response
+            else float(np.max(voltage_mag))
+        )
+        peak_voltage_rms_v = (
+            float(np.asarray(response["peak_voltage_rms_v"], dtype=np.float64))
+            if "peak_voltage_rms_v" in response
+            else float(peak_voltage_peak_v / np.sqrt(2.0))
+        )
         argmax_freq_hz = float(freq_hz[int(np.argmax(voltage_mag))])
         eigenfreq_hz = np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)
         mode1_frequency_hz = (
@@ -256,6 +274,38 @@ def audit_run_sample(
             if "capacitance_f" in modal
             else float("nan")
         )
+        response_provenance = load_solver_provenance(response)
+        modal_provenance = load_solver_provenance(modal)
+        modal_diagnostics = load_modal_diagnostics(modal)
+
+    solver_provenance = dict(response_provenance)
+    for key, value in modal_provenance.items():
+        if key == "parity_invalid_reason":
+            if not solver_provenance.get(key):
+                solver_provenance[key] = value
+            continue
+        if key == "eigensolver_backend":
+            if str(solver_provenance.get(key, "")) in {"", "unknown"}:
+                solver_provenance[key] = value
+            continue
+        if key == "requested_eigensolver_backend":
+            if not str(solver_provenance.get(key, "")):
+                solver_provenance[key] = value
+            continue
+        if key in {"solver_element_order", "requested_solver_element_order"}:
+            if int(solver_provenance.get(key, -1)) < 0:
+                solver_provenance[key] = value
+            continue
+        if key in {"used_eigensolver_fallback", "used_element_order_fallback", "strict_parity_requested", "diagnostic_only"}:
+            solver_provenance[key] = bool(solver_provenance.get(key, False) or value)
+            continue
+        if key == "solver_parity_valid":
+            solver_provenance[key] = bool(solver_provenance.get(key, True) and value)
+
+    low_mode_eigenfreq_hz = np.asarray(modal_diagnostics["low_mode_eigenfreq_hz"], dtype=np.float64).reshape(-1)
+    low_mode_modal_force = np.asarray(modal_diagnostics["low_mode_modal_force"], dtype=np.float64).reshape(-1)
+    low_mode_modal_theta = np.asarray(modal_diagnostics["low_mode_modal_theta"], dtype=np.float64).reshape(-1)
+    drive_coupling_score = np.asarray(modal_diagnostics["drive_coupling_score"], dtype=np.float64).reshape(-1)
 
     handoff = _load_json(handoff_path)
     face_groups = _load_json(face_groups_path) if face_groups_path.exists() else None
@@ -268,6 +318,12 @@ def audit_run_sample(
     warnings: list[str] = []
     if abs(argmax_freq_hz - f_peak_hz) > 1.0e-9:
         warnings.append("The saved FRF peak frequency does not match the stored f_peak_hz exactly.")
+    if not bool(solver_provenance["solver_parity_valid"]):
+        reason = str(solver_provenance["parity_invalid_reason"]).strip() or "solver path deviated from strict parity requirements."
+        warnings.append(
+            "WARNING: solver_parity_valid=false; numeric comparison is diagnostic only and must not be used "
+            f"for ANSYS parity conclusions. Reason: {reason}"
+        )
     ansys_modal_reference_hz = None if ansys_modal_hz is None else float(ansys_modal_hz)
     ansys_frf_peak_reference_hz = None if ansys_frf_peak_hz is None else float(ansys_frf_peak_hz)
     supplied_frequency_references = [
@@ -350,6 +406,8 @@ def audit_run_sample(
         frequency_hz=float(preferred_surface_field["frequency_hz"]),
     )
     warnings.extend(surface_warnings)
+    if str(preferred_surface_field["key"]) == "surface_strain_unavailable":
+        warnings.append("No compatible top-surface strain field was available in the modal output for this audit.")
     harmonic_surface_strain = None
     for field in available_surface_fields:
         if field["kind"] != "harmonic":
@@ -371,6 +429,18 @@ def audit_run_sample(
         "run_dir": str(run_dir),
         "sample_id": int(sample_id),
         "problem_spec_path": "" if problem_spec_path is None else str(problem_spec_path),
+        "solver_provenance": {
+            "eigensolver_backend": str(solver_provenance["eigensolver_backend"]),
+            "requested_eigensolver_backend": str(solver_provenance["requested_eigensolver_backend"]),
+            "solver_element_order": int(solver_provenance["solver_element_order"]),
+            "requested_solver_element_order": int(solver_provenance["requested_solver_element_order"]),
+            "used_eigensolver_fallback": bool(solver_provenance["used_eigensolver_fallback"]),
+            "used_element_order_fallback": bool(solver_provenance["used_element_order_fallback"]),
+            "solver_parity_valid": bool(solver_provenance["solver_parity_valid"]),
+            "parity_invalid_reason": str(solver_provenance["parity_invalid_reason"]),
+            "strict_parity_requested": bool(solver_provenance["strict_parity_requested"]),
+            "diagnostic_only": bool(solver_provenance["diagnostic_only"]),
+        },
         "geometry": {
             "plate_size_m": [float(plate_size[0]), float(plate_size[1])],
             "substrate_thickness_m": float(handoff["geometry"]["substrate_thickness_m"]),
@@ -419,6 +489,17 @@ def audit_run_sample(
             "modal_mass_mode1": float(modal_mass[0]) if modal_mass.size > 0 else float("nan"),
             "capacitance_f": float(capacitance_f),
         },
+        "modal_diagnostics": {
+            "low_mode_eigenfreq_hz": low_mode_eigenfreq_hz.tolist(),
+            "low_mode_modal_force": low_mode_modal_force.tolist(),
+            "low_mode_modal_theta": low_mode_modal_theta.tolist(),
+            "drive_coupling_score": drive_coupling_score.tolist(),
+            "dominant_drive_coupling_mode_index": int(modal_diagnostics["dominant_drive_coupling_mode_index"]),
+            "dominant_drive_coupling_mode_frequency_hz": float(
+                modal_diagnostics["dominant_drive_coupling_mode_frequency_hz"]
+            ),
+            "suspect_mode_ordering": bool(modal_diagnostics["suspect_mode_ordering"]),
+        },
         "mesh_materials": mesh_materials,
         "top_surface_strain": top_surface_strain,
         "ansys_face_groups": {
@@ -460,8 +541,26 @@ def audit_run_sample(
 def _print_summary(summary: dict[str, Any]) -> None:
     frequency_comparison = summary["frequency_comparison"]
     voltage_comparison = summary["voltage_comparison"]
+    solver_provenance = summary.get("solver_provenance", {})
+    modal_diagnostics = summary.get("modal_diagnostics", {})
     print(f"run_dir: {summary['run_dir']}")
     print(f"sample_id: {summary['sample_id']}")
+    if solver_provenance:
+        print(
+            "solver_provenance: "
+            f"solver_parity_valid={bool(solver_provenance.get('solver_parity_valid', True))}, "
+            f"diagnostic_only={bool(solver_provenance.get('diagnostic_only', False))}, "
+            f"strict_parity_requested={bool(solver_provenance.get('strict_parity_requested', False))}, "
+            f"eigensolver_backend={solver_provenance.get('eigensolver_backend', 'unknown')}, "
+            f"solver_element_order={solver_provenance.get('solver_element_order', -1)}, "
+            f"used_eigensolver_fallback={bool(solver_provenance.get('used_eigensolver_fallback', False))}, "
+            f"used_element_order_fallback={bool(solver_provenance.get('used_element_order_fallback', False))}"
+        )
+        if not bool(solver_provenance.get("solver_parity_valid", True)):
+            print(
+                "WARNING: numeric comparison is diagnostic only and must not be used for ANSYS parity conclusions. "
+                f"Reason: {solver_provenance.get('parity_invalid_reason', '')}"
+            )
     print(
         "geometry: "
         f"plate={tuple(summary['geometry']['plate_size_m'])} m, "
@@ -524,6 +623,13 @@ def _print_summary(summary: dict[str, Any]) -> None:
         f"modal_force_mode1={summary['electromechanical']['modal_force_mode1']:.12g}, "
         f"capacitance_f={summary['electromechanical']['capacitance_f']:.12g}"
     )
+    if modal_diagnostics:
+        print(
+            "modal_diagnostics: "
+            f"dominant_drive_coupling_mode_index={modal_diagnostics.get('dominant_drive_coupling_mode_index', -1)}, "
+            f"dominant_drive_coupling_mode_frequency_hz={float(modal_diagnostics.get('dominant_drive_coupling_mode_frequency_hz', np.nan)):.12g}, "
+            f"suspect_mode_ordering={bool(modal_diagnostics.get('suspect_mode_ordering', False))}"
+        )
     print(
         "mesh_materials: "
         f"substrate_volume_m3={summary['mesh_materials']['substrate_volume_m3']:.12g}, "

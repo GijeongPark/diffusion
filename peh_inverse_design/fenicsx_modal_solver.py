@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import math
 import re
 import sys
@@ -23,6 +24,7 @@ if __package__ in (None, ""):
         load_problem_spec,
     )
     from peh_inverse_design.response_dataset import save_fem_response
+    from peh_inverse_design.solver_diagnostics import build_solver_provenance_arrays, compute_drive_coupling_diagnostics
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from .modal_surface_fields import has_explicit_surface_strain_fields
@@ -34,6 +36,7 @@ else:
         load_problem_spec,
     )
     from .response_dataset import save_fem_response
+    from .solver_diagnostics import build_solver_provenance_arrays, compute_drive_coupling_diagnostics
 
 
 @dataclass(frozen=True)
@@ -69,11 +72,33 @@ class PiezoConfig:
     )
 
 
+class SolverParityError(RuntimeError):
+    def __init__(self, message: str, *, diagnostic_payload: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic_payload = diagnostic_payload or {}
+
+
 def _extract_sample_id(mesh_path: Path) -> int:
     matches = re.findall(r"(\d+)", mesh_path.stem)
     if not matches:
         raise ValueError(f"Could not infer sample id from {mesh_path}.")
     return int(matches[-1])
+
+
+def _solver_diagnostic_output_path(output_dir: str | Path, sample_id: int) -> Path:
+    return Path(output_dir) / f"sample_{int(sample_id):04d}_solver_diagnostic.json"
+
+
+def _write_solver_diagnostic_payload(
+    *,
+    output_dir: str | Path,
+    sample_id: int,
+    payload: dict[str, object],
+) -> Path:
+    output_path = _solver_diagnostic_output_path(output_dir, sample_id)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    return output_path
 
 
 def _build_top_surface_point_cell_map(
@@ -483,13 +508,76 @@ def _build_eps_solver(
     raise ValueError(f"Unsupported eigensolver backend: {backend}")
 
 
+def _normalize_eigensolver_backend(
+    *,
+    eigensolver_backend: str,
+    strict_parity: bool,
+) -> str:
+    normalized_backend = str(eigensolver_backend).strip().lower()
+    if normalized_backend not in {"shift_invert_lu", "iterative_gd", "auto"}:
+        raise ValueError(f"Unsupported eigensolver backend: {eigensolver_backend}")
+    if strict_parity and normalized_backend == "auto":
+        return "shift_invert_lu"
+    if strict_parity and normalized_backend != "shift_invert_lu":
+        raise ValueError("--strict-parity requires --eigensolver-backend shift_invert_lu (or the implicit strict default).")
+    return normalized_backend
+
+
+def _successful_solver_parity_state(
+    *,
+    requested_backend: str,
+    actual_backend: str,
+    allow_eigensolver_fallback: bool,
+    strict_parity: bool,
+    used_eigensolver_fallback: bool,
+    used_element_order_fallback: bool,
+) -> tuple[bool, bool, str]:
+    diagnostic_only = bool(
+        allow_eigensolver_fallback
+        or requested_backend == "iterative_gd"
+        or actual_backend == "iterative_gd"
+        or used_eigensolver_fallback
+        or used_element_order_fallback
+    )
+    solver_parity_valid = bool(not diagnostic_only)
+    if used_element_order_fallback:
+        return (
+            solver_parity_valid,
+            True,
+            "element order fallback changed the actual solver order from the requested parity order",
+        )
+    if used_eigensolver_fallback:
+        return (
+            solver_parity_valid,
+            True,
+            "automatic eigensolver fallback from shift_invert_lu to iterative_gd was used",
+        )
+    if requested_backend == "iterative_gd":
+        return (
+            solver_parity_valid,
+            True,
+            "iterative_gd eigensolver backend was requested; run is diagnostic only",
+        )
+    if allow_eigensolver_fallback:
+        return (
+            solver_parity_valid,
+            True,
+            "automatic eigensolver fallback was enabled for this run; treat results as diagnostic only",
+        )
+    return (solver_parity_valid, False, "")
+
+
 def _assemble_modal_model(
     mesh_path: Path,
     num_modes: int,
     mechanical: MechanicalConfig,
     piezo: PiezoConfig,
     element_order: int = 1,
+    requested_element_order: int | None = None,
     store_mode_shapes: bool = False,
+    eigensolver_backend: str = "auto",
+    allow_eigensolver_fallback: bool = False,
+    strict_parity: bool = False,
 ) -> dict[str, np.ndarray]:
     MPI, PETSc, SLEPc, fem, fem_petsc, io, io_gmsh, ufl = _load_fenicsx()
     import basix.ufl  # type: ignore
@@ -497,6 +585,14 @@ def _assemble_modal_model(
 
     comm = MPI.COMM_WORLD
     mesh_path = Path(mesh_path)
+    sample_id = _extract_sample_id(mesh_path)
+    requested_backend = _normalize_eigensolver_backend(
+        eigensolver_backend=eigensolver_backend,
+        strict_parity=strict_parity,
+    )
+    requested_element_order = int(element_order) if requested_element_order is None else int(requested_element_order)
+    if strict_parity and allow_eigensolver_fallback:
+        raise ValueError("--allow-eigensolver-fallback cannot be combined with --strict-parity.")
     raw_points = np.zeros((0, 3), dtype=np.float64)
     raw_tetra_cells = np.zeros((0, 4), dtype=np.int64)
     raw_tetra_tags = np.zeros((0,), dtype=np.int32)
@@ -600,34 +696,60 @@ def _assemble_modal_model(
     eps_solver = None
     vr = None
     vi = None
-    eigensolver_backend = "shift_invert_lu"
+    used_eigensolver_fallback = False
+    actual_eigensolver_backend = "shift_invert_lu"
     try:
         K = fem_petsc.assemble_matrix(a_form, bcs=bcs, diag=1.0)
         M = fem_petsc.assemble_matrix(m_form, bcs=bcs, diag=0.0)
         K.assemble()
         M.assemble()
 
-        eps_solver, eigensolver_backend = _build_eps_solver(
+        initial_backend = "shift_invert_lu" if requested_backend == "auto" else requested_backend
+        eps_solver, actual_eigensolver_backend = _build_eps_solver(
             comm=comm,
             K=K,
             M=M,
             num_modes=num_modes,
             PETSc=PETSc,
             SLEPc=SLEPc,
-            backend="shift_invert_lu",
+            backend=initial_backend,
         )
         try:
             eps_solver.solve()
         except Exception as exc:
-            if not _is_mumps_factorization_failure(exc):
+            if initial_backend != "shift_invert_lu" or not _is_mumps_factorization_failure(exc):
                 raise
+            reason = (
+                "strict parity requested, but shift_invert_lu failed and automatic eigensolver fallback is disallowed"
+                if strict_parity
+                else "shift_invert_lu failed and automatic eigensolver fallback is disallowed for this run"
+            )
+            if not allow_eigensolver_fallback:
+                raise SolverParityError(
+                    reason,
+                    diagnostic_payload={
+                        "sample_id": int(sample_id),
+                        "mesh_path": str(mesh_path),
+                        "error_message": str(exc),
+                        "eigensolver_backend": "shift_invert_lu",
+                        "requested_eigensolver_backend": str(requested_backend),
+                        "solver_element_order": int(element_order),
+                        "requested_solver_element_order": int(requested_element_order),
+                        "used_eigensolver_fallback": False,
+                        "used_element_order_fallback": False,
+                        "solver_parity_valid": False,
+                        "parity_invalid_reason": reason,
+                        "strict_parity_requested": bool(strict_parity),
+                        "diagnostic_only": bool(allow_eigensolver_fallback or requested_backend == "iterative_gd"),
+                    },
+                ) from exc
             print(
                 "Eigen solve fallback: shift-invert LU/MUMPS ran out of factorization memory; "
                 "retrying with the iterative generalized-Davidson backend.",
                 flush=True,
             )
             _destroy_petsc_object(eps_solver)
-            eps_solver, eigensolver_backend = _build_eps_solver(
+            eps_solver, actual_eigensolver_backend = _build_eps_solver(
                 comm=comm,
                 K=K,
                 M=M,
@@ -636,7 +758,28 @@ def _assemble_modal_model(
                 SLEPc=SLEPc,
                 backend="iterative_gd",
             )
-            eps_solver.solve()
+            try:
+                eps_solver.solve()
+            except Exception as fallback_exc:
+                raise SolverParityError(
+                    "iterative_gd eigensolver fallback failed after shift_invert_lu failed",
+                    diagnostic_payload={
+                        "sample_id": int(sample_id),
+                        "mesh_path": str(mesh_path),
+                        "error_message": str(fallback_exc),
+                        "eigensolver_backend": "iterative_gd",
+                        "requested_eigensolver_backend": str(requested_backend),
+                        "solver_element_order": int(element_order),
+                        "requested_solver_element_order": int(requested_element_order),
+                        "used_eigensolver_fallback": True,
+                        "used_element_order_fallback": False,
+                        "solver_parity_valid": False,
+                        "parity_invalid_reason": "iterative_gd eigensolver fallback failed after shift_invert_lu failed",
+                        "strict_parity_requested": bool(strict_parity),
+                        "diagnostic_only": True,
+                    },
+                ) from fallback_exc
+            used_eigensolver_fallback = True
 
         nconv = eps_solver.getConverged()
         if nconv <= 0:
@@ -706,7 +849,22 @@ def _assemble_modal_model(
         if not eigenfreq_hz:
             raise RuntimeError("No positive eigenfrequencies were extracted from the mesh.")
 
-        return {
+        used_element_order_fallback = bool(int(element_order) != int(requested_element_order))
+        solver_parity_valid, diagnostic_only, parity_invalid_reason = _successful_solver_parity_state(
+            requested_backend=requested_backend,
+            actual_backend=actual_eigensolver_backend,
+            allow_eigensolver_fallback=allow_eigensolver_fallback,
+            strict_parity=strict_parity,
+            used_eigensolver_fallback=used_eigensolver_fallback,
+            used_element_order_fallback=used_element_order_fallback,
+        )
+        modal_diagnostics = compute_drive_coupling_diagnostics(
+            eigenfreq_hz=np.asarray(eigenfreq_hz, dtype=np.float64),
+            modal_force=np.asarray(modal_force, dtype=np.float64),
+            modal_theta=np.asarray(modal_theta, dtype=np.float64),
+        )
+
+        payload = {
             "element_order": np.asarray([int(element_order)], dtype=np.int32),
             "eigenfreq_hz": np.asarray(eigenfreq_hz, dtype=np.float64),
             "modal_force": np.asarray(modal_force, dtype=np.float64),
@@ -726,8 +884,23 @@ def _assemble_modal_model(
             "piezo_volume_m3": np.asarray([piezo_volume], dtype=np.float64),
             "substrate_cell_count": np.asarray([substrate_cell_count], dtype=np.int32),
             "piezo_cell_count": np.asarray([piezo_cell_count], dtype=np.int32),
-            "eigensolver_backend": np.asarray([str(eigensolver_backend)]),
         }
+        payload.update(
+            build_solver_provenance_arrays(
+                eigensolver_backend=str(actual_eigensolver_backend),
+                solver_element_order=int(element_order),
+                requested_solver_element_order=int(requested_element_order),
+                requested_eigensolver_backend=str(requested_backend),
+                used_eigensolver_fallback=bool(used_eigensolver_fallback),
+                used_element_order_fallback=bool(used_element_order_fallback),
+                solver_parity_valid=bool(solver_parity_valid),
+                parity_invalid_reason=str(parity_invalid_reason),
+                strict_parity_requested=bool(strict_parity),
+                diagnostic_only=bool(diagnostic_only),
+            )
+        )
+        payload.update(modal_diagnostics)
+        return payload
     finally:
         _destroy_petsc_object(vi)
         _destroy_petsc_object(vr)
@@ -918,6 +1091,14 @@ def _log_modal_diagnostics(
     modal_theta = np.asarray(modal_model.get("modal_theta", []), dtype=np.float64).reshape(-1)
     modal_force = np.asarray(modal_model.get("modal_force", []), dtype=np.float64).reshape(-1)
     eigensolver_backend = str(np.asarray(modal_model.get("eigensolver_backend", ["unknown"])).reshape(-1)[0])
+    drive_coupling_score = np.asarray(modal_model.get("drive_coupling_score", []), dtype=np.float64).reshape(-1)
+    dominant_drive_coupling_mode_index = int(
+        np.asarray(modal_model.get("dominant_drive_coupling_mode_index", [-1]), dtype=np.int32).reshape(-1)[0]
+    )
+    dominant_drive_coupling_mode_frequency_hz = float(
+        np.asarray(modal_model.get("dominant_drive_coupling_mode_frequency_hz", [np.nan]), dtype=np.float64).reshape(-1)[0]
+    )
+    suspect_mode_ordering = bool(np.asarray(modal_model.get("suspect_mode_ordering", [False])).reshape(-1)[0])
     print(
         "Modal diagnostics: "
         f"plate=({plate_dimensions[0]:.6g}, {plate_dimensions[1]:.6g}) m, "
@@ -933,7 +1114,14 @@ def _log_modal_diagnostics(
         "Modal diagnostics: "
         f"eigenfreq_hz[:6]={np.array2string(eigenfreq_hz[:6], precision=6, separator=', ')}, "
         f"modal_theta[:6]={np.array2string(modal_theta[:6], precision=6, separator=', ')}, "
-        f"modal_force[:6]={np.array2string(modal_force[:6], precision=6, separator=', ')}"
+        f"modal_force[:6]={np.array2string(modal_force[:6], precision=6, separator=', ')}, "
+        f"drive_coupling_score[:6]={np.array2string(drive_coupling_score[:6], precision=6, separator=', ')}"
+    )
+    print(
+        "Modal diagnostics: "
+        f"dominant_drive_coupling_mode_index={dominant_drive_coupling_mode_index}, "
+        f"dominant_drive_coupling_mode_frequency_hz={dominant_drive_coupling_mode_frequency_hz:.6g}, "
+        f"suspect_mode_ordering={suspect_mode_ordering}"
     )
 
 
@@ -1046,12 +1234,64 @@ def _build_modal_save_payload(
     return {
         "sample_id": np.asarray(sample_id, dtype=np.int32),
         "element_order": np.asarray([int(element_order)], dtype=np.int32),
+        "solver_element_order": np.asarray(
+            modal_model.get("solver_element_order", np.asarray([int(element_order)], dtype=np.int32))
+        ),
         "eigenfreq_hz": modal_model["eigenfreq_hz"],
         "modal_force": modal_model["modal_force"],
         "modal_theta": modal_model["modal_theta"],
         "modal_mass": modal_model["modal_mass"],
         "capacitance_f": modal_model["capacitance_f"],
         "eigensolver_backend": np.asarray(modal_model.get("eigensolver_backend", ["unknown"])),
+        "requested_solver_element_order": np.asarray(
+            modal_model.get("requested_solver_element_order", np.asarray([int(element_order)], dtype=np.int32))
+        ),
+        "requested_eigensolver_backend": np.asarray(
+            modal_model.get("requested_eigensolver_backend", np.asarray(["unknown"]))
+        ),
+        "used_eigensolver_fallback": np.asarray(
+            modal_model.get("used_eigensolver_fallback", np.asarray([False], dtype=np.bool_))
+        ),
+        "used_element_order_fallback": np.asarray(
+            modal_model.get("used_element_order_fallback", np.asarray([False], dtype=np.bool_))
+        ),
+        "solver_parity_valid": np.asarray(
+            modal_model.get("solver_parity_valid", np.asarray([True], dtype=np.bool_))
+        ),
+        "parity_invalid_reason": np.asarray(
+            modal_model.get("parity_invalid_reason", np.asarray([""]))
+        ),
+        "strict_parity_requested": np.asarray(
+            modal_model.get("strict_parity_requested", np.asarray([False], dtype=np.bool_))
+        ),
+        "diagnostic_only": np.asarray(
+            modal_model.get("diagnostic_only", np.asarray([False], dtype=np.bool_))
+        ),
+        "low_mode_eigenfreq_hz": np.asarray(
+            modal_model.get("low_mode_eigenfreq_hz", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
+        "low_mode_modal_force": np.asarray(
+            modal_model.get("low_mode_modal_force", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
+        "low_mode_modal_theta": np.asarray(
+            modal_model.get("low_mode_modal_theta", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
+        "drive_coupling_score": np.asarray(
+            modal_model.get("drive_coupling_score", np.asarray([], dtype=np.float64)),
+            dtype=np.float64,
+        ),
+        "dominant_drive_coupling_mode_index": np.asarray(
+            modal_model.get("dominant_drive_coupling_mode_index", np.asarray([-1], dtype=np.int32))
+        ),
+        "dominant_drive_coupling_mode_frequency_hz": np.asarray(
+            modal_model.get("dominant_drive_coupling_mode_frequency_hz", np.asarray([np.nan], dtype=np.float64))
+        ),
+        "suspect_mode_ordering": np.asarray(
+            modal_model.get("suspect_mode_ordering", np.asarray([False], dtype=np.bool_))
+        ),
         "substrate_volume_m3": modal_model["substrate_volume_m3"],
         "piezo_volume_m3": modal_model["piezo_volume_m3"],
         "substrate_cell_count": modal_model["substrate_cell_count"],
@@ -1083,21 +1323,39 @@ def solve_modal_voltage_frf(
     piezo: PiezoConfig | None = None,
     modes_output_dir: str | Path | None = None,
     element_order: int = 2,
+    requested_element_order: int | None = None,
     store_mode_shapes: bool = False,
+    eigensolver_backend: str = "auto",
+    allow_eigensolver_fallback: bool = False,
+    strict_parity: bool = False,
 ) -> Path:
     mechanical = mechanical or MechanicalConfig()
     piezo = piezo or PiezoConfig()
     mesh_path = Path(mesh_path)
     sample_id = _extract_sample_id(mesh_path)
+    requested_element_order = int(element_order) if requested_element_order is None else int(requested_element_order)
 
-    modal_model = _assemble_modal_model(
-        mesh_path=mesh_path,
-        num_modes=num_modes,
-        mechanical=mechanical,
-        piezo=piezo,
-        element_order=element_order,
-        store_mode_shapes=store_mode_shapes,
-    )
+    try:
+        modal_model = _assemble_modal_model(
+            mesh_path=mesh_path,
+            num_modes=num_modes,
+            mechanical=mechanical,
+            piezo=piezo,
+            element_order=element_order,
+            requested_element_order=requested_element_order,
+            store_mode_shapes=store_mode_shapes,
+            eigensolver_backend=eigensolver_backend,
+            allow_eigensolver_fallback=allow_eigensolver_fallback,
+            strict_parity=strict_parity,
+        )
+    except SolverParityError as exc:
+        diagnostic_path = _write_solver_diagnostic_payload(
+            output_dir=response_dir,
+            sample_id=sample_id,
+            payload=exc.diagnostic_payload,
+        )
+        print(f"Saved solver diagnostic payload to {diagnostic_path}", flush=True)
+        raise
     _log_modal_diagnostics(modal_model)
     _warn_if_frequency_scale_is_suspicious(
         modal_model=modal_model,
@@ -1183,6 +1441,27 @@ def solve_modal_voltage_frf(
         voltage_mag=np.abs(voltage),
         output_dir=response_dir,
         quality_flag=1,
+        solver_provenance=build_solver_provenance_arrays(
+            eigensolver_backend=str(np.asarray(modal_model["eigensolver_backend"]).reshape(-1)[0]),
+            solver_element_order=int(np.asarray(modal_model["solver_element_order"], dtype=np.int32).reshape(-1)[0]),
+            requested_solver_element_order=int(
+                np.asarray(modal_model["requested_solver_element_order"], dtype=np.int32).reshape(-1)[0]
+            ),
+            requested_eigensolver_backend=str(
+                np.asarray(modal_model["requested_eigensolver_backend"]).reshape(-1)[0]
+            ),
+            used_eigensolver_fallback=bool(np.asarray(modal_model["used_eigensolver_fallback"]).reshape(-1)[0]),
+            used_element_order_fallback=bool(np.asarray(modal_model["used_element_order_fallback"]).reshape(-1)[0]),
+            solver_parity_valid=bool(np.asarray(modal_model["solver_parity_valid"]).reshape(-1)[0]),
+            parity_invalid_reason=str(np.asarray(modal_model["parity_invalid_reason"]).reshape(-1)[0]),
+            strict_parity_requested=bool(np.asarray(modal_model["strict_parity_requested"]).reshape(-1)[0]),
+            diagnostic_only=bool(np.asarray(modal_model["diagnostic_only"]).reshape(-1)[0]),
+        ),
+        modal_diagnostics=compute_drive_coupling_diagnostics(
+            eigenfreq_hz=np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64),
+            modal_force=np.asarray(modal_model["modal_force"], dtype=np.float64),
+            modal_theta=np.asarray(modal_model["modal_theta"], dtype=np.float64),
+        ),
     )
 
     if modes_output_dir is not None:
@@ -1237,8 +1516,12 @@ def solve_modal_voltage_frf_batch(
     piezo: PiezoConfig | None = None,
     modes_output_dir: str | Path | None = None,
     element_order: int = 2,
+    requested_element_order: int | None = None,
     store_mode_shapes: bool = False,
     skip_existing: bool = False,
+    eigensolver_backend: str = "auto",
+    allow_eigensolver_fallback: bool = False,
+    strict_parity: bool = False,
 ) -> list[Path]:
     response_dir = Path(response_dir)
     response_dir.mkdir(parents=True, exist_ok=True)
@@ -1280,7 +1563,11 @@ def solve_modal_voltage_frf_batch(
                     piezo=piezo,
                     modes_output_dir=modes_output_dir,
                     element_order=element_order,
+                    requested_element_order=requested_element_order,
                     store_mode_shapes=store_mode_shapes,
+                    eigensolver_backend=eigensolver_backend,
+                    allow_eigensolver_fallback=allow_eigensolver_fallback,
+                    strict_parity=strict_parity,
                 )
             )
         finally:
@@ -1355,6 +1642,28 @@ def main() -> None:
         help="Lagrange order for the solid displacement field. Use 2 by default for thin-plate bending accuracy.",
     )
     parser.add_argument(
+        "--requested-element-order",
+        type=int,
+        default=None,
+        help="Original requested displacement order. Defaults to --element-order.",
+    )
+    parser.add_argument(
+        "--eigensolver-backend",
+        default="auto",
+        choices=["shift_invert_lu", "iterative_gd", "auto"],
+        help="Eigen backend. Strict parity defaults 'auto' to shift_invert_lu and rejects iterative_gd.",
+    )
+    parser.add_argument(
+        "--allow-eigensolver-fallback",
+        action="store_true",
+        help="Permit automatic fallback from shift_invert_lu to iterative_gd for diagnostic runs only.",
+    )
+    parser.add_argument(
+        "--strict-parity",
+        action="store_true",
+        help="Require the strict parity solver path: shift_invert_lu only, with no automatic eigensolver fallback.",
+    )
+    parser.add_argument(
         "--store-mode-shapes",
         action="store_true",
         help="Store per-mode nodal fields for extra diagnostics. Disabled by default to keep screening runs fast.",
@@ -1385,6 +1694,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if bool(args.strict_parity) and bool(args.allow_eigensolver_fallback):
+        raise ValueError("--allow-eigensolver-fallback cannot be combined with --strict-parity.")
 
     mesh_paths = _resolve_mesh_paths(args.mesh, args.mesh_dir)
     if not mesh_paths:
@@ -1428,8 +1739,14 @@ def main() -> None:
         piezo=piezo,
         modes_output_dir=args.modes_dir,
         element_order=int(args.element_order),
+        requested_element_order=(
+            int(args.element_order) if args.requested_element_order is None else int(args.requested_element_order)
+        ),
         store_mode_shapes=bool(args.store_mode_shapes),
         skip_existing=bool(args.skip_existing),
+        eigensolver_backend=str(args.eigensolver_backend),
+        allow_eigensolver_fallback=bool(args.allow_eigensolver_fallback),
+        strict_parity=bool(args.strict_parity),
     )
     print(f"Saved {len(saved_paths)} response file(s) to {Path(args.response_dir)}")
 

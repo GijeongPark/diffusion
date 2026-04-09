@@ -95,6 +95,10 @@ def _workspace_path(path: Path, project_root: Path) -> str:
     return str(Path("/workspace") / resolved_path.relative_to(project_root))
 
 
+def _solver_diagnostic_payload_path(response_dir: Path, sample_id: int) -> Path:
+    return response_dir / f"sample_{int(sample_id):04d}_solver_diagnostic.json"
+
+
 def _run_solver_case(
     *,
     project_root: Path,
@@ -109,6 +113,7 @@ def _run_solver_case(
     element_order: int,
     store_mode_shapes: bool,
     docker_image: str,
+    allow_diagnostic_fallbacks: bool,
 ) -> None:
     if _fenicsx_available_locally():
         solver_args = [
@@ -132,6 +137,10 @@ def _run_solver_case(
             "--element-order",
             str(int(element_order)),
         ]
+        if allow_diagnostic_fallbacks:
+            solver_args.extend(["--eigensolver-backend", "auto", "--allow-eigensolver-fallback"])
+        else:
+            solver_args.extend(["--eigensolver-backend", "shift_invert_lu", "--strict-parity"])
         if store_mode_shapes:
             solver_args.append("--store-mode-shapes")
         if problem_spec_path is not None:
@@ -160,6 +169,10 @@ def _run_solver_case(
         "--element-order",
         str(int(element_order)),
     ]
+    if allow_diagnostic_fallbacks:
+        solver_inner.extend(["--eigensolver-backend", "auto", "--allow-eigensolver-fallback"])
+    else:
+        solver_inner.extend(["--eigensolver-backend", "shift_invert_lu", "--strict-parity"])
     if store_mode_shapes:
         solver_inner.append("--store-mode-shapes")
     if problem_spec_path is not None:
@@ -240,6 +253,16 @@ def _frequency_match_score(record: dict[str, Any]) -> float:
     return min(candidates) if candidates else float("inf")
 
 
+def _load_solver_diagnostic_payload(response_dir: Path, sample_id: int) -> dict[str, Any] | None:
+    diagnostic_path = _solver_diagnostic_payload_path(response_dir, sample_id)
+    if not diagnostic_path.exists():
+        return None
+    try:
+        return json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _record_from_summary(
     *,
     case_name: str,
@@ -253,6 +276,8 @@ def _record_from_summary(
     frequency = summary["frequency_comparison"]
     voltage = summary["voltage_comparison"]
     mesh_materials = summary["mesh_materials"]
+    solver_provenance = summary.get("solver_provenance", {})
+    modal_diagnostics = summary.get("modal_diagnostics", {})
     mesh_npz_path = case_dir / "meshes" / "volumes" / f"plate3d_{int(summary['sample_id']):04d}_fenicsx.npz"
     mesh_meta = _load_mesh_metadata(mesh_npz_path)
     return {
@@ -273,6 +298,16 @@ def _record_from_summary(
         "solver_mesh_coarsening_allowed": bool(mesh_meta["solver_mesh_coarsening_allowed"]),
         "solver_mesh_coarsening_passes": int(mesh_meta["solver_mesh_coarsening_passes"]),
         "element_order": int(element_order),
+        "solver_element_order": int(solver_provenance.get("solver_element_order", element_order)),
+        "requested_solver_element_order": int(solver_provenance.get("requested_solver_element_order", element_order)),
+        "eigensolver_backend": str(solver_provenance.get("eigensolver_backend", "unknown")),
+        "requested_eigensolver_backend": str(solver_provenance.get("requested_eigensolver_backend", "")),
+        "used_eigensolver_fallback": bool(solver_provenance.get("used_eigensolver_fallback", False)),
+        "used_element_order_fallback": bool(solver_provenance.get("used_element_order_fallback", False)),
+        "solver_parity_valid": bool(solver_provenance.get("solver_parity_valid", True)),
+        "parity_invalid_reason": str(solver_provenance.get("parity_invalid_reason", "")),
+        "strict_parity_requested": bool(solver_provenance.get("strict_parity_requested", False)),
+        "diagnostic_only": bool(solver_provenance.get("diagnostic_only", False)),
         "mode1_frequency_hz": float(frequency["mode1_frequency_hz"]),
         "f_peak_hz": float(frequency["f_peak_hz"]),
         "harmonic_field_frequency_hz": float(frequency["harmonic_field_frequency_hz"]),
@@ -294,6 +329,11 @@ def _record_from_summary(
         "modal_theta_mode1": float(summary["electromechanical"]["modal_theta_mode1"]),
         "modal_force_mode1": float(summary["electromechanical"]["modal_force_mode1"]),
         "capacitance_f": float(summary["electromechanical"]["capacitance_f"]),
+        "dominant_drive_coupling_mode_index": int(modal_diagnostics.get("dominant_drive_coupling_mode_index", -1)),
+        "dominant_drive_coupling_mode_frequency_hz": float(
+            modal_diagnostics.get("dominant_drive_coupling_mode_frequency_hz", np.nan)
+        ),
+        "suspect_mode_ordering": bool(modal_diagnostics.get("suspect_mode_ordering", False)),
         "piezo_volume_m3": float(mesh_materials["piezo_volume_m3"]),
         "substrate_volume_m3": float(mesh_materials["substrate_volume_m3"]),
         "frequency_match_score_percent": float(_frequency_match_score(frequency)),
@@ -312,7 +352,19 @@ def _failure_record(
     element_order: int,
     status: str,
     exc: Exception,
+    strict_parity_requested: bool,
+    diagnostic_only: bool,
+    diagnostic_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    diagnostic_payload = diagnostic_payload or {}
+    parity_invalid_reason = str(
+        diagnostic_payload.get("parity_invalid_reason")
+        or (
+            "diagnostic fallbacks were permitted for this run"
+            if diagnostic_only
+            else f"{status}: {exc}"
+        )
+    )
     return {
         "case_name": str(case_name),
         "case_dir": str(case_dir),
@@ -323,6 +375,21 @@ def _failure_record(
         "piezo_layers": int(piezo_layers),
         "mesh_size_scale": float(mesh_size_scale),
         "element_order": int(element_order),
+        "solver_element_order": int(diagnostic_payload.get("solver_element_order", element_order)),
+        "requested_solver_element_order": int(diagnostic_payload.get("requested_solver_element_order", element_order)),
+        "eigensolver_backend": str(diagnostic_payload.get("eigensolver_backend", "unknown")),
+        "requested_eigensolver_backend": str(diagnostic_payload.get("requested_eigensolver_backend", "")),
+        "used_eigensolver_fallback": bool(diagnostic_payload.get("used_eigensolver_fallback", False)),
+        "used_element_order_fallback": bool(diagnostic_payload.get("used_element_order_fallback", False)),
+        "solver_parity_valid": bool(diagnostic_payload.get("solver_parity_valid", False)),
+        "parity_invalid_reason": parity_invalid_reason,
+        "strict_parity_requested": bool(diagnostic_payload.get("strict_parity_requested", strict_parity_requested)),
+        "diagnostic_only": bool(diagnostic_payload.get("diagnostic_only", diagnostic_only)),
+        "dominant_drive_coupling_mode_index": int(diagnostic_payload.get("dominant_drive_coupling_mode_index", -1)),
+        "dominant_drive_coupling_mode_frequency_hz": float(
+            diagnostic_payload.get("dominant_drive_coupling_mode_frequency_hz", np.nan)
+        ),
+        "suspect_mode_ordering": bool(diagnostic_payload.get("suspect_mode_ordering", False)),
         "error_message": str(exc),
         "frequency_match_score_percent": float("inf"),
     }
@@ -366,6 +433,7 @@ def verify_sample_parity(
     element_order: int,
     store_mode_shapes: bool,
     docker_image: str,
+    allow_diagnostic_fallbacks: bool = False,
 ) -> dict[str, Any]:
     project_root = Path(__file__).resolve().parents[1].resolve()
     if problem_spec_path is not None and str(problem_spec_path).strip():
@@ -504,6 +572,8 @@ def verify_sample_parity(
                         element_order=int(element_order),
                         status="mesh_failed",
                         exc=exc,
+                        strict_parity_requested=not bool(allow_diagnostic_fallbacks),
+                        diagnostic_only=bool(allow_diagnostic_fallbacks),
                     )
                 )
                 print(f"[mesh_failed] {case_name}: {exc}", flush=True)
@@ -523,6 +593,7 @@ def verify_sample_parity(
                     element_order=int(element_order),
                     store_mode_shapes=bool(store_mode_shapes),
                     docker_image=str(docker_image),
+                    allow_diagnostic_fallbacks=bool(allow_diagnostic_fallbacks),
                 )
                 summary = audit_run_sample(
                     run_dir=case_dir,
@@ -564,6 +635,9 @@ def verify_sample_parity(
                         element_order=int(element_order),
                         status="solve_failed",
                         exc=exc,
+                        strict_parity_requested=not bool(allow_diagnostic_fallbacks),
+                        diagnostic_only=bool(allow_diagnostic_fallbacks),
+                        diagnostic_payload=_load_solver_diagnostic_payload(response_dir, int(sample_id)),
                     )
                 )
                 print(f"[solve_failed] {case_name}: {exc}", flush=True)
@@ -582,6 +656,8 @@ def verify_sample_parity(
         "ansys_frf_peak_hz": None if ansys_frf_peak_hz is None else float(ansys_frf_peak_hz),
         "ansys_voltage_v": None if ansys_voltage_v is None else float(ansys_voltage_v),
         "ansys_voltage_form": str(ansys_voltage_form),
+        "strict_parity_requested": not bool(allow_diagnostic_fallbacks),
+        "allow_diagnostic_fallbacks": bool(allow_diagnostic_fallbacks),
         "records": sorted_records,
     }
     json_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=False), encoding="utf-8")
@@ -663,6 +739,11 @@ def main() -> None:
     parser.add_argument("--element-order", type=int, default=2, help="Solid displacement interpolation order.")
     parser.add_argument("--docker-image", default="dolfinx/dolfinx:stable", help="Docker image used when FEniCSx is not installed locally.")
     parser.add_argument(
+        "--allow-diagnostic-fallbacks",
+        action="store_true",
+        help="Allow diagnostic-only solver fallbacks. Strict parity is the default when this flag is absent.",
+    )
+    parser.add_argument(
         "--no-store-mode-shapes",
         action="store_true",
         help="Disable extra mode-shape storage. Leave this off only if you need the lightest possible parity run.",
@@ -699,6 +780,7 @@ def main() -> None:
         element_order=int(args.element_order),
         store_mode_shapes=not bool(args.no_store_mode_shapes),
         docker_image=str(args.docker_image),
+        allow_diagnostic_fallbacks=bool(args.allow_diagnostic_fallbacks),
     )
 
 

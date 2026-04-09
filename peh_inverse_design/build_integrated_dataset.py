@@ -12,8 +12,10 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from peh_inverse_design.solver_diagnostics import load_modal_diagnostics, load_solver_provenance
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from .solver_diagnostics import load_modal_diagnostics, load_solver_provenance
 
 
 def _infer_sample_ids_from_source(data: np.lib.npyio.NpzFile, n_samples: int) -> tuple[np.ndarray, np.ndarray]:
@@ -48,7 +50,7 @@ def _copy_source_fields(data: np.lib.npyio.NpzFile, n_total: int, n_samples: int
 
 
 def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.ndarray | float | int]], int]:
-    records: dict[int, dict[str, np.ndarray | float | int]] = {}
+    records: dict[int, dict[str, np.ndarray | float | int | str | bool]] = {}
     n_freq = 0
     for path in sorted(response_dir.glob("sample_*_response.npz")):
         data = np.load(path, allow_pickle=True)
@@ -56,6 +58,8 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
         freq_hz = np.asarray(data["freq_hz"], dtype=np.float64).reshape(-1)
         voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64).reshape(-1)
         n_freq = max(n_freq, int(freq_hz.shape[0]))
+        provenance = load_solver_provenance(data)
+        diagnostics = load_modal_diagnostics(data)
         records[sample_id] = {
             "f_peak_hz": float(data["f_peak_hz"]),
             "freq_hz": freq_hz,
@@ -80,6 +84,25 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
                 else "peak"
             ),
             "quality_flag": int(data["quality_flag"]) if "quality_flag" in data.files else 1,
+            "eigensolver_backend": str(provenance["eigensolver_backend"]),
+            "solver_element_order": int(provenance["solver_element_order"]),
+            "requested_solver_element_order": int(provenance["requested_solver_element_order"]),
+            "requested_eigensolver_backend": str(provenance["requested_eigensolver_backend"]),
+            "used_eigensolver_fallback": bool(provenance["used_eigensolver_fallback"]),
+            "used_element_order_fallback": bool(provenance["used_element_order_fallback"]),
+            "solver_parity_valid": bool(provenance["solver_parity_valid"]),
+            "parity_invalid_reason": str(provenance["parity_invalid_reason"]),
+            "strict_parity_requested": bool(provenance["strict_parity_requested"]),
+            "diagnostic_only": bool(provenance["diagnostic_only"]),
+            "low_mode_eigenfreq_hz": np.asarray(diagnostics["low_mode_eigenfreq_hz"], dtype=np.float64),
+            "low_mode_modal_force": np.asarray(diagnostics["low_mode_modal_force"], dtype=np.float64),
+            "low_mode_modal_theta": np.asarray(diagnostics["low_mode_modal_theta"], dtype=np.float64),
+            "drive_coupling_score": np.asarray(diagnostics["drive_coupling_score"], dtype=np.float64),
+            "dominant_drive_coupling_mode_index": int(diagnostics["dominant_drive_coupling_mode_index"]),
+            "dominant_drive_coupling_mode_frequency_hz": float(
+                diagnostics["dominant_drive_coupling_mode_frequency_hz"]
+            ),
+            "suspect_mode_ordering": bool(diagnostics["suspect_mode_ordering"]),
             "path": str(path),
         }
     return records, n_freq
@@ -234,6 +257,25 @@ def build_integrated_dataset(
     integrated["source_sample_id"] = source_sample_id
 
     response_records, n_freq = _load_response_records(response_dir)
+    modal_records = _load_modal_records(modal_dir) if modal_dir is not None and modal_dir.exists() else {}
+    low_mode_count = max(
+        max(
+            (
+                int(np.asarray(record["low_mode_eigenfreq_hz"], dtype=np.float64).reshape(-1).shape[0])
+                for record in response_records.values()
+            ),
+            default=0,
+        ),
+        max(
+            (
+                int(
+                    np.asarray(load_modal_diagnostics(record)["low_mode_eigenfreq_hz"], dtype=np.float64).reshape(-1).shape[0]
+                )
+                for record in modal_records.values()
+            ),
+            default=0,
+        ),
+    )
     response_ok = np.zeros(n_samples, dtype=np.int32)
     f_peak_hz = np.full(n_samples, np.nan, dtype=np.float64)
     peak_voltage = np.full(n_samples, np.nan, dtype=np.float64)
@@ -242,6 +284,23 @@ def build_integrated_dataset(
     peak_voltage_form = np.full(n_samples, "", dtype="<U16")
     quality_flag = np.zeros(n_samples, dtype=np.int32)
     response_npz_path = np.full(n_samples, "", dtype=object)
+    eigensolver_backend = np.full(n_samples, "", dtype="<U32")
+    solver_element_order = np.full(n_samples, -1, dtype=np.int32)
+    requested_solver_element_order = np.full(n_samples, -1, dtype=np.int32)
+    requested_eigensolver_backend = np.full(n_samples, "", dtype="<U32")
+    used_eigensolver_fallback = np.zeros(n_samples, dtype=np.int32)
+    used_element_order_fallback = np.zeros(n_samples, dtype=np.int32)
+    solver_parity_valid = np.ones(n_samples, dtype=np.int32)
+    parity_invalid_reason = np.full(n_samples, "", dtype=object)
+    strict_parity_requested = np.zeros(n_samples, dtype=np.int32)
+    diagnostic_only = np.zeros(n_samples, dtype=np.int32)
+    low_mode_eigenfreq_hz = np.full((n_samples, low_mode_count), np.nan, dtype=np.float64)
+    low_mode_modal_force = np.full((n_samples, low_mode_count), np.nan, dtype=np.float64)
+    low_mode_modal_theta = np.full((n_samples, low_mode_count), np.nan, dtype=np.float64)
+    drive_coupling_score = np.full((n_samples, low_mode_count), np.nan, dtype=np.float64)
+    dominant_drive_coupling_mode_index = np.full(n_samples, -1, dtype=np.int32)
+    dominant_drive_coupling_mode_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
+    suspect_mode_ordering = np.zeros(n_samples, dtype=np.int32)
     if n_freq > 0:
         freq_hz = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
         freq_ratio = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
@@ -269,6 +328,27 @@ def build_integrated_dataset(
         freq_ratio[idx, : freq.shape[0]] = freq / f_peak
         voltage_mag[idx, : voltage.shape[0]] = voltage
         response_npz_path[idx] = str(record["path"])
+        eigensolver_backend[idx] = str(record["eigensolver_backend"])
+        solver_element_order[idx] = int(record["solver_element_order"])
+        requested_solver_element_order[idx] = int(record["requested_solver_element_order"])
+        requested_eigensolver_backend[idx] = str(record["requested_eigensolver_backend"])
+        used_eigensolver_fallback[idx] = int(bool(record["used_eigensolver_fallback"]))
+        used_element_order_fallback[idx] = int(bool(record["used_element_order_fallback"]))
+        solver_parity_valid[idx] = int(bool(record["solver_parity_valid"]))
+        parity_invalid_reason[idx] = str(record["parity_invalid_reason"])
+        strict_parity_requested[idx] = int(bool(record["strict_parity_requested"]))
+        diagnostic_only[idx] = int(bool(record["diagnostic_only"]))
+        low_freq = np.asarray(record["low_mode_eigenfreq_hz"], dtype=np.float64).reshape(-1)
+        low_force = np.asarray(record["low_mode_modal_force"], dtype=np.float64).reshape(-1)
+        low_theta = np.asarray(record["low_mode_modal_theta"], dtype=np.float64).reshape(-1)
+        low_score = np.asarray(record["drive_coupling_score"], dtype=np.float64).reshape(-1)
+        low_mode_eigenfreq_hz[idx, : low_freq.shape[0]] = low_freq
+        low_mode_modal_force[idx, : low_force.shape[0]] = low_force
+        low_mode_modal_theta[idx, : low_theta.shape[0]] = low_theta
+        drive_coupling_score[idx, : low_score.shape[0]] = low_score
+        dominant_drive_coupling_mode_index[idx] = int(record["dominant_drive_coupling_mode_index"])
+        dominant_drive_coupling_mode_frequency_hz[idx] = float(record["dominant_drive_coupling_mode_frequency_hz"])
+        suspect_mode_ordering[idx] = int(bool(record["suspect_mode_ordering"]))
 
     integrated["response_ok"] = response_ok
     integrated["f_peak_hz"] = f_peak_hz
@@ -281,6 +361,23 @@ def build_integrated_dataset(
     integrated["freq_ratio"] = freq_ratio
     integrated["voltage_mag"] = voltage_mag
     integrated["response_npz_path"] = response_npz_path
+    integrated["eigensolver_backend"] = eigensolver_backend
+    integrated["solver_element_order"] = solver_element_order
+    integrated["requested_solver_element_order"] = requested_solver_element_order
+    integrated["requested_eigensolver_backend"] = requested_eigensolver_backend
+    integrated["used_eigensolver_fallback"] = used_eigensolver_fallback
+    integrated["used_element_order_fallback"] = used_element_order_fallback
+    integrated["solver_parity_valid"] = solver_parity_valid
+    integrated["parity_invalid_reason"] = parity_invalid_reason
+    integrated["strict_parity_requested"] = strict_parity_requested
+    integrated["diagnostic_only"] = diagnostic_only
+    integrated["low_mode_eigenfreq_hz"] = low_mode_eigenfreq_hz
+    integrated["low_mode_modal_force"] = low_mode_modal_force
+    integrated["low_mode_modal_theta"] = low_mode_modal_theta
+    integrated["drive_coupling_score"] = drive_coupling_score
+    integrated["dominant_drive_coupling_mode_index"] = dominant_drive_coupling_mode_index
+    integrated["dominant_drive_coupling_mode_frequency_hz"] = dominant_drive_coupling_mode_frequency_hz
+    integrated["suspect_mode_ordering"] = suspect_mode_ordering
 
     modal_ok = np.zeros(n_samples, dtype=np.int32)
     modal_npz_path = np.full(n_samples, "", dtype=object)
@@ -315,7 +412,6 @@ def build_integrated_dataset(
         top_surface_points[:] = None
         top_surface_triangles[:] = None
 
-    modal_records = _load_modal_records(modal_dir) if modal_dir is not None and modal_dir.exists() else {}
     eigen_shape = _max_shape_for_key(modal_records, "eigenfreq_hz")
     force_shape = _max_shape_for_key(modal_records, "modal_force")
     theta_shape = _max_shape_for_key(modal_records, "modal_theta")
@@ -357,6 +453,39 @@ def build_integrated_dataset(
             continue
         modal_ok[idx] = 1
         modal_npz_path[idx] = str(modal["path"])
+        modal_provenance = load_solver_provenance(modal)
+        modal_diagnostics = load_modal_diagnostics(modal)
+        if eigensolver_backend[idx] == "":
+            eigensolver_backend[idx] = str(modal_provenance["eigensolver_backend"])
+        if solver_element_order[idx] < 0:
+            solver_element_order[idx] = int(modal_provenance["solver_element_order"])
+        if requested_solver_element_order[idx] < 0:
+            requested_solver_element_order[idx] = int(modal_provenance["requested_solver_element_order"])
+        if requested_eigensolver_backend[idx] == "":
+            requested_eigensolver_backend[idx] = str(modal_provenance["requested_eigensolver_backend"])
+        if not bool(used_eigensolver_fallback[idx]):
+            used_eigensolver_fallback[idx] = int(bool(modal_provenance["used_eigensolver_fallback"]))
+        if not bool(used_element_order_fallback[idx]):
+            used_element_order_fallback[idx] = int(bool(modal_provenance["used_element_order_fallback"]))
+        if response_ok[idx] == 0:
+            solver_parity_valid[idx] = int(bool(modal_provenance["solver_parity_valid"]))
+            parity_invalid_reason[idx] = str(modal_provenance["parity_invalid_reason"])
+            strict_parity_requested[idx] = int(bool(modal_provenance["strict_parity_requested"]))
+            diagnostic_only[idx] = int(bool(modal_provenance["diagnostic_only"]))
+        if not np.isfinite(dominant_drive_coupling_mode_frequency_hz[idx]):
+            low_freq = np.asarray(modal_diagnostics["low_mode_eigenfreq_hz"], dtype=np.float64).reshape(-1)
+            low_force = np.asarray(modal_diagnostics["low_mode_modal_force"], dtype=np.float64).reshape(-1)
+            low_theta = np.asarray(modal_diagnostics["low_mode_modal_theta"], dtype=np.float64).reshape(-1)
+            low_score = np.asarray(modal_diagnostics["drive_coupling_score"], dtype=np.float64).reshape(-1)
+            low_mode_eigenfreq_hz[idx, : low_freq.shape[0]] = low_freq
+            low_mode_modal_force[idx, : low_force.shape[0]] = low_force
+            low_mode_modal_theta[idx, : low_theta.shape[0]] = low_theta
+            drive_coupling_score[idx, : low_score.shape[0]] = low_score
+            dominant_drive_coupling_mode_index[idx] = int(modal_diagnostics["dominant_drive_coupling_mode_index"])
+            dominant_drive_coupling_mode_frequency_hz[idx] = float(
+                modal_diagnostics["dominant_drive_coupling_mode_frequency_hz"]
+            )
+            suspect_mode_ordering[idx] = int(bool(modal_diagnostics["suspect_mode_ordering"]))
         if eigenfreq_hz is not None and "eigenfreq_hz" in modal:
             _assign_padded(eigenfreq_hz, idx, np.asarray(modal["eigenfreq_hz"], dtype=np.float64))
         if modal_force is not None and "modal_force" in modal:
@@ -452,6 +581,26 @@ def build_integrated_dataset(
                     "" if np.isnan(peak_voltage_rms_v[idx]) else f"{float(peak_voltage_rms_v[idx]):.12g}"
                 ),
                 "peak_voltage_form": str(peak_voltage_form[idx]),
+                "eigensolver_backend": str(eigensolver_backend[idx]),
+                "solver_element_order": "" if int(solver_element_order[idx]) < 0 else str(int(solver_element_order[idx])),
+                "requested_solver_element_order": (
+                    "" if int(requested_solver_element_order[idx]) < 0 else str(int(requested_solver_element_order[idx]))
+                ),
+                "used_eigensolver_fallback": str(bool(used_eigensolver_fallback[idx])),
+                "used_element_order_fallback": str(bool(used_element_order_fallback[idx])),
+                "solver_parity_valid": str(bool(solver_parity_valid[idx])),
+                "parity_invalid_reason": str(parity_invalid_reason[idx]),
+                "strict_parity_requested": str(bool(strict_parity_requested[idx])),
+                "diagnostic_only": str(bool(diagnostic_only[idx])),
+                "dominant_drive_coupling_mode_index": (
+                    "" if int(dominant_drive_coupling_mode_index[idx]) < 0 else str(int(dominant_drive_coupling_mode_index[idx]))
+                ),
+                "dominant_drive_coupling_mode_frequency_hz": (
+                    ""
+                    if np.isnan(dominant_drive_coupling_mode_frequency_hz[idx])
+                    else f"{float(dominant_drive_coupling_mode_frequency_hz[idx]):.12g}"
+                ),
+                "suspect_mode_ordering": str(bool(suspect_mode_ordering[idx])),
                 "max_top_surface_strain": (
                     "" if np.isnan(max_top_surface_strain[idx]) else f"{float(max_top_surface_strain[idx]):.12g}"
                 ),
@@ -487,6 +636,18 @@ def build_integrated_dataset(
                 "peak_voltage_peak_v",
                 "peak_voltage_rms_v",
                 "peak_voltage_form",
+                "eigensolver_backend",
+                "solver_element_order",
+                "requested_solver_element_order",
+                "used_eigensolver_fallback",
+                "used_element_order_fallback",
+                "solver_parity_valid",
+                "parity_invalid_reason",
+                "strict_parity_requested",
+                "diagnostic_only",
+                "dominant_drive_coupling_mode_index",
+                "dominant_drive_coupling_mode_frequency_hz",
+                "suspect_mode_ordering",
                 "max_top_surface_strain",
                 "mesh_preset",
                 "substrate_layers",

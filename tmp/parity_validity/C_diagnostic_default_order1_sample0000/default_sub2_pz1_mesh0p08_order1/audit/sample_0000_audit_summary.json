@@ -1,0 +1,151 @@
+{
+  "run_dir": "tmp/parity_validity/C_diagnostic_default_order1_sample0000/default_sub2_pz1_mesh0p08_order1",
+  "sample_id": 0,
+  "problem_spec_path": "tmp/parity_validity/C_diagnostic_default_order1_sample0000/default_sub2_pz1_mesh0p08_order1/data/problem_spec_used.yaml",
+  "solver_provenance": {
+    "eigensolver_backend": "shift_invert_lu",
+    "requested_eigensolver_backend": "shift_invert_lu",
+    "solver_element_order": 1,
+    "requested_solver_element_order": 2,
+    "used_eigensolver_fallback": false,
+    "used_element_order_fallback": true,
+    "solver_parity_valid": false,
+    "parity_invalid_reason": "element order fallback changed the actual solver order from the requested parity order",
+    "strict_parity_requested": false,
+    "diagnostic_only": true
+  },
+  "geometry": {
+    "plate_size_m": [
+      1.0,
+      1.0
+    ],
+    "substrate_thickness_m": 0.001,
+    "piezo_thickness_m": 0.0001,
+    "total_thickness_m": 0.0011
+  },
+  "effective_problem_defaults": {
+    "substrate_thickness_m": 0.001,
+    "piezo_thickness_m": 0.0001,
+    "substrate_rho": 7930.0,
+    "piezo_rho": 7500.0,
+    "resistance_ohm": 10000.0
+  },
+  "frequency_comparison": {
+    "ansys_modal_target_hz": 2.786935887902568,
+    "mode1_frequency_hz": 2.786935887902568,
+    "f_peak_hz": 2.79162351406602,
+    "harmonic_field_frequency_hz": 2.79162351406602,
+    "field_frequency_hz": 2.79162351406602,
+    "saved_voltage_peak_freq_hz": 2.79162351406602,
+    "ansys_modal_reference_hz": NaN,
+    "ansys_frf_peak_reference_hz": NaN,
+    "frequency_reference_ambiguous": false,
+    "ambiguous_frequency_reference_hz": NaN,
+    "mode1_vs_ansys_modal_error_percent": NaN,
+    "f_peak_vs_ansys_frf_peak_error_percent": NaN,
+    "mode1_vs_ambiguous_frequency_error_percent": NaN,
+    "f_peak_vs_ambiguous_frequency_error_percent": NaN
+  },
+  "voltage_comparison": {
+    "peak_voltage_v": 31.68123090773942,
+    "peak_voltage_peak_v": 31.68123090773942,
+    "peak_voltage_rms_v": 22.40201321119938,
+    "external_load_resistance_ohm": 10000.0,
+    "ansys_voltage_reference_v": NaN,
+    "ansys_voltage_form": "unknown",
+    "selected_in_house_voltage_v": NaN,
+    "selected_voltage_error_percent": NaN,
+    "error_percent_assuming_ansys_peak": NaN,
+    "error_percent_assuming_ansys_rms": NaN,
+    "rms_equivalent_error_percent": NaN,
+    "voltage_convention_mismatch_likely": false,
+    "voltage_convention_tolerance_percent": 2.0
+  },
+  "electromechanical": {
+    "modal_theta_mode1": 0.013269901973541947,
+    "modal_force_mode1": -4.696595762909636,
+    "modal_mass_mode1": 1.0,
+    "capacitance_f": 0.00012693399999998936
+  },
+  "modal_diagnostics": {
+    "low_mode_eigenfreq_hz": [
+      2.786935887902568,
+      7.729299232246524,
+      17.423716933765512,
+      21.41453216933457,
+      26.74956918634209,
+      45.6847626911991,
+      48.943983604532015,
+      49.59919134649301
+    ],
+    "low_mode_modal_force": [
+      -4.696595762909636,
+      0.10109593925927579,
+      2.5948558166619993,
+      -0.2809396697980892,
+      -0.0600378328412214,
+      -0.1109905521540335,
+      1.5219736534690265,
+      0.19317671657769636
+    ],
+    "low_mode_modal_theta": [
+      0.013269901973541947,
+      -0.0012013661584454674,
+      0.052281847106516635,
+      0.06121611045967981,
+      -0.008119941290400048,
+      -0.00986927400080653,
+      -0.07286107529242693,
+      -0.012694150754115657
+    ],
+    "drive_coupling_score": [
+      0.062323365383163326,
+      0.00012145324018235247,
+      0.135663855070178,
+      0.017198033858865803,
+      0.00048750367787356964,
+      0.001095396170708964,
+      0.11089263695849683,
+      0.0024522143624223507
+    ],
+    "dominant_drive_coupling_mode_index": 2,
+    "dominant_drive_coupling_mode_frequency_hz": 17.423716933765512,
+    "suspect_mode_ordering": true
+  },
+  "mesh_materials": {
+    "substrate_volume_m3": 0.0006343225273194004,
+    "piezo_volume_m3": 0.00010000000000000005,
+    "substrate_cell_count": 559560,
+    "piezo_cell_count": 418824
+  },
+  "top_surface_strain": {
+    "field_name": "surface_strain_unavailable",
+    "label": "surface strain unavailable",
+    "frequency_hz": NaN,
+    "triangle_count": 139608,
+    "max_strain_eqv": NaN,
+    "max_strain_centroid_m": [
+      0.8692629326326831,
+      0.4744787897489657,
+      0.0011
+    ],
+    "top_1pct_x_mean_m": NaN,
+    "root_mean_strain_eqv": NaN,
+    "tip_mean_strain_eqv": NaN,
+    "root_max_strain_eqv": NaN,
+    "tip_max_strain_eqv": NaN
+  },
+  "ansys_face_groups": {
+    "path": "tmp/parity_validity/C_diagnostic_default_order1_sample0000/default_sub2_pz1_mesh0p08_order1/meshes/volumes/plate3d_0000_ansys_face_groups.json",
+    "piezo_bottom_expected_region_count": 1,
+    "selection_strategy": "worksheet_by_body_and_z_plane"
+  },
+  "warnings": [
+    "WARNING: solver_parity_valid=false; numeric comparison is diagnostic only and must not be used for ANSYS parity conclusions. Reason: element order fallback changed the actual solver order from the requested parity order",
+    "No compatible top-surface strain field was available in the modal output for this audit."
+  ],
+  "exports": {
+    "top_surface_csv_path": "tmp/parity_validity/C_diagnostic_default_order1_sample0000/default_sub2_pz1_mesh0p08_order1/audit/sample_0000_top_surface_strain.csv",
+    "top_surface_mesh_npz_path": "tmp/parity_validity/C_diagnostic_default_order1_sample0000/default_sub2_pz1_mesh0p08_order1/audit/sample_0000_top_surface_strain_mesh.npz"
+  }
+}

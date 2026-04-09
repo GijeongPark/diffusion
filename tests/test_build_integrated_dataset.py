@@ -10,6 +10,7 @@ import numpy as np
 
 from peh_inverse_design.build_integrated_dataset import build_integrated_dataset
 from peh_inverse_design.response_dataset import save_fem_response
+from peh_inverse_design.solver_diagnostics import build_solver_provenance_arrays, compute_drive_coupling_diagnostics
 
 
 class BuildIntegratedDatasetTests(unittest.TestCase):
@@ -38,6 +39,23 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                 freq_hz=np.asarray([0.6, 0.72, 0.84], dtype=np.float64),
                 voltage_mag=np.asarray([200.0, 342.0, 210.0], dtype=np.float64),
                 output_dir=response_dir,
+                solver_provenance=build_solver_provenance_arrays(
+                    eigensolver_backend="shift_invert_lu",
+                    solver_element_order=2,
+                    requested_solver_element_order=2,
+                    requested_eigensolver_backend="shift_invert_lu",
+                    used_eigensolver_fallback=False,
+                    used_element_order_fallback=False,
+                    solver_parity_valid=True,
+                    parity_invalid_reason="",
+                    strict_parity_requested=True,
+                    diagnostic_only=False,
+                ),
+                modal_diagnostics=compute_drive_coupling_diagnostics(
+                    eigenfreq_hz=np.asarray([0.7, 1.1], dtype=np.float64),
+                    modal_force=np.asarray([1.0, 0.2], dtype=np.float64),
+                    modal_theta=np.asarray([2.0, 5.0], dtype=np.float64),
+                ),
             )
             np.savez_compressed(
                 modal_dir / "sample_0000_modal.npz",
@@ -106,6 +124,10 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                 self.assertEqual(int(integrated["mesh_tetra_count"][0]), 1)
                 self.assertEqual(int(integrated["solver_max_q2_vector_dofs"][0]), -1)
                 self.assertEqual(int(integrated["solver_max_q2_vector_dofs_unlimited"][0]), 1)
+                self.assertEqual(str(integrated["eigensolver_backend"][0]), "shift_invert_lu")
+                self.assertEqual(int(integrated["solver_element_order"][0]), 2)
+                self.assertEqual(int(integrated["dominant_drive_coupling_mode_index"][0]), 0)
+                self.assertTrue(bool(integrated["solver_parity_valid"][0]))
 
             with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
@@ -116,6 +138,8 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
             self.assertEqual(rows[0]["piezo_layers"], "3")
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs"], "")
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs_unlimited"], "True")
+            self.assertEqual(rows[0]["eigensolver_backend"], "shift_invert_lu")
+            self.assertEqual(rows[0]["solver_parity_valid"], "True")
 
 
 if __name__ == "__main__":

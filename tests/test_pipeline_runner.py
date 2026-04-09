@@ -106,6 +106,56 @@ class PipelineRunnerTests(unittest.TestCase):
 
         self.assertEqual(requested_orders, [None, None, 1])
 
+    def test_isolated_retry_disables_lower_order_fallback_for_strict_parity_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mesh_dir = root / "meshes"
+            mesh_dir.mkdir(parents=True, exist_ok=True)
+            mesh_path = mesh_dir / "plate3d_0002_fenicsx.npz"
+            mesh_path.write_bytes(b"stub")
+            response_dir = root / "responses"
+            modal_dir = root / "modal"
+            config = PipelineConfig(
+                source_unit_cell_npz=root / "dummy.npz",
+                exact_cad=True,
+                repair_cad=False,
+                mesh_preset="ansys_parity",
+                strict_parity=True,
+                solver_element_order=2,
+                solver_oom_fallback_element_order=1,
+            )
+            requested_orders: list[int | None] = []
+
+            def fake_build_solver_docker_command(*, element_order=None, **_kwargs):
+                requested_orders.append(None if element_order is None else int(element_order))
+                return ["docker", "run"]
+
+            with mock.patch(
+                "peh_inverse_design.pipeline_runner._build_solver_docker_command",
+                side_effect=fake_build_solver_docker_command,
+            ), mock.patch(
+                "peh_inverse_design.pipeline_runner._run_command",
+                side_effect=[
+                    subprocess.CalledProcessError(137, ["docker", "run"]),
+                    subprocess.CalledProcessError(137, ["docker", "run"]),
+                ],
+            ), mock.patch(
+                "peh_inverse_design.pipeline_runner._solver_outputs_exist",
+                return_value=False,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    _run_solver_with_isolated_retry(
+                        mesh_files=[mesh_path],
+                        project_root=root,
+                        response_dir=response_dir,
+                        modal_dir=modal_dir,
+                        config=config,
+                        runtime_problem_spec_path=None,
+                    )
+                self.assertIn("parity-invalid", str(raised.exception))
+                self.assertEqual(requested_orders, [None, None])
+                self.assertTrue((response_dir / "sample_0002_solver_diagnostic.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

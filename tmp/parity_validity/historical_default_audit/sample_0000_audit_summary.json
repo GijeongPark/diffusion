@@ -1,0 +1,165 @@
+{
+  "run_dir": "tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08",
+  "sample_id": 0,
+  "problem_spec_path": "tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08/data/problem_spec_used.yaml",
+  "solver_provenance": {
+    "eigensolver_backend": "unknown",
+    "requested_eigensolver_backend": "unknown",
+    "solver_element_order": 2,
+    "requested_solver_element_order": 2,
+    "used_eigensolver_fallback": false,
+    "used_element_order_fallback": false,
+    "solver_parity_valid": true,
+    "parity_invalid_reason": "",
+    "strict_parity_requested": false,
+    "diagnostic_only": false
+  },
+  "geometry": {
+    "plate_size_m": [
+      1.0,
+      1.0
+    ],
+    "substrate_thickness_m": 0.001,
+    "piezo_thickness_m": 0.0001,
+    "total_thickness_m": 0.0011
+  },
+  "effective_problem_defaults": {
+    "substrate_thickness_m": 0.001,
+    "piezo_thickness_m": 0.0001,
+    "substrate_rho": 7930.0,
+    "piezo_rho": 7500.0,
+    "resistance_ohm": 10000.0
+  },
+  "frequency_comparison": {
+    "ansys_modal_target_hz": 0.70702918606303,
+    "mode1_frequency_hz": 0.70702918606303,
+    "f_peak_hz": 0.7235824185030824,
+    "harmonic_field_frequency_hz": 0.7235824185030824,
+    "field_frequency_hz": 0.7235824185030824,
+    "saved_voltage_peak_freq_hz": 0.7235824185030824,
+    "ansys_modal_reference_hz": NaN,
+    "ansys_frf_peak_reference_hz": NaN,
+    "frequency_reference_ambiguous": false,
+    "ambiguous_frequency_reference_hz": NaN,
+    "mode1_vs_ansys_modal_error_percent": NaN,
+    "f_peak_vs_ansys_frf_peak_error_percent": NaN,
+    "mode1_vs_ambiguous_frequency_error_percent": NaN,
+    "f_peak_vs_ambiguous_frequency_error_percent": NaN
+  },
+  "voltage_comparison": {
+    "peak_voltage_v": 342.21362725580235,
+    "peak_voltage_peak_v": 342.21362725580235,
+    "peak_voltage_rms_v": 241.98157644702334,
+    "external_load_resistance_ohm": 10000.0,
+    "ansys_voltage_reference_v": NaN,
+    "ansys_voltage_form": "unknown",
+    "selected_in_house_voltage_v": NaN,
+    "selected_voltage_error_percent": NaN,
+    "error_percent_assuming_ansys_peak": NaN,
+    "error_percent_assuming_ansys_rms": NaN,
+    "rms_equivalent_error_percent": NaN,
+    "voltage_convention_mismatch_likely": false,
+    "voltage_convention_tolerance_percent": 2.0
+  },
+  "electromechanical": {
+    "modal_theta_mode1": 0.011413461489560886,
+    "modal_force_mode1": -4.703503261463084,
+    "modal_mass_mode1": 1.0,
+    "capacitance_f": 0.00012693399999998936
+  },
+  "modal_diagnostics": {
+    "low_mode_eigenfreq_hz": [
+      0.70702918606303,
+      1.781854314596093,
+      4.405744810139042,
+      5.346185308112459,
+      6.409925139754603,
+      10.936072937102029,
+      12.386911236542828,
+      12.769499198107807
+    ],
+    "low_mode_modal_force": [
+      -4.703503261463084,
+      0.14436737285178955,
+      2.5869252793839053,
+      -0.36498489046099725,
+      -0.15424882843088566,
+      -0.07052564929450567,
+      1.5337468140880872,
+      0.06333255260454178
+    ],
+    "low_mode_modal_theta": [
+      0.011413461489560886,
+      -0.0006603245123514919,
+      0.02939277227047313,
+      -0.06307970320782813,
+      -0.010382283839966316,
+      0.02896211482212184,
+      -0.06549622628504517,
+      0.0007923289487465618
+    ],
+    "drive_coupling_score": [
+      0.053683253340732935,
+      9.532931507782393e-05,
+      0.0760369056176612,
+      0.023023138565621368,
+      0.001601455118751721,
+      0.0020425719527721693,
+      0.10045462839948047,
+      5.018021482659291e-05
+    ],
+    "dominant_drive_coupling_mode_index": 6,
+    "dominant_drive_coupling_mode_frequency_hz": 12.386911236542828,
+    "suspect_mode_ordering": true
+  },
+  "mesh_materials": {
+    "substrate_volume_m3": 0.0006343225273194004,
+    "piezo_volume_m3": 0.00010000000000000005,
+    "substrate_cell_count": 559560,
+    "piezo_cell_count": 418824
+  },
+  "top_surface_strain": {
+    "field_name": "mode1_top_surface_strain_eqv",
+    "label": "Mode 1 Modal Top-Surface Equivalent Strain",
+    "frequency_hz": 0.70702918606303,
+    "triangle_count": 139608,
+    "max_strain_eqv": 0.0053763957665679376,
+    "max_strain_centroid_m": [
+      0.01592930880601538,
+      0.19644309111855643,
+      0.0011
+    ],
+    "top_1pct_x_mean_m": 0.07831767089829059,
+    "root_mean_strain_eqv": 0.0019247774772904575,
+    "tip_mean_strain_eqv": 3.887228276751653e-05,
+    "root_max_strain_eqv": 0.0053763957665679376,
+    "tip_max_strain_eqv": 0.00016996080212606116
+  },
+  "ansys_face_groups": {
+    "path": "tmp/parity_exec/default_sample0000/default_sub2_pz1_mesh0p08/meshes/volumes/plate3d_0000_ansys_face_groups.json",
+    "piezo_bottom_expected_region_count": 1,
+    "selection_strategy": "worksheet_by_body_and_z_plane"
+  },
+  "warnings": [],
+  "harmonic_top_surface_strain": {
+    "field_name": "harmonic_top_surface_strain_eqv",
+    "label": "Harmonic Peak Top-Surface Equivalent Strain",
+    "frequency_hz": 0.7235824185030824,
+    "triangle_count": 139608,
+    "max_strain_eqv": 0.022025006998527306,
+    "max_strain_centroid_m": [
+      0.015929308806015285,
+      0.29644309111855666,
+      0.0011
+    ],
+    "top_1pct_x_mean_m": 0.07810341713510145,
+    "root_mean_strain_eqv": 0.007845453532546976,
+    "tip_mean_strain_eqv": 0.0002547808222444441,
+    "root_max_strain_eqv": 0.022025006998527306,
+    "tip_max_strain_eqv": 0.0015616783973230457
+  },
+  "exports": {
+    "top_surface_csv_path": "tmp/parity_validity/historical_default_audit/sample_0000_top_surface_strain.csv",
+    "top_surface_mesh_npz_path": "tmp/parity_validity/historical_default_audit/sample_0000_top_surface_strain_mesh.npz"
+  }
+}

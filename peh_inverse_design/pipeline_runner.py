@@ -47,6 +47,9 @@ class PipelineConfig:
     solver_num_modes: int = 8
     solver_search_points: int = 301
     solver_element_order: int = 2
+    solver_eigensolver_backend: str = "auto"
+    allow_eigensolver_fallback: bool = False
+    strict_parity: bool = False
     solver_store_mode_shapes: bool = False
     skip_existing_solver_outputs: bool = True
     solver_max_q2_vector_dofs: int | None = None
@@ -92,6 +95,12 @@ class PipelineConfig:
             raise ValueError("solver_max_q2_vector_dofs must be strictly positive when provided.")
         if self.solver_oom_fallback_element_order is not None and int(self.solver_oom_fallback_element_order) <= 0:
             raise ValueError("solver_oom_fallback_element_order must be strictly positive when provided.")
+        if str(self.solver_eigensolver_backend).strip().lower() not in {"shift_invert_lu", "iterative_gd", "auto"}:
+            raise ValueError("solver_eigensolver_backend must be 'shift_invert_lu', 'iterative_gd', or 'auto'.")
+        if bool(self.strict_parity) and bool(self.allow_eigensolver_fallback):
+            raise ValueError("allow_eigensolver_fallback cannot be enabled when strict_parity=True.")
+        if bool(self.strict_parity) and str(self.solver_eigensolver_backend).strip().lower() == "iterative_gd":
+            raise ValueError("strict_parity requires solver_eigensolver_backend='shift_invert_lu' or 'auto'.")
         if str(self.audit_ansys_voltage_form).strip().lower() not in {"unknown", "peak", "rms"}:
             raise ValueError("audit_ansys_voltage_form must be one of: unknown, peak, rms.")
 
@@ -379,6 +388,53 @@ def _solver_modal_output_path(modal_dir: Path, sample_id: int) -> Path:
     return modal_dir / f"sample_{int(sample_id):04d}_modal.npz"
 
 
+def _solver_diagnostic_output_path(response_dir: Path, sample_id: int) -> Path:
+    return response_dir / f"sample_{int(sample_id):04d}_solver_diagnostic.json"
+
+
+def _solver_requested_backend(config: PipelineConfig) -> str:
+    backend = str(config.solver_eigensolver_backend).strip().lower()
+    if bool(config.strict_parity) and backend == "auto":
+        return "shift_invert_lu"
+    return backend
+
+
+def _parity_sensitive_solver_run(config: PipelineConfig) -> bool:
+    return bool(config.strict_parity) or str(config.mesh_preset).strip().lower() == "ansys_parity" or _audit_is_requested(config)
+
+
+def _write_pipeline_solver_diagnostic(
+    *,
+    response_dir: Path,
+    mesh_path: Path,
+    config: PipelineConfig,
+    parity_invalid_reason: str,
+    error_message: str,
+    actual_element_order: int | None = None,
+    used_element_order_fallback: bool = False,
+) -> Path:
+    sample_id = _solver_sample_id_from_mesh(mesh_path)
+    payload = {
+        "sample_id": int(sample_id),
+        "mesh_path": str(mesh_path),
+        "eigensolver_backend": _solver_requested_backend(config),
+        "requested_eigensolver_backend": _solver_requested_backend(config),
+        "solver_element_order": int(config.solver_element_order if actual_element_order is None else actual_element_order),
+        "requested_solver_element_order": int(config.solver_element_order),
+        "used_eigensolver_fallback": False,
+        "used_element_order_fallback": bool(used_element_order_fallback),
+        "solver_parity_valid": False,
+        "parity_invalid_reason": str(parity_invalid_reason),
+        "strict_parity_requested": bool(config.strict_parity),
+        "diagnostic_only": bool(used_element_order_fallback or config.allow_eigensolver_fallback),
+        "error_message": str(error_message),
+    }
+    output_path = _solver_diagnostic_output_path(response_dir, sample_id)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    return output_path
+
+
 def _solver_outputs_exist(mesh_path: Path, response_dir: Path, modal_dir: Path) -> bool:
     sample_id = _solver_sample_id_from_mesh(mesh_path)
     return (
@@ -397,7 +453,12 @@ def _build_solver_inner_args(
     mesh_path: Path | None = None,
     mesh_dir: Path | None = None,
     element_order: int | None = None,
+    requested_element_order: int | None = None,
 ) -> list[str]:
+    actual_element_order = int(config.solver_element_order if element_order is None else element_order)
+    requested_solver_element_order = int(
+        config.solver_element_order if requested_element_order is None else requested_element_order
+    )
     solver_args = ["python3", "-m", "peh_inverse_design.fenicsx_modal_solver"]
     if mesh_path is not None:
         solver_args.extend(["--mesh", _workspace_path(mesh_path, project_root)])
@@ -418,9 +479,17 @@ def _build_solver_inner_args(
             "--search-points",
             str(config.solver_search_points),
             "--element-order",
-            str(config.solver_element_order if element_order is None else int(element_order)),
+            str(actual_element_order),
+            "--requested-element-order",
+            str(requested_solver_element_order),
+            "--eigensolver-backend",
+            _solver_requested_backend(config),
         ]
     )
+    if config.allow_eigensolver_fallback:
+        solver_args.append("--allow-eigensolver-fallback")
+    if config.strict_parity:
+        solver_args.append("--strict-parity")
     if config.solver_store_mode_shapes:
         solver_args.append("--store-mode-shapes")
     if config.skip_existing_solver_outputs:
@@ -440,6 +509,7 @@ def _build_solver_docker_command(
     mesh_path: Path | None = None,
     mesh_dir: Path | None = None,
     element_order: int | None = None,
+    requested_element_order: int | None = None,
 ) -> list[str]:
     solver_args = _build_solver_inner_args(
         project_root=project_root,
@@ -450,6 +520,7 @@ def _build_solver_docker_command(
         mesh_path=mesh_path,
         mesh_dir=mesh_dir,
         element_order=element_order,
+        requested_element_order=requested_element_order,
     )
     solver_inner = " ".join(shlex.quote(str(arg)) for arg in solver_args)
     return [
@@ -476,6 +547,7 @@ def _run_solver_with_isolated_retry(
     config: PipelineConfig,
     runtime_problem_spec_path: Path | None,
 ) -> None:
+    parity_sensitive = _parity_sensitive_solver_run(config)
     batch_cmd = _build_solver_docker_command(
         project_root=project_root,
         response_dir=response_dir,
@@ -519,6 +591,7 @@ def _run_solver_with_isolated_retry(
                 mesh_exc.returncode == 137
                 and fallback_order is not None
                 and int(fallback_order) < int(config.solver_element_order)
+                and not parity_sensitive
             ):
                 print(
                     f"{mesh_path.name} hit Docker exit 137 with element_order={config.solver_element_order}. "
@@ -534,12 +607,33 @@ def _run_solver_with_isolated_retry(
                             runtime_problem_spec_path=runtime_problem_spec_path,
                             mesh_path=mesh_path,
                             element_order=int(fallback_order),
+                            requested_element_order=int(config.solver_element_order),
                         ),
                         cwd=project_root,
                     )
                     continue
                 except subprocess.CalledProcessError as fallback_exc:
                     mesh_exc = fallback_exc
+            if mesh_exc.returncode == 137 and parity_sensitive:
+                diagnostic_path = _write_pipeline_solver_diagnostic(
+                    response_dir=response_dir,
+                    mesh_path=mesh_path,
+                    config=config,
+                    parity_invalid_reason=(
+                        "docker exit 137 occurred, and parity-sensitive runs are not allowed to downgrade element order"
+                    ),
+                    error_message=(
+                        f"Solver container exited with status 137 for {mesh_path.name} at element_order="
+                        f"{config.solver_element_order}."
+                    ),
+                    actual_element_order=int(config.solver_element_order),
+                    used_element_order_fallback=False,
+                )
+                raise RuntimeError(
+                    f"Isolated solver retry failed for {mesh_path.name} with exit status 137. "
+                    "This run is parity-invalid because element-order fallback is disabled for strict/audit/ansys_parity runs. "
+                    f"Diagnostic payload: {diagnostic_path}"
+                ) from mesh_exc
             raise RuntimeError(
                 f"Isolated solver retry failed for {mesh_path.name} with exit status {mesh_exc.returncode}. "
                 "If this persists, reduce the number of samples per run, lower solver_max_q2_vector_dofs, "
@@ -828,7 +922,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"backend={config.solver_mesh_backend}, mesh_preset={effective_mesh['mesh_preset']}, "
         f"layers={effective_mesh['substrate_layers']}+{effective_mesh['piezo_layers']}, "
         f"modes={config.solver_num_modes}, search_points={config.solver_search_points}, "
-        f"element_order={config.solver_element_order}, skip_existing={config.skip_existing_solver_outputs}, "
+        f"element_order={config.solver_element_order}, eigensolver_backend={_solver_requested_backend(config)}, "
+        f"allow_eigensolver_fallback={config.allow_eigensolver_fallback}, strict_parity={config.strict_parity}, "
+        f"skip_existing={config.skip_existing_solver_outputs}, "
         f"mesh_size_scale={config.mesh_size_scale:.6g}, cad_reference_scale={config.cad_reference_size_scale:.6g}, "
         f"max_q2_vector_dofs={effective_mesh['solver_max_q2_vector_dofs']}, "
         f"oom_fallback_order={config.solver_oom_fallback_element_order}, "
@@ -1052,6 +1148,22 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--solver-search-points", type=int, default=301, help="Coarse FRF search points used before local peak refinement.")
     parser.add_argument("--solver-element-order", type=int, default=2, help="Solid displacement interpolation order for the in-house modal solver.")
     parser.add_argument(
+        "--solver-eigensolver-backend",
+        default="auto",
+        choices=["shift_invert_lu", "iterative_gd", "auto"],
+        help="Eigensolver backend forwarded to fenicsx_modal_solver.",
+    )
+    parser.add_argument(
+        "--allow-eigensolver-fallback",
+        action="store_true",
+        help="Allow automatic shift_invert_lu -> iterative_gd fallback for diagnostic-only solver runs.",
+    )
+    parser.add_argument(
+        "--strict-parity",
+        action="store_true",
+        help="Disable solver fallbacks that break apples-to-apples parity and forward strict parity to the solver.",
+    )
+    parser.add_argument(
         "--solver-max-q2-vector-dofs",
         type=int,
         default=None,
@@ -1129,6 +1241,9 @@ def main() -> None:
         solver_num_modes=int(args.solver_num_modes),
         solver_search_points=int(args.solver_search_points),
         solver_element_order=int(args.solver_element_order),
+        solver_eigensolver_backend=str(args.solver_eigensolver_backend),
+        allow_eigensolver_fallback=bool(args.allow_eigensolver_fallback),
+        strict_parity=bool(args.strict_parity),
         solver_max_q2_vector_dofs=args.solver_max_q2_vector_dofs,
         solver_oom_fallback_element_order=(
             None if int(args.solver_oom_fallback_element_order) <= 0 else int(args.solver_oom_fallback_element_order)

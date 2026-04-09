@@ -78,6 +78,37 @@ class SolverParityError(RuntimeError):
         self.diagnostic_payload = diagnostic_payload or {}
 
 
+def _exception_chain_messages(exc: BaseException) -> list[str]:
+    messages: list[str] = []
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        text = str(current).strip()
+        if text:
+            messages.append(text)
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return messages
+
+
+def _root_exception_message(exc: BaseException) -> str:
+    messages = _exception_chain_messages(exc)
+    if not messages:
+        return ""
+    for raw_message in reversed(messages):
+        lines = [line.strip() for line in str(raw_message).splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    return ""
+
+
+def _format_exception_chain(exc: BaseException) -> str:
+    messages = _exception_chain_messages(exc)
+    if not messages:
+        return str(exc)
+    return "\n\nCaused by:\n".join(messages)
+
+
 def _extract_sample_id(mesh_path: Path) -> int:
     matches = re.findall(r"(\d+)", mesh_path.stem)
     if not matches:
@@ -462,6 +493,18 @@ def _is_mumps_factorization_failure(exc: Exception) -> bool:
     return False
 
 
+def _apply_shift_invert_lu_mumps_defaults(*, PETSc, options_prefix: str | None) -> None:
+    prefix = "" if options_prefix is None else str(options_prefix)
+    options = PETSc.Options()
+    default_values = {
+        f"{prefix}mat_mumps_icntl_14": "120",
+        f"{prefix}mat_mumps_icntl_22": "1",
+    }
+    for key, value in default_values.items():
+        if not options.hasName(key):
+            options.setValue(key, value)
+
+
 def _build_eps_solver(
     *,
     comm,
@@ -489,6 +532,10 @@ def _build_eps_solver(
         pc = ksp.getPC()
         pc.setType(PETSc.PC.Type.LU)
         pc.setFactorSolverType("mumps")
+        _apply_shift_invert_lu_mumps_defaults(
+            PETSc=PETSc,
+            options_prefix=pc.getOptionsPrefix(),
+        )
         eps_solver.setFromOptions()
         return eps_solver, "shift_invert_lu"
 
@@ -726,6 +773,8 @@ def _assemble_modal_model(
         except Exception as exc:
             if initial_backend != "shift_invert_lu" or not _is_mumps_factorization_failure(exc):
                 raise
+            detailed_error_message = _format_exception_chain(exc)
+            root_error_message = _root_exception_message(exc)
             reason = (
                 "strict parity requested, but shift_invert_lu failed and automatic eigensolver fallback is disallowed"
                 if strict_parity
@@ -737,7 +786,8 @@ def _assemble_modal_model(
                     diagnostic_payload={
                         "sample_id": int(sample_id),
                         "mesh_path": str(mesh_path),
-                        "error_message": str(exc),
+                        "error_message": str(detailed_error_message),
+                        "error_root_cause": str(root_error_message),
                         "eigensolver_backend": "shift_invert_lu",
                         "requested_eigensolver_backend": str(requested_backend),
                         "solver_element_order": int(element_order),
@@ -773,7 +823,8 @@ def _assemble_modal_model(
                     diagnostic_payload={
                         "sample_id": int(sample_id),
                         "mesh_path": str(mesh_path),
-                        "error_message": str(fallback_exc),
+                        "error_message": str(_format_exception_chain(fallback_exc)),
+                        "error_root_cause": str(_root_exception_message(fallback_exc)),
                         "eigensolver_backend": "iterative_gd",
                         "requested_eigensolver_backend": str(requested_backend),
                         "solver_element_order": int(element_order),

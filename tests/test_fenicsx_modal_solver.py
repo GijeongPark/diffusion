@@ -7,14 +7,93 @@ import numpy as np
 from peh_inverse_design.fenicsx_modal_solver import (
     MechanicalConfig,
     PiezoConfig,
+    _apply_shift_invert_lu_mumps_defaults,
     _build_modal_save_payload,
     _compute_top_surface_cellwise_strain,
+    _format_exception_chain,
     _remap_raw_cell_tags_to_created_mesh,
     _resolve_peak_search_seed,
+    _root_exception_message,
 )
 
 
 class FenicsxModalSolverTests(unittest.TestCase):
+    def test_apply_shift_invert_lu_mumps_defaults_uses_prefixed_option_names(self) -> None:
+        class FakeOptions:
+            def __init__(self) -> None:
+                self.values: dict[str, str] = {}
+
+            def hasName(self, key: str) -> bool:
+                return key in self.values
+
+            def setValue(self, key: str, value: str) -> None:
+                self.values[key] = str(value)
+
+        class FakePETSc:
+            def __init__(self) -> None:
+                self.options = FakeOptions()
+
+            def Options(self) -> FakeOptions:
+                return self.options
+
+        fake_petsc = FakePETSc()
+
+        _apply_shift_invert_lu_mumps_defaults(
+            PETSc=fake_petsc,
+            options_prefix="st_",
+        )
+
+        self.assertEqual(fake_petsc.options.values["st_mat_mumps_icntl_14"], "120")
+        self.assertEqual(fake_petsc.options.values["st_mat_mumps_icntl_22"], "1")
+
+    def test_apply_shift_invert_lu_mumps_defaults_keeps_explicit_overrides(self) -> None:
+        class FakeOptions:
+            def __init__(self) -> None:
+                self.values = {"st_mat_mumps_icntl_14": "80"}
+
+            def hasName(self, key: str) -> bool:
+                return key in self.values
+
+            def setValue(self, key: str, value: str) -> None:
+                self.values[key] = str(value)
+
+        class FakePETSc:
+            def __init__(self) -> None:
+                self.options = FakeOptions()
+
+            def Options(self) -> FakeOptions:
+                return self.options
+
+        fake_petsc = FakePETSc()
+
+        _apply_shift_invert_lu_mumps_defaults(
+            PETSc=fake_petsc,
+            options_prefix="st_",
+        )
+
+        self.assertEqual(fake_petsc.options.values["st_mat_mumps_icntl_14"], "80")
+        self.assertEqual(fake_petsc.options.values["st_mat_mumps_icntl_22"], "1")
+
+    def test_root_exception_message_uses_deepest_nonempty_line(self) -> None:
+        root = RuntimeError("header\nMUMPS error in numerical factorization: INFOG(1)=-13")
+        exc = SystemError("wrapper")
+        exc.__cause__ = root
+
+        self.assertEqual(
+            _root_exception_message(exc),
+            "MUMPS error in numerical factorization: INFOG(1)=-13",
+        )
+
+    def test_format_exception_chain_keeps_nested_context(self) -> None:
+        root = RuntimeError("deep cause")
+        exc = SystemError("outer wrapper")
+        exc.__cause__ = root
+
+        self.assertEqual(
+            _format_exception_chain(exc),
+            "outer wrapper\n\nCaused by:\ndeep cause",
+        )
+
     def test_remap_raw_cell_tags_matches_created_mesh_after_point_reordering(self) -> None:
         raw_tetra_cells = np.asarray([[0, 1, 2, 3]], dtype=np.int64)
         raw_tetra_tags = np.asarray([12], dtype=np.int32)

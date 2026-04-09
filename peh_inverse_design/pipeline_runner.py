@@ -526,6 +526,11 @@ def _solver_runtime_error_from_diagnostic(
         payload = {}
 
     reason = str(payload.get("parity_invalid_reason", "")).strip() or str(payload.get("error_message", "")).strip()
+    root_cause = str(payload.get("error_root_cause", "")).strip()
+    if reason and root_cause and root_cause not in reason:
+        reason = f"{reason} Root cause: {root_cause}"
+    elif not reason and root_cause:
+        reason = root_cause
     if not reason:
         reason = f"solver container exited with status {exc.returncode}"
     strict_requested = bool(payload.get("strict_parity_requested", False))

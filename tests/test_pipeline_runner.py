@@ -13,6 +13,7 @@ from peh_inverse_design.pipeline_runner import (
     _build_mesh_command,
     _cli_parser,
     _run_solver_with_isolated_retry,
+    _solver_runtime_error_from_diagnostic,
     apply_strict_ansys_parity_overrides_to_config,
 )
 
@@ -159,6 +160,34 @@ class PipelineRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(args[args.index("--peak-search-seed") + 1], "dominant_coupling")
+
+    def test_solver_runtime_error_uses_root_cause_from_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response_dir = Path(tmpdir)
+            mesh_path = response_dir / "plate3d_0000_fenicsx.npz"
+            mesh_path.write_text("", encoding="utf-8")
+            diagnostic_path = response_dir / "sample_0000_solver_diagnostic.json"
+            diagnostic_path.write_text(
+                '{\n'
+                '  "strict_parity_requested": true,\n'
+                '  "eigensolver_backend": "shift_invert_lu",\n'
+                '  "used_eigensolver_fallback": false,\n'
+                '  "used_element_order_fallback": false,\n'
+                '  "diagnostic_only": false,\n'
+                '  "parity_invalid_reason": "strict parity requested, but shift_invert_lu failed and automatic eigensolver fallback is disallowed",\n'
+                '  "error_root_cause": "MUMPS error in numerical factorization: INFOG(1)=-13"\n'
+                '}\n',
+                encoding="utf-8",
+            )
+
+            error = _solver_runtime_error_from_diagnostic(
+                response_dir=response_dir,
+                mesh_path=mesh_path,
+                exc=subprocess.CalledProcessError(1, ["docker", "run"]),
+            )
+
+        self.assertIsNotNone(error)
+        self.assertIn("Root cause: MUMPS error in numerical factorization: INFOG(1)=-13", str(error))
 
     def test_isolated_retry_falls_back_to_lower_order_after_oom(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

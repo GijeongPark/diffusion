@@ -186,4 +186,14 @@ def load_modal_diagnostics(data: Mapping[str, Any]) -> dict[str, Any]:
         "suspect_mode_ordering",
         default=bool(np.asarray(diagnostics["suspect_mode_ordering"]).reshape(-1)[0]),
     )
+    diagnostics["frf_search_seed_source"] = npz_string_scalar(
+        data,
+        "frf_search_seed_source",
+        default="",
+    )
+    diagnostics["frf_search_seed_frequency_hz"] = npz_float_scalar(
+        data,
+        "frf_search_seed_frequency_hz",
+        default=float("nan"),
+    )
     return diagnostics

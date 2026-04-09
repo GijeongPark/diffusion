@@ -159,6 +159,8 @@ def aggregate_response_directory(
                 diagnostics["dominant_drive_coupling_mode_frequency_hz"]
             ),
             "suspect_mode_ordering": bool(diagnostics["suspect_mode_ordering"]),
+            "frf_search_seed_source": str(diagnostics.get("frf_search_seed_source", "")),
+            "frf_search_seed_frequency_hz": float(diagnostics.get("frf_search_seed_frequency_hz", np.nan)),
         }
 
     if n_freq is None:
@@ -201,6 +203,8 @@ def aggregate_response_directory(
     dominant_drive_coupling_mode_index = np.full(n_samples, -1, dtype=np.int32)
     dominant_drive_coupling_mode_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
     suspect_mode_ordering = np.zeros(n_samples, dtype=np.int32)
+    frf_search_seed_source = np.full(n_samples, "", dtype="<U32")
+    frf_search_seed_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
 
     for idx, sample_id in enumerate(sample_ids):
         record = loaded.get(int(sample_id))
@@ -241,6 +245,8 @@ def aggregate_response_directory(
         dominant_drive_coupling_mode_index[idx] = int(record["dominant_drive_coupling_mode_index"])
         dominant_drive_coupling_mode_frequency_hz[idx] = float(record["dominant_drive_coupling_mode_frequency_hz"])
         suspect_mode_ordering[idx] = int(bool(record["suspect_mode_ordering"]))
+        frf_search_seed_source[idx] = str(record["frf_search_seed_source"])
+        frf_search_seed_frequency_hz[idx] = float(record["frf_search_seed_frequency_hz"])
 
     response_dataset = {
         "sample_id": np.asarray(sample_ids, dtype=np.int32),
@@ -270,6 +276,8 @@ def aggregate_response_directory(
         "dominant_drive_coupling_mode_index": dominant_drive_coupling_mode_index,
         "dominant_drive_coupling_mode_frequency_hz": dominant_drive_coupling_mode_frequency_hz,
         "suspect_mode_ordering": suspect_mode_ordering,
+        "frf_search_seed_source": frf_search_seed_source,
+        "frf_search_seed_frequency_hz": frf_search_seed_frequency_hz,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_path, **response_dataset)

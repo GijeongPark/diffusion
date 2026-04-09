@@ -103,6 +103,8 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
                 diagnostics["dominant_drive_coupling_mode_frequency_hz"]
             ),
             "suspect_mode_ordering": bool(diagnostics["suspect_mode_ordering"]),
+            "frf_search_seed_source": str(diagnostics.get("frf_search_seed_source", "")),
+            "frf_search_seed_frequency_hz": float(diagnostics.get("frf_search_seed_frequency_hz", np.nan)),
             "path": str(path),
         }
     return records, n_freq
@@ -301,6 +303,8 @@ def build_integrated_dataset(
     dominant_drive_coupling_mode_index = np.full(n_samples, -1, dtype=np.int32)
     dominant_drive_coupling_mode_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
     suspect_mode_ordering = np.zeros(n_samples, dtype=np.int32)
+    frf_search_seed_source = np.full(n_samples, "", dtype="<U32")
+    frf_search_seed_frequency_hz = np.full(n_samples, np.nan, dtype=np.float64)
     if n_freq > 0:
         freq_hz = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
         freq_ratio = np.full((n_samples, n_freq), np.nan, dtype=np.float64)
@@ -349,6 +353,8 @@ def build_integrated_dataset(
         dominant_drive_coupling_mode_index[idx] = int(record["dominant_drive_coupling_mode_index"])
         dominant_drive_coupling_mode_frequency_hz[idx] = float(record["dominant_drive_coupling_mode_frequency_hz"])
         suspect_mode_ordering[idx] = int(bool(record["suspect_mode_ordering"]))
+        frf_search_seed_source[idx] = str(record["frf_search_seed_source"])
+        frf_search_seed_frequency_hz[idx] = float(record["frf_search_seed_frequency_hz"])
 
     integrated["response_ok"] = response_ok
     integrated["f_peak_hz"] = f_peak_hz
@@ -378,6 +384,8 @@ def build_integrated_dataset(
     integrated["dominant_drive_coupling_mode_index"] = dominant_drive_coupling_mode_index
     integrated["dominant_drive_coupling_mode_frequency_hz"] = dominant_drive_coupling_mode_frequency_hz
     integrated["suspect_mode_ordering"] = suspect_mode_ordering
+    integrated["frf_search_seed_source"] = frf_search_seed_source
+    integrated["frf_search_seed_frequency_hz"] = frf_search_seed_frequency_hz
 
     modal_ok = np.zeros(n_samples, dtype=np.int32)
     modal_npz_path = np.full(n_samples, "", dtype=object)
@@ -486,6 +494,12 @@ def build_integrated_dataset(
                 modal_diagnostics["dominant_drive_coupling_mode_frequency_hz"]
             )
             suspect_mode_ordering[idx] = int(bool(modal_diagnostics["suspect_mode_ordering"]))
+        if frf_search_seed_source[idx] == "":
+            frf_search_seed_source[idx] = str(modal_diagnostics.get("frf_search_seed_source", ""))
+        if not np.isfinite(frf_search_seed_frequency_hz[idx]):
+            frf_search_seed_frequency_hz[idx] = float(
+                modal_diagnostics.get("frf_search_seed_frequency_hz", np.nan)
+            )
         if eigenfreq_hz is not None and "eigenfreq_hz" in modal:
             _assign_padded(eigenfreq_hz, idx, np.asarray(modal["eigenfreq_hz"], dtype=np.float64))
         if modal_force is not None and "modal_force" in modal:
@@ -601,6 +615,10 @@ def build_integrated_dataset(
                     else f"{float(dominant_drive_coupling_mode_frequency_hz[idx]):.12g}"
                 ),
                 "suspect_mode_ordering": str(bool(suspect_mode_ordering[idx])),
+                "frf_search_seed_source": str(frf_search_seed_source[idx]),
+                "frf_search_seed_frequency_hz": (
+                    "" if np.isnan(frf_search_seed_frequency_hz[idx]) else f"{float(frf_search_seed_frequency_hz[idx]):.12g}"
+                ),
                 "max_top_surface_strain": (
                     "" if np.isnan(max_top_surface_strain[idx]) else f"{float(max_top_surface_strain[idx]):.12g}"
                 ),
@@ -648,6 +666,8 @@ def build_integrated_dataset(
                 "dominant_drive_coupling_mode_index",
                 "dominant_drive_coupling_mode_frequency_hz",
                 "suspect_mode_ordering",
+                "frf_search_seed_source",
+                "frf_search_seed_frequency_hz",
                 "max_top_surface_strain",
                 "mesh_preset",
                 "substrate_layers",

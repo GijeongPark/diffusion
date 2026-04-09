@@ -10,6 +10,7 @@ from peh_inverse_design.fenicsx_modal_solver import (
     _build_modal_save_payload,
     _compute_top_surface_cellwise_strain,
     _remap_raw_cell_tags_to_created_mesh,
+    _resolve_peak_search_seed,
 )
 
 
@@ -108,15 +109,51 @@ class FenicsxModalSolverTests(unittest.TestCase):
             mode1_top_surface_strain_eqv=np.asarray([10.0, 20.0], dtype=np.float64),
             harmonic_top_surface_strain_eqv=np.asarray([30.0, 40.0], dtype=np.float64),
             harmonic_field_frequency_hz=1.2,
+            frf_search_seed_source="dominant_coupling",
+            frf_search_seed_frequency_hz=3.5,
         )
 
         self.assertIn("mode1_frequency_hz", payload)
         self.assertIn("mode1_top_surface_strain_eqv", payload)
         self.assertIn("harmonic_field_frequency_hz", payload)
         self.assertIn("harmonic_top_surface_strain_eqv", payload)
+        self.assertIn("frf_search_seed_source", payload)
+        self.assertIn("frf_search_seed_frequency_hz", payload)
         np.testing.assert_array_equal(payload["top_surface_strain_eqv"], np.asarray([30.0, 40.0], dtype=np.float64))
         self.assertEqual(float(payload["mode1_frequency_hz"]), 1.25)
         self.assertEqual(float(payload["harmonic_field_frequency_hz"]), 1.2)
+        self.assertEqual(str(np.asarray(payload["frf_search_seed_source"]).reshape(-1)[0]), "dominant_coupling")
+        self.assertEqual(float(np.asarray(payload["frf_search_seed_frequency_hz"]).reshape(-1)[0]), 3.5)
+
+    def test_resolve_peak_search_seed_prefers_dominant_coupling_for_auto(self) -> None:
+        modal_model = {
+            "eigenfreq_hz": np.asarray([0.7, 1.5, 3.7], dtype=np.float64),
+            "dominant_drive_coupling_mode_frequency_hz": np.asarray([3.7], dtype=np.float64),
+            "suspect_mode_ordering": np.asarray([True], dtype=np.bool_),
+        }
+
+        source, frequency_hz = _resolve_peak_search_seed(
+            modal_model=modal_model,
+            peak_search_seed="auto",
+        )
+
+        self.assertEqual(source, "dominant_coupling")
+        self.assertEqual(frequency_hz, 3.7)
+
+    def test_resolve_peak_search_seed_uses_f1_when_requested(self) -> None:
+        modal_model = {
+            "eigenfreq_hz": np.asarray([0.7, 1.5, 3.7], dtype=np.float64),
+            "dominant_drive_coupling_mode_frequency_hz": np.asarray([3.7], dtype=np.float64),
+            "suspect_mode_ordering": np.asarray([True], dtype=np.bool_),
+        }
+
+        source, frequency_hz = _resolve_peak_search_seed(
+            modal_model=modal_model,
+            peak_search_seed="f1",
+        )
+
+        self.assertEqual(source, "f1")
+        self.assertEqual(frequency_hz, 0.7)
 
     def test_top_surface_cellwise_strain_is_root_dominant_for_cantilever_like_mode(self) -> None:
         x_nodes = np.linspace(0.0, 1.0, 5, dtype=np.float64)

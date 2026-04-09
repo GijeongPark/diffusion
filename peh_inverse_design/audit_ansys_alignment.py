@@ -224,7 +224,7 @@ def audit_run_sample(
     ansys_modal_hz: float | None = None,
     ansys_frf_peak_hz: float | None = None,
     ansys_voltage_v: float | None = None,
-    ansys_voltage_form: str = "unknown",
+    ansys_voltage_form: str = "peak",
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     sample_id = int(sample_id)
@@ -448,6 +448,11 @@ def audit_run_sample(
             "total_thickness_m": float(handoff["geometry"]["total_thickness_m"]),
         },
         "effective_problem_defaults": runtime_defaults,
+        "runtime_inputs": {
+            "base_excitation_amplitude_m_per_s2": float(runtime_defaults.get("base_acceleration_m_per_s2", np.nan)),
+            "modal_damping_ratio": float(runtime_defaults.get("damping_ratio", np.nan)),
+            "external_load_resistance_ohm": float(runtime_defaults.get("resistance_ohm", np.nan)),
+        },
         "frequency_comparison": {
             "ansys_modal_target_hz": (
                 float(ansys_modal_reference_hz)
@@ -499,6 +504,8 @@ def audit_run_sample(
                 modal_diagnostics["dominant_drive_coupling_mode_frequency_hz"]
             ),
             "suspect_mode_ordering": bool(modal_diagnostics["suspect_mode_ordering"]),
+            "frf_search_seed_source": str(modal_diagnostics.get("frf_search_seed_source", "")),
+            "frf_search_seed_frequency_hz": float(modal_diagnostics.get("frf_search_seed_frequency_hz", np.nan)),
         },
         "mesh_materials": mesh_materials,
         "top_surface_strain": top_surface_strain,
@@ -543,6 +550,7 @@ def _print_summary(summary: dict[str, Any]) -> None:
     voltage_comparison = summary["voltage_comparison"]
     solver_provenance = summary.get("solver_provenance", {})
     modal_diagnostics = summary.get("modal_diagnostics", {})
+    runtime_inputs = summary.get("runtime_inputs", {})
     print(f"run_dir: {summary['run_dir']}")
     print(f"sample_id: {summary['sample_id']}")
     if solver_provenance:
@@ -567,6 +575,13 @@ def _print_summary(summary: dict[str, Any]) -> None:
         f"substrate_thickness={summary['geometry']['substrate_thickness_m']:.6g} m, "
         f"piezo_thickness={summary['geometry']['piezo_thickness_m']:.6g} m"
     )
+    if runtime_inputs:
+        print(
+            "runtime_inputs: "
+            f"base_excitation_amplitude_m_per_s2={float(runtime_inputs.get('base_excitation_amplitude_m_per_s2', np.nan)):.12g}, "
+            f"modal_damping_ratio={float(runtime_inputs.get('modal_damping_ratio', np.nan)):.12g}, "
+            f"external_load_resistance_ohm={float(runtime_inputs.get('external_load_resistance_ohm', np.nan)):.12g}"
+        )
     print(
         "frequency_comparison: "
         f"mode1_frequency_hz={frequency_comparison['mode1_frequency_hz']:.12g}, "
@@ -628,7 +643,9 @@ def _print_summary(summary: dict[str, Any]) -> None:
             "modal_diagnostics: "
             f"dominant_drive_coupling_mode_index={modal_diagnostics.get('dominant_drive_coupling_mode_index', -1)}, "
             f"dominant_drive_coupling_mode_frequency_hz={float(modal_diagnostics.get('dominant_drive_coupling_mode_frequency_hz', np.nan)):.12g}, "
-            f"suspect_mode_ordering={bool(modal_diagnostics.get('suspect_mode_ordering', False))}"
+            f"suspect_mode_ordering={bool(modal_diagnostics.get('suspect_mode_ordering', False))}, "
+            f"frf_search_seed_source={modal_diagnostics.get('frf_search_seed_source', '')}, "
+            f"frf_search_seed_frequency_hz={float(modal_diagnostics.get('frf_search_seed_frequency_hz', np.nan)):.12g}"
         )
     print(
         "mesh_materials: "
@@ -684,9 +701,9 @@ def main() -> None:
     parser.add_argument("--ansys-voltage-v", type=float, default=None, help="Optional ANSYS voltage reference value.")
     parser.add_argument(
         "--ansys-voltage-form",
-        default="unknown",
+        default="peak",
         choices=["unknown", "peak", "rms"],
-        help="Interpretation of --ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+        help="Interpretation of --ansys-voltage-v. Defaults to 'peak'; use 'unknown' only to compare both peak and RMS.",
     )
     args = parser.parse_args()
 

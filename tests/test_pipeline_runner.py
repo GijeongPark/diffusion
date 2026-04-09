@@ -8,7 +8,9 @@ from unittest import mock
 
 from peh_inverse_design.pipeline_runner import (
     PipelineConfig,
+    _apply_strict_ansys_parity_overrides,
     _build_mesh_command,
+    _cli_parser,
     _run_solver_with_isolated_retry,
 )
 
@@ -58,6 +60,60 @@ class PipelineRunnerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--substrate-layers") + 1], "6")
         self.assertEqual(cmd[cmd.index("--piezo-layers") + 1], "2")
         self.assertEqual(cmd[cmd.index("--solver-max-q2-vector-dofs") + 1], "4000000")
+
+    def test_pipeline_config_defaults_to_peak_audit_voltage_form(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+        )
+
+        self.assertEqual(config.audit_ansys_voltage_form, "peak")
+
+    def test_strict_ansys_parity_overrides_pipeline_args(self) -> None:
+        parser = _cli_parser()
+        args = parser.parse_args(
+            [
+                "--unit-cell-npz",
+                "dummy.npz",
+                "--strict-ansys-parity",
+                "--mesh-preset",
+                "default",
+                "--solver-eigensolver-backend",
+                "auto",
+                "--allow-eigensolver-fallback",
+            ]
+        )
+
+        updated = _apply_strict_ansys_parity_overrides(
+            args,
+            explicit_audit_voltage_form=False,
+        )
+
+        self.assertEqual(updated.mesh_preset, "ansys_parity")
+        self.assertTrue(updated.strict_parity)
+        self.assertEqual(updated.solver_eigensolver_backend, "shift_invert_lu")
+        self.assertFalse(updated.allow_eigensolver_fallback)
+        self.assertEqual(updated.audit_ansys_voltage_form, "peak")
+
+    def test_strict_ansys_parity_keeps_explicit_audit_voltage_override(self) -> None:
+        parser = _cli_parser()
+        args = parser.parse_args(
+            [
+                "--unit-cell-npz",
+                "dummy.npz",
+                "--strict-ansys-parity",
+                "--audit-ansys-voltage-form",
+                "rms",
+            ]
+        )
+
+        updated = _apply_strict_ansys_parity_overrides(
+            args,
+            explicit_audit_voltage_form=True,
+        )
+
+        self.assertEqual(updated.audit_ansys_voltage_form, "rms")
 
     def test_isolated_retry_falls_back_to_lower_order_after_oom(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

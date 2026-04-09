@@ -315,6 +315,89 @@ class AuditAnsysAlignmentTests(unittest.TestCase):
             self.assertAlmostEqual(summary["voltage_comparison"]["error_percent_assuming_ansys_rms"], 0.0, places=9)
             self.assertGreater(abs(summary["voltage_comparison"]["error_percent_assuming_ansys_peak"]), 40.0)
 
+    def test_audit_defaults_to_peak_voltage_form(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "runs" / "demo"
+            mesh_dir = run_dir / "meshes" / "volumes"
+            response_dir = run_dir / "data" / "fem_responses"
+            modal_dir = run_dir / "data" / "modal_data"
+            mesh_dir.mkdir(parents=True, exist_ok=True)
+            response_dir.mkdir(parents=True, exist_ok=True)
+            modal_dir.mkdir(parents=True, exist_ok=True)
+
+            (run_dir / "data" / "problem_spec_used.yaml").write_text(
+                "\n".join(
+                    [
+                        "geometry:",
+                        "  substrate_thickness_m: 0.001",
+                        "  piezo_patch_thickness_m: 0.0001",
+                        "mechanics:",
+                        "  damping:",
+                        "    modal_damping_ratio: 0.025",
+                        "  base_excitation:",
+                        "    amplitude_m_per_s2: 2.5",
+                        "electrical:",
+                        "  external_load_resistance_ohm: 10000.0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            np.savez_compressed(
+                mesh_dir / "plate3d_0000_fenicsx.npz",
+                points=np.asarray(
+                    [
+                        [0.0, 0.0, 0.0011],
+                        [1.0, 0.0, 0.0011],
+                        [1.0, 1.0, 0.0011],
+                        [0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float64,
+                ),
+                tetra_cells=np.asarray([[3, 0, 1, 2]], dtype=np.int64),
+                tetra_tags=np.asarray([12], dtype=np.int32),
+                triangle_cells=np.asarray([[0, 1, 2]], dtype=np.int32),
+                triangle_tags=np.asarray([105], dtype=np.int32),
+            )
+            np.savez_compressed(
+                response_dir / "sample_0000_response.npz",
+                sample_id=np.asarray(0, dtype=np.int32),
+                f_peak_hz=np.asarray(0.5, dtype=np.float64),
+                freq_hz=np.asarray([0.45, 0.5, 0.55], dtype=np.float64),
+                voltage_mag=np.asarray([1.0, 2.0, 1.5], dtype=np.float64),
+                quality_flag=np.asarray(1, dtype=np.int32),
+            )
+            np.savez_compressed(
+                modal_dir / "sample_0000_modal.npz",
+                sample_id=np.asarray(0, dtype=np.int32),
+                eigenfreq_hz=np.asarray([0.48], dtype=np.float64),
+                mode1_frequency_hz=np.asarray(0.48, dtype=np.float64),
+                harmonic_field_frequency_hz=np.asarray(0.5, dtype=np.float64),
+                top_surface_strain_eqv=np.asarray([12.0], dtype=np.float64),
+            )
+            (mesh_dir / "plate3d_0000_ansys_workbench.json").write_text(
+                json.dumps(
+                    {
+                        "geometry": {
+                            "plate_size_m": [1.0, 1.0],
+                            "substrate_thickness_m": 0.001,
+                            "piezo_thickness_m": 0.0001,
+                            "total_thickness_m": 0.0011,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = audit_run_sample(
+                run_dir=run_dir,
+                sample_id=0,
+                ansys_voltage_v=2.0,
+            )
+
+            self.assertEqual(summary["voltage_comparison"]["ansys_voltage_form"], "peak")
+            self.assertAlmostEqual(summary["voltage_comparison"]["selected_voltage_error_percent"], 0.0, places=9)
+            self.assertFalse(summary["voltage_comparison"]["voltage_convention_mismatch_likely"])
+
 
 if __name__ == "__main__":
     unittest.main()

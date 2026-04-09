@@ -523,6 +523,13 @@ def _normalize_eigensolver_backend(
     return normalized_backend
 
 
+def _normalize_peak_search_seed(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"auto", "f1", "dominant_coupling"}:
+        raise ValueError("peak_search_seed must be one of: auto, f1, dominant_coupling.")
+    return normalized
+
+
 def _successful_solver_parity_state(
     *,
     requested_backend: str,
@@ -916,17 +923,45 @@ def _assemble_modal_model(
 
 
 def _build_peak_search_grid(
-    f1_hz: float,
+    seed_frequency_hz: float,
     lower_factor: float,
     upper_factor: float,
     search_points: int,
 ) -> np.ndarray:
-    f_min = max(1.0e-9, float(lower_factor) * float(f1_hz))
-    f_max = float(upper_factor) * float(f1_hz)
-    f_max = max(f_max, 1.05 * float(f1_hz))
+    f_min = max(1.0e-9, float(lower_factor) * float(seed_frequency_hz))
+    f_max = float(upper_factor) * float(seed_frequency_hz)
+    f_max = max(f_max, 1.05 * float(seed_frequency_hz))
     if f_max <= f_min:
-        f_max = max(1.10 * float(f1_hz), 1.05 * f_min)
+        f_max = max(1.10 * float(seed_frequency_hz), 1.05 * f_min)
     return np.linspace(f_min, f_max, int(search_points), dtype=np.float64)
+
+
+def _resolve_peak_search_seed(
+    *,
+    modal_model: dict[str, np.ndarray],
+    peak_search_seed: str,
+) -> tuple[str, float]:
+    freq_n = np.sort(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1))
+    if freq_n.size == 0:
+        raise ValueError("modal_model does not contain any eigenfrequencies.")
+    f1_hz = float(freq_n[0])
+    dominant_frequency_hz = float(
+        np.asarray(modal_model.get("dominant_drive_coupling_mode_frequency_hz", [np.nan]), dtype=np.float64).reshape(-1)[0]
+    )
+    suspect_mode_ordering = bool(np.asarray(modal_model.get("suspect_mode_ordering", [False])).reshape(-1)[0])
+    normalized_seed = _normalize_peak_search_seed(peak_search_seed)
+
+    if normalized_seed == "f1":
+        return ("f1", f1_hz)
+    if normalized_seed == "dominant_coupling":
+        if np.isfinite(dominant_frequency_hz) and dominant_frequency_hz > 0.0:
+            return ("dominant_coupling", dominant_frequency_hz)
+        return ("f1", f1_hz)
+    if np.isfinite(dominant_frequency_hz) and dominant_frequency_hz > 0.0 and (
+        suspect_mode_ordering or np.isfinite(dominant_frequency_hz)
+    ):
+        return ("dominant_coupling", dominant_frequency_hz)
+    return ("f1", f1_hz)
 
 
 def _search_peak_with_adaptive_window(
@@ -935,17 +970,18 @@ def _search_peak_with_adaptive_window(
     resistance_ohm: float,
     search_scale: tuple[float, float],
     search_points: int,
+    peak_search_seed: str = "auto",
     max_expansions: int = 12,
-) -> tuple[np.ndarray, np.ndarray, int, bool]:
-    freq_n = np.sort(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1))
-    if freq_n.size == 0:
-        raise ValueError("modal_model does not contain any eigenfrequencies.")
-    f1_hz = float(freq_n[0])
+) -> tuple[np.ndarray, np.ndarray, int, bool, str, float]:
+    seed_source, seed_frequency_hz = _resolve_peak_search_seed(
+        modal_model=modal_model,
+        peak_search_seed=peak_search_seed,
+    )
     lower_factor = float(search_scale[0])
     upper_factor = float(search_scale[1])
 
     search_freq = _build_peak_search_grid(
-        f1_hz=f1_hz,
+        seed_frequency_hz=seed_frequency_hz,
         lower_factor=lower_factor,
         upper_factor=upper_factor,
         search_points=search_points,
@@ -964,7 +1000,7 @@ def _search_peak_with_adaptive_window(
         else:
             upper_factor *= 2.0
         search_freq = _build_peak_search_grid(
-            f1_hz=f1_hz,
+            seed_frequency_hz=seed_frequency_hz,
             lower_factor=lower_factor,
             upper_factor=upper_factor,
             search_points=search_points,
@@ -979,7 +1015,7 @@ def _search_peak_with_adaptive_window(
         expansions += 1
 
     boundary_hit = peak_index == 0 or peak_index == search_freq.shape[0] - 1
-    return search_freq, search_voltage, peak_index, boundary_hit
+    return search_freq, search_voltage, peak_index, boundary_hit, seed_source, seed_frequency_hz
 
 
 def _refine_peak_frequency(
@@ -1228,6 +1264,8 @@ def _build_modal_save_payload(
     mode1_top_surface_strain_eqv: np.ndarray,
     harmonic_top_surface_strain_eqv: np.ndarray,
     harmonic_field_frequency_hz: float,
+    frf_search_seed_source: str,
+    frf_search_seed_frequency_hz: float,
 ) -> dict[str, np.ndarray]:
     mode1_frequency_hz = float(np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64).reshape(-1)[0])
     harmonic_frequency_array = np.asarray(harmonic_field_frequency_hz, dtype=np.float64)
@@ -1292,6 +1330,8 @@ def _build_modal_save_payload(
         "suspect_mode_ordering": np.asarray(
             modal_model.get("suspect_mode_ordering", np.asarray([False], dtype=np.bool_))
         ),
+        "frf_search_seed_source": np.asarray([str(frf_search_seed_source)]),
+        "frf_search_seed_frequency_hz": np.asarray([float(frf_search_seed_frequency_hz)], dtype=np.float64),
         "substrate_volume_m3": modal_model["substrate_volume_m3"],
         "piezo_volume_m3": modal_model["piezo_volume_m3"],
         "substrate_cell_count": modal_model["substrate_cell_count"],
@@ -1317,6 +1357,7 @@ def solve_modal_voltage_frf(
     num_modes: int = 8,
     search_scale: tuple[float, float] = (0.5, 2.0),
     search_points: int = 301,
+    peak_search_seed: str = "auto",
     frf_points: int = 256,
     normalized_range: tuple[float, float] = (0.9, 1.1),
     mechanical: MechanicalConfig | None = None,
@@ -1362,12 +1403,18 @@ def solve_modal_voltage_frf(
         mechanical=mechanical,
         piezo=piezo,
     )
-    search_freq, search_voltage, peak_index, boundary_hit = _search_peak_with_adaptive_window(
+    search_freq, search_voltage, peak_index, boundary_hit, frf_search_seed_source, frf_search_seed_frequency_hz = _search_peak_with_adaptive_window(
         modal_model=modal_model,
         damping_ratio=mechanical.damping_ratio,
         resistance_ohm=piezo.resistance_ohm,
         search_scale=search_scale,
         search_points=search_points,
+        peak_search_seed=peak_search_seed,
+    )
+    print(
+        "FRF peak search seed: "
+        f"source={frf_search_seed_source}, frequency_hz={frf_search_seed_frequency_hz:.6g}",
+        flush=True,
     )
     _warn_if_open_circuit_resonance_is_inverted(
         search_freq_hz=search_freq,
@@ -1434,6 +1481,17 @@ def solve_modal_voltage_frf(
             element_order=element_order,
             modal_coefficients=q_peak,
         )
+    response_modal_diagnostics = compute_drive_coupling_diagnostics(
+        eigenfreq_hz=np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64),
+        modal_force=np.asarray(modal_model["modal_force"], dtype=np.float64),
+        modal_theta=np.asarray(modal_model["modal_theta"], dtype=np.float64),
+    )
+    response_modal_diagnostics.update(
+        {
+            "frf_search_seed_source": np.asarray([str(frf_search_seed_source)]),
+            "frf_search_seed_frequency_hz": np.asarray([float(frf_search_seed_frequency_hz)], dtype=np.float64),
+        }
+    )
     response_path = save_fem_response(
         sample_id=sample_id,
         f_peak_hz=f_peak_hz,
@@ -1457,11 +1515,7 @@ def solve_modal_voltage_frf(
             strict_parity_requested=bool(np.asarray(modal_model["strict_parity_requested"]).reshape(-1)[0]),
             diagnostic_only=bool(np.asarray(modal_model["diagnostic_only"]).reshape(-1)[0]),
         ),
-        modal_diagnostics=compute_drive_coupling_diagnostics(
-            eigenfreq_hz=np.asarray(modal_model["eigenfreq_hz"], dtype=np.float64),
-            modal_force=np.asarray(modal_model["modal_force"], dtype=np.float64),
-            modal_theta=np.asarray(modal_model["modal_theta"], dtype=np.float64),
-        ),
+        modal_diagnostics=response_modal_diagnostics,
     )
 
     if modes_output_dir is not None:
@@ -1476,6 +1530,8 @@ def solve_modal_voltage_frf(
             mode1_top_surface_strain_eqv=mode1_top_surface_strain,
             harmonic_top_surface_strain_eqv=harmonic_top_surface_strain,
             harmonic_field_frequency_hz=f_peak_hz,
+            frf_search_seed_source=frf_search_seed_source,
+            frf_search_seed_frequency_hz=frf_search_seed_frequency_hz,
         )
         np.savez_compressed(
             modes_output_dir / f"sample_{sample_id:04d}_modal.npz",
@@ -1510,6 +1566,7 @@ def solve_modal_voltage_frf_batch(
     num_modes: int = 8,
     search_scale: tuple[float, float] = (0.5, 2.0),
     search_points: int = 301,
+    peak_search_seed: str = "auto",
     frf_points: int = 256,
     normalized_range: tuple[float, float] = (0.9, 1.1),
     mechanical: MechanicalConfig | None = None,
@@ -1557,6 +1614,7 @@ def solve_modal_voltage_frf_batch(
                     num_modes=num_modes,
                     search_scale=search_scale,
                     search_points=search_points,
+                    peak_search_seed=peak_search_seed,
                     frf_points=frf_points,
                     normalized_range=normalized_range,
                     mechanical=mechanical,
@@ -1628,6 +1686,15 @@ def main() -> None:
         type=int,
         default=301,
         help="Number of coarse points used to locate the fundamental FRF peak before refinement.",
+    )
+    parser.add_argument(
+        "--peak-search-seed",
+        default="auto",
+        choices=["auto", "f1", "dominant_coupling"],
+        help=(
+            "Seed for the adaptive FRF peak search. 'auto' prefers the dominant drive-coupling mode "
+            "when modal diagnostics are available, otherwise it starts from f1."
+        ),
     )
     parser.add_argument(
         "--frf-points",
@@ -1734,6 +1801,7 @@ def main() -> None:
         response_dir=args.response_dir,
         num_modes=int(args.num_modes),
         search_points=int(args.search_points),
+        peak_search_seed=str(args.peak_search_seed),
         frf_points=int(args.frf_points),
         mechanical=mechanical,
         piezo=piezo,

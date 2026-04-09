@@ -55,7 +55,11 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                     eigenfreq_hz=np.asarray([0.7, 1.1], dtype=np.float64),
                     modal_force=np.asarray([1.0, 0.2], dtype=np.float64),
                     modal_theta=np.asarray([2.0, 5.0], dtype=np.float64),
-                ),
+                )
+                | {
+                    "frf_search_seed_source": np.asarray(["dominant_coupling"]),
+                    "frf_search_seed_frequency_hz": np.asarray([1.1], dtype=np.float64),
+                },
             )
             np.savez_compressed(
                 modal_dir / "sample_0000_modal.npz",
@@ -128,6 +132,8 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                 self.assertEqual(int(integrated["solver_element_order"][0]), 2)
                 self.assertEqual(int(integrated["dominant_drive_coupling_mode_index"][0]), 0)
                 self.assertTrue(bool(integrated["solver_parity_valid"][0]))
+                self.assertEqual(str(integrated["frf_search_seed_source"][0]), "dominant_coupling")
+                self.assertAlmostEqual(float(integrated["frf_search_seed_frequency_hz"][0]), 1.1)
 
             with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
@@ -140,6 +146,7 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs_unlimited"], "True")
             self.assertEqual(rows[0]["eigensolver_backend"], "shift_invert_lu")
             self.assertEqual(rows[0]["solver_parity_valid"], "True")
+            self.assertEqual(rows[0]["frf_search_seed_source"], "dominant_coupling")
 
 
 if __name__ == "__main__":

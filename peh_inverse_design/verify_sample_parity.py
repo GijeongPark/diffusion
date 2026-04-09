@@ -90,6 +90,24 @@ def _fenicsx_available_locally() -> bool:
     return True
 
 
+def _cli_flag_present(argv: list[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def _apply_strict_ansys_parity_overrides(
+    args: argparse.Namespace,
+    *,
+    explicit_voltage_form: bool,
+) -> argparse.Namespace:
+    if not bool(getattr(args, "strict_ansys_parity", False)):
+        return args
+    args.mesh_preset = "ansys_parity"
+    args.allow_diagnostic_fallbacks = False
+    if not explicit_voltage_form:
+        args.ansys_voltage_form = "peak"
+    return args
+
+
 def _workspace_path(path: Path, project_root: Path) -> str:
     resolved_path = path if path.is_absolute() else (project_root / path).resolve()
     return str(Path("/workspace") / resolved_path.relative_to(project_root))
@@ -253,6 +271,46 @@ def _frequency_match_score(record: dict[str, Any]) -> float:
     return min(candidates) if candidates else float("inf")
 
 
+def _parity_match_score(record: dict[str, Any]) -> float:
+    candidates: list[float] = []
+    for key in [
+        "mode1_vs_ansys_modal_error_percent",
+        "f_peak_vs_ansys_frf_peak_error_percent",
+        "selected_voltage_error_percent",
+    ]:
+        value = float(record.get(key, np.nan))
+        if np.isfinite(value):
+            candidates.append(abs(value))
+    if candidates:
+        return max(candidates)
+    for key in [
+        "mode1_vs_ambiguous_frequency_error_percent",
+        "f_peak_vs_ambiguous_frequency_error_percent",
+        "selected_voltage_error_percent",
+    ]:
+        value = float(record.get(key, np.nan))
+        if np.isfinite(value):
+            candidates.append(abs(value))
+    return max(candidates) if candidates else float("inf")
+
+
+def _parity_rank_bucket(record: dict[str, Any]) -> int:
+    if str(record.get("status", "")) != "ok":
+        return 2
+    if (not bool(record.get("solver_parity_valid", True))) or bool(record.get("diagnostic_only", False)):
+        return 1
+    return 0
+
+
+def _parity_rank_key(record: dict[str, Any]) -> tuple[int, float, float, str]:
+    return (
+        _parity_rank_bucket(record),
+        float(_parity_match_score(record)),
+        float(_frequency_match_score(record)),
+        str(record.get("case_name", "")),
+    )
+
+
 def _load_solver_diagnostic_payload(response_dir: Path, sample_id: int) -> dict[str, Any] | None:
     diagnostic_path = _solver_diagnostic_payload_path(response_dir, sample_id)
     if not diagnostic_path.exists():
@@ -278,9 +336,10 @@ def _record_from_summary(
     mesh_materials = summary["mesh_materials"]
     solver_provenance = summary.get("solver_provenance", {})
     modal_diagnostics = summary.get("modal_diagnostics", {})
+    runtime_inputs = summary.get("runtime_inputs", {})
     mesh_npz_path = case_dir / "meshes" / "volumes" / f"plate3d_{int(summary['sample_id']):04d}_fenicsx.npz"
     mesh_meta = _load_mesh_metadata(mesh_npz_path)
-    return {
+    record = {
         "case_name": str(case_name),
         "case_dir": str(case_dir),
         "status": "ok",
@@ -326,6 +385,11 @@ def _record_from_summary(
         "error_percent_assuming_ansys_peak": float(voltage["error_percent_assuming_ansys_peak"]),
         "error_percent_assuming_ansys_rms": float(voltage["error_percent_assuming_ansys_rms"]),
         "voltage_convention_mismatch_likely": bool(voltage["voltage_convention_mismatch_likely"]),
+        "base_excitation_amplitude_m_per_s2": float(
+            runtime_inputs.get("base_excitation_amplitude_m_per_s2", np.nan)
+        ),
+        "modal_damping_ratio": float(runtime_inputs.get("modal_damping_ratio", np.nan)),
+        "external_load_resistance_ohm": float(runtime_inputs.get("external_load_resistance_ohm", np.nan)),
         "modal_theta_mode1": float(summary["electromechanical"]["modal_theta_mode1"]),
         "modal_force_mode1": float(summary["electromechanical"]["modal_force_mode1"]),
         "capacitance_f": float(summary["electromechanical"]["capacitance_f"]),
@@ -334,10 +398,15 @@ def _record_from_summary(
             modal_diagnostics.get("dominant_drive_coupling_mode_frequency_hz", np.nan)
         ),
         "suspect_mode_ordering": bool(modal_diagnostics.get("suspect_mode_ordering", False)),
+        "frf_search_seed_source": str(modal_diagnostics.get("frf_search_seed_source", "")),
+        "frf_search_seed_frequency_hz": float(modal_diagnostics.get("frf_search_seed_frequency_hz", np.nan)),
         "piezo_volume_m3": float(mesh_materials["piezo_volume_m3"]),
         "substrate_volume_m3": float(mesh_materials["substrate_volume_m3"]),
-        "frequency_match_score_percent": float(_frequency_match_score(frequency)),
     }
+    record["frequency_match_score_percent"] = float(_frequency_match_score(record))
+    record["parity_match_score_percent"] = float(_parity_match_score(record))
+    record["parity_rank_bucket"] = int(_parity_rank_bucket(record))
+    return record
 
 
 def _failure_record(
@@ -365,7 +434,7 @@ def _failure_record(
             else f"{status}: {exc}"
         )
     )
-    return {
+    record = {
         "case_name": str(case_name),
         "case_dir": str(case_dir),
         "status": str(status),
@@ -390,9 +459,14 @@ def _failure_record(
             diagnostic_payload.get("dominant_drive_coupling_mode_frequency_hz", np.nan)
         ),
         "suspect_mode_ordering": bool(diagnostic_payload.get("suspect_mode_ordering", False)),
+        "frf_search_seed_source": str(diagnostic_payload.get("frf_search_seed_source", "")),
+        "frf_search_seed_frequency_hz": float(diagnostic_payload.get("frf_search_seed_frequency_hz", np.nan)),
         "error_message": str(exc),
-        "frequency_match_score_percent": float("inf"),
     }
+    record["frequency_match_score_percent"] = float("inf")
+    record["parity_match_score_percent"] = float("inf")
+    record["parity_rank_bucket"] = int(_parity_rank_bucket(record))
+    return record
 
 
 def _write_csv(records: list[dict[str, Any]], output_path: Path) -> None:
@@ -618,8 +692,10 @@ def verify_sample_parity(
                     f"[ok] {case_name}: mode1={record['mode1_frequency_hz']:.12g} Hz, "
                     f"f_peak={record['f_peak_hz']:.12g} Hz, "
                     f"Vpeak={record['peak_voltage_peak_v']:.12g} V, "
-                    f"Vrms={record['peak_voltage_rms_v']:.12g} V, "
-                    f"freq_score={record['frequency_match_score_percent']:.6g}%",
+                    f"selected_voltage_error={record['selected_voltage_error_percent']:.6g}%, "
+                    f"parity_score={record['parity_match_score_percent']:.6g}%, "
+                    f"seed={record['frf_search_seed_source'] or 'unknown'}@"
+                    f"{record['frf_search_seed_frequency_hz']:.12g} Hz",
                     flush=True,
                 )
             except Exception as exc:
@@ -642,7 +718,7 @@ def verify_sample_parity(
                 )
                 print(f"[solve_failed] {case_name}: {exc}", flush=True)
 
-    sorted_records = sorted(records, key=_frequency_match_score)
+    sorted_records = sorted(records, key=_parity_rank_key)
     json_path = output_dir / f"parity_sweep_sample_{int(sample_id):04d}.json"
     csv_path = output_dir / f"parity_sweep_sample_{int(sample_id):04d}.csv"
     summary_payload = {
@@ -658,12 +734,16 @@ def verify_sample_parity(
         "ansys_voltage_form": str(ansys_voltage_form),
         "strict_parity_requested": not bool(allow_diagnostic_fallbacks),
         "allow_diagnostic_fallbacks": bool(allow_diagnostic_fallbacks),
+        "ranking_mode": (
+            "combined_parity_max(abs(mode1_vs_ansys_modal_error_percent), "
+            "abs(f_peak_vs_ansys_frf_peak_error_percent), abs(selected_voltage_error_percent))"
+        ),
         "records": sorted_records,
     }
     json_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=False), encoding="utf-8")
     _write_csv(sorted_records, csv_path)
 
-    print("Frequency ranking (best to worst):", flush=True)
+    print("Parity ranking (best to worst):", flush=True)
     for record in sorted_records:
         if str(record.get("status", "")) != "ok":
             print(
@@ -676,12 +756,32 @@ def verify_sample_parity(
             f"mode1={record['mode1_frequency_hz']:.12g} Hz, "
             f"f_peak={record['f_peak_hz']:.12g} Hz, "
             f"Vpeak={record['peak_voltage_peak_v']:.12g} V, "
-            f"Vrms={record['peak_voltage_rms_v']:.12g} V, "
-            f"freq_score={record['frequency_match_score_percent']:.6g}%",
+            f"selected_voltage_error={record['selected_voltage_error_percent']:.6g}%, "
+            f"parity_score={record['parity_match_score_percent']:.6g}%, "
+            f"bucket={record['parity_rank_bucket']}, "
+            f"seed={record['frf_search_seed_source'] or 'unknown'}@"
+            f"{record['frf_search_seed_frequency_hz']:.12g} Hz",
             flush=True,
         )
     print(f"Saved parity sweep JSON to {json_path}", flush=True)
     print(f"Saved parity sweep CSV to {csv_path}", flush=True)
+    if not bool(allow_diagnostic_fallbacks):
+        invalid_records = [
+            record
+            for record in sorted_records
+            if str(record.get("status", "")) != "ok"
+            or not bool(record.get("solver_parity_valid", True))
+            or bool(record.get("diagnostic_only", False))
+        ]
+        if invalid_records:
+            details = "; ".join(
+                f"{record['case_name']}: {record.get('parity_invalid_reason') or record.get('error_message') or record.get('status')}"
+                for record in invalid_records[:4]
+            )
+            raise RuntimeError(
+                f"Strict parity became invalid for sample {int(sample_id):04d}. "
+                f"Saved partial results to {json_path}. Details: {details}"
+            )
     return summary_payload
 
 
@@ -707,6 +807,14 @@ def main() -> None:
         help="Mesh preset used for the sweep cases.",
     )
     parser.add_argument(
+        "--strict-ansys-parity",
+        action="store_true",
+        help=(
+            "Convenience strict parity mode: mesh_preset=ansys_parity, strict solver path "
+            "(no diagnostic fallbacks), and ansys_voltage_form=peak unless you explicitly override it."
+        ),
+    )
+    parser.add_argument(
         "--parity-sweep",
         action="store_true",
         help="Run the dedicated parity sweep over multiple through-thickness layer settings.",
@@ -726,9 +834,9 @@ def main() -> None:
     parser.add_argument("--ansys-voltage-v", type=float, default=None, help="Optional ANSYS voltage reference value.")
     parser.add_argument(
         "--ansys-voltage-form",
-        default="unknown",
+        default="peak",
         choices=["unknown", "peak", "rms"],
-        help="Interpretation of --ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+        help="Interpretation of --ansys-voltage-v. Defaults to 'peak'; use 'unknown' only when you explicitly want both peak and RMS.",
     )
     parser.add_argument("--substrate-thickness", type=float, default=None, help="Override substrate thickness in meters.")
     parser.add_argument("--piezo-thickness", type=float, default=None, help="Override piezo thickness in meters.")
@@ -748,7 +856,12 @@ def main() -> None:
         action="store_true",
         help="Disable extra mode-shape storage. Leave this off only if you need the lightest possible parity run.",
     )
+    raw_argv = sys.argv[1:]
     args = parser.parse_args()
+    args = _apply_strict_ansys_parity_overrides(
+        args,
+        explicit_voltage_form=_cli_flag_present(raw_argv, "--ansys-voltage-form"),
+    )
     layer_sweep = (
         _parse_layer_sweep(args.layer_sweep)
         if str(args.layer_sweep).strip()

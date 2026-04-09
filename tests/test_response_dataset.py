@@ -38,7 +38,11 @@ class ResponseDatasetTests(unittest.TestCase):
                     eigenfreq_hz=np.asarray([1.4, 2.8], dtype=np.float64),
                     modal_force=np.asarray([1.0, 3.0], dtype=np.float64),
                     modal_theta=np.asarray([2.0, 1.0], dtype=np.float64),
-                ),
+                )
+                | {
+                    "frf_search_seed_source": np.asarray(["dominant_coupling"]),
+                    "frf_search_seed_frequency_hz": np.asarray([2.8], dtype=np.float64),
+                },
             )
 
             with np.load(response_dir / "sample_0007_response.npz", allow_pickle=True) as response:
@@ -49,6 +53,8 @@ class ResponseDatasetTests(unittest.TestCase):
                 self.assertEqual(str(np.asarray(response["eigensolver_backend"]).reshape(-1)[0]), "shift_invert_lu")
                 self.assertTrue(bool(np.asarray(response["solver_parity_valid"]).reshape(-1)[0]))
                 self.assertEqual(int(np.asarray(response["dominant_drive_coupling_mode_index"]).reshape(-1)[0]), 1)
+                self.assertEqual(str(np.asarray(response["frf_search_seed_source"]).reshape(-1)[0]), "dominant_coupling")
+                self.assertAlmostEqual(float(np.asarray(response["frf_search_seed_frequency_hz"]).reshape(-1)[0]), 2.8)
 
             aggregated = aggregate_response_directory(response_dir=response_dir, output_path=output_path)
 
@@ -63,6 +69,8 @@ class ResponseDatasetTests(unittest.TestCase):
             self.assertEqual(int(aggregated["solver_element_order"][0]), 2)
             self.assertEqual(int(aggregated["dominant_drive_coupling_mode_index"][0]), 1)
             self.assertTrue(bool(aggregated["solver_parity_valid"][0]))
+            self.assertEqual(str(aggregated["frf_search_seed_source"][0]), "dominant_coupling")
+            self.assertAlmostEqual(float(aggregated["frf_search_seed_frequency_hz"][0]), 2.8)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from .problem_spec import (
     load_problem_spec,
     write_problem_spec_snapshot,
 )
+from .solver_diagnostics import load_solver_provenance
 from .subset_unit_cell_dataset import subset_unit_cell_dataset
 
 
@@ -69,7 +70,7 @@ class PipelineConfig:
     audit_ansys_modal_hz: float | None = None
     audit_ansys_frf_peak_hz: float | None = None
     audit_ansys_voltage_v: float | None = None
-    audit_ansys_voltage_form: str = "unknown"
+    audit_ansys_voltage_form: str = "peak"
     audit_sample_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -202,6 +203,26 @@ def _run_command(args: list[str | Path], cwd: Path, env: dict[str, str] | None =
     subprocess.run([str(arg) for arg in args], cwd=str(cwd), env=merged_env, check=True)
 
 
+def _cli_flag_present(argv: list[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def _apply_strict_ansys_parity_overrides(
+    args: argparse.Namespace,
+    *,
+    explicit_audit_voltage_form: bool,
+) -> argparse.Namespace:
+    if not bool(getattr(args, "strict_ansys_parity", False)):
+        return args
+    args.mesh_preset = "ansys_parity"
+    args.strict_parity = True
+    args.solver_eigensolver_backend = "shift_invert_lu"
+    args.allow_eigensolver_fallback = False
+    if not explicit_audit_voltage_form:
+        args.audit_ansys_voltage_form = "peak"
+    return args
+
+
 def _build_mesh_command(
     *,
     project_python: Path,
@@ -302,6 +323,7 @@ def _run_audit_summaries(
         summaries.append(summary)
         frequency = summary["frequency_comparison"]
         voltage = summary["voltage_comparison"]
+        runtime_inputs = summary.get("runtime_inputs", {})
         print(
             "Audit summary       : "
             f"sample={int(summary['sample_id']):04d}, "
@@ -309,8 +331,20 @@ def _run_audit_summaries(
             f"f_peak={float(frequency['f_peak_hz']):.12g} Hz, "
             f"Vpeak={float(voltage['peak_voltage_peak_v']):.12g} V, "
             f"Vrms={float(voltage['peak_voltage_rms_v']):.12g} V, "
-            f"voltage_convention_mismatch_likely={bool(voltage['voltage_convention_mismatch_likely'])}"
+            f"selected_voltage_error={float(voltage['selected_voltage_error_percent']):.6g}%, "
+            f"base_excitation={float(runtime_inputs.get('base_excitation_amplitude_m_per_s2', np.nan)):.6g} m/s^2, "
+            f"modal_damping_ratio={float(runtime_inputs.get('modal_damping_ratio', np.nan)):.6g}, "
+            f"load_ohm={float(runtime_inputs.get('external_load_resistance_ohm', np.nan)):.6g}"
         )
+        solver_provenance = summary.get("solver_provenance", {})
+        if bool(config.strict_parity) and (
+            not bool(solver_provenance.get("solver_parity_valid", True))
+            or bool(solver_provenance.get("diagnostic_only", False))
+        ):
+            reason = str(solver_provenance.get("parity_invalid_reason", "")).strip() or "strict parity became invalid"
+            raise RuntimeError(
+                f"Audit for sample {int(summary['sample_id']):04d} detected a strict-parity violation: {reason}"
+            )
     return summaries
 
 
@@ -390,6 +424,31 @@ def _solver_modal_output_path(modal_dir: Path, sample_id: int) -> Path:
 
 def _solver_diagnostic_output_path(response_dir: Path, sample_id: int) -> Path:
     return response_dir / f"sample_{int(sample_id):04d}_solver_diagnostic.json"
+
+
+def _assert_strict_parity_outputs_valid(
+    *,
+    mesh_files: list[Path],
+    response_dir: Path,
+) -> None:
+    for mesh_path in mesh_files:
+        sample_id = _solver_sample_id_from_mesh(mesh_path)
+        response_path = _solver_response_output_path(response_dir, sample_id)
+        if not response_path.exists():
+            raise FileNotFoundError(
+                f"Strict parity run for sample {sample_id:04d} did not produce {response_path}."
+            )
+        with np.load(response_path, allow_pickle=True) as response:
+            provenance = load_solver_provenance(response)
+        if bool(provenance.get("solver_parity_valid", True)) and not bool(provenance.get("diagnostic_only", False)):
+            continue
+        reason = str(provenance.get("parity_invalid_reason", "")).strip() or "strict parity became invalid"
+        raise RuntimeError(
+            f"Strict parity became invalid for sample {sample_id:04d}: {reason} "
+            f"[backend={provenance.get('eigensolver_backend', 'unknown')}, "
+            f"used_eigensolver_fallback={bool(provenance.get('used_eigensolver_fallback', False))}, "
+            f"used_element_order_fallback={bool(provenance.get('used_element_order_fallback', False))}]"
+        )
 
 
 def _solver_requested_backend(config: PipelineConfig) -> str:
@@ -1017,6 +1076,11 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         config=config,
         runtime_problem_spec_path=runtime_problem_spec_path,
     )
+    if config.strict_parity:
+        _assert_strict_parity_outputs_valid(
+            mesh_files=mesh_files,
+            response_dir=response_dir,
+        )
 
     _print_step(f"Step {step_idx}/{total_steps}: Aggregate datasets")
     step_idx += 1
@@ -1164,6 +1228,15 @@ def _cli_parser() -> argparse.ArgumentParser:
         help="Disable solver fallbacks that break apples-to-apples parity and forward strict parity to the solver.",
     )
     parser.add_argument(
+        "--strict-ansys-parity",
+        action="store_true",
+        help=(
+            "Convenience strict parity mode: mesh_preset=ansys_parity, strict_parity=True, "
+            "solver_eigensolver_backend=shift_invert_lu, allow_eigensolver_fallback=False, "
+            "and audit_ansys_voltage_form=peak unless you explicitly override it."
+        ),
+    )
+    parser.add_argument(
         "--solver-max-q2-vector-dofs",
         type=int,
         default=None,
@@ -1200,9 +1273,12 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audit-ansys-voltage-v", type=float, default=None, help="Optional ANSYS voltage reference value.")
     parser.add_argument(
         "--audit-ansys-voltage-form",
-        default="unknown",
+        default="peak",
         choices=["unknown", "peak", "rms"],
-        help="Interpretation of --audit-ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+        help=(
+            "Interpretation of --audit-ansys-voltage-v. Defaults to 'peak'; "
+            "use 'unknown' only when you explicitly want both peak and RMS comparisons."
+        ),
     )
     parser.add_argument(
         "--audit-sample-id",
@@ -1218,7 +1294,12 @@ def _cli_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = _cli_parser()
+    raw_argv = sys.argv[1:]
     args = parser.parse_args()
+    args = _apply_strict_ansys_parity_overrides(
+        args,
+        explicit_audit_voltage_form=_cli_flag_present(raw_argv, "--audit-ansys-voltage-form"),
+    )
     config = PipelineConfig(
         source_unit_cell_npz=args.unit_cell_npz,
         run_name=args.run_name,

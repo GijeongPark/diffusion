@@ -151,6 +151,36 @@ Run the FEniCSx modal-reduction solver in the official Docker image:
   --modes-dir /workspace/data/modal_data
 ```
 
+Audit one sample against ANSYS without mixing modal-vs-FRF or peak-vs-RMS conventions:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.audit_ansys_alignment \
+  --run-dir runs/0402 \
+  --sample-id 0 \
+  --ansys-modal-hz 0.58 \
+  --ansys-voltage-v 242.96 \
+  --ansys-voltage-form unknown
+```
+
+`audit_ansys_alignment` now reports `mode1_frequency_hz`, `f_peak_hz`, and `harmonic_field_frequency_hz` separately, and it prints both `peak_voltage_peak_v` and `peak_voltage_rms_v`. If the ANSYS voltage form is unknown, it compares the reference against both interpretations so an RMS-vs-peak mismatch is visible instead of being mistaken for a physics error.
+
+Run a dedicated single-sample parity sweep with the verification mesh preset:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.verify_sample_parity \
+  --sample-id 0 \
+  --unit-cell-npz data/unit_cell_dataset.npz \
+  --output-dir tmp/parity_sweeps/sample_0000 \
+  --mesh-preset ansys_parity \
+  --layer-sweep 2:1,4:2,6:2,8:3 \
+  --mesh-size-scales 0.08 \
+  --ansys-modal-hz 0.58 \
+  --ansys-voltage-v 242.96 \
+  --ansys-voltage-form unknown
+```
+
+The `ansys_parity` mesh preset raises through-thickness resolution and disables silent solver-mesh coarsening so the saved JSON/CSV sweep report reflects the actual verification mesh that was solved.
+
 Create human-readable summary figures after a run:
 
 ```bash

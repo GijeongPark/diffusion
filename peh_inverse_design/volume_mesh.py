@@ -35,6 +35,30 @@ from .mesh_tags import (
 )
 
 
+def normalize_volume_mesh_preset(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"default", "ansys_parity"}:
+        raise ValueError("mesh_preset must be 'default' or 'ansys_parity'.")
+    return normalized
+
+
+def volume_mesh_preset_overrides(mesh_preset: str) -> dict[str, object]:
+    normalized = normalize_volume_mesh_preset(mesh_preset)
+    if normalized == "ansys_parity":
+        return {
+            "substrate_layers": 8,
+            "piezo_layers": 3,
+            "max_solver_vector_dofs": None,
+            "allow_solver_mesh_coarsening": False,
+        }
+    return {
+        "substrate_layers": 2,
+        "piezo_layers": 1,
+        "max_solver_vector_dofs": 5_000_000,
+        "allow_solver_mesh_coarsening": True,
+    }
+
+
 @dataclass(frozen=True)
 class VolumeMeshConfig:
     substrate_thickness_m: float = 1.0e-3
@@ -57,7 +81,9 @@ class VolumeMeshConfig:
     max_solver_vector_dofs: int | None = 5_000_000
     solver_mesh_growth_factor: float = 1.15
     solver_mesh_limit_retries: int = 5
+    allow_solver_mesh_coarsening: bool = True
     ansys_step_strategy: str = "single_face_assembly"
+    mesh_preset: str = "default"
     export_inspection_single_face_step: bool = False
     cad_planform_simplify_relative_to_reference: float = 1.5
     cad_min_hole_area_relative_to_reference_squared: float = 100.0
@@ -108,6 +134,7 @@ class VolumeMeshConfig:
             raise ValueError("solver_mesh_growth_factor must be greater than 1.0.")
         if int(self.solver_mesh_limit_retries) < 0:
             raise ValueError("solver_mesh_limit_retries must be non-negative.")
+        normalize_volume_mesh_preset(self.mesh_preset)
         if float(self.cad_planform_simplify_relative_to_reference) < 0.0:
             raise ValueError("cad_planform_simplify_relative_to_reference must be non-negative.")
         if float(self.cad_min_hole_area_relative_to_reference_squared) < 0.0:
@@ -1104,8 +1131,13 @@ def _write_cad_report(
         "solver_mesh_size_relative_to_cell": float(volume_config.mesh_size_relative_to_cell),
         "cad_reference_size_relative_to_cell": float(volume_config.cad_reference_size_relative_to_cell),
         "solver_mesh_backend": str(volume_config.solver_mesh_backend),
+        "mesh_preset": str(volume_config.mesh_preset),
         "substrate_layers": int(volume_config.substrate_layers),
         "piezo_layers": int(volume_config.piezo_layers),
+        "allow_solver_mesh_coarsening": bool(volume_config.allow_solver_mesh_coarsening),
+        "max_solver_vector_dofs": None
+        if volume_config.max_solver_vector_dofs is None
+        else int(volume_config.max_solver_vector_dofs),
         "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
         "cad_planform_simplify_relative_to_reference": float(volume_config.cad_planform_simplify_relative_to_reference),
         "cad_min_hole_area_relative_to_reference_squared": float(
@@ -1525,6 +1557,7 @@ def _build_layered_tet_solver_mesh(
     max_solver_vector_dofs = None if volume_config.max_solver_vector_dofs is None else int(volume_config.max_solver_vector_dofs)
     growth_factor = float(volume_config.solver_mesh_growth_factor)
     max_retries = int(volume_config.solver_mesh_limit_retries)
+    allow_solver_mesh_coarsening = bool(getattr(volume_config, "allow_solver_mesh_coarsening", True))
     estimated_q2_vector_dofs = 0
     coarsening_pass = 0
 
@@ -1582,21 +1615,28 @@ def _build_layered_tet_solver_mesh(
         if (
             max_solver_vector_dofs is not None
             and estimated_q2_vector_dofs > max_solver_vector_dofs
-            and coarsening_pass < max_retries
         ):
-            coarsening_pass += 1
-            next_solver_mesh_size_m = solver_mesh_size_m * growth_factor
-            print(
-                f"Coarsening layered solver mesh for sample {int(sample_id):04d}: "
-                f"estimated quadratic vector DOFs {estimated_q2_vector_dofs} exceed the "
-                f"{max_solver_vector_dofs} limit; retrying with in-plane mesh size "
-                f"{next_solver_mesh_size_m:.6g} m."
-            )
-            solver_mesh_size_m = next_solver_mesh_size_m
-            continue
+            if allow_solver_mesh_coarsening and coarsening_pass < max_retries:
+                coarsening_pass += 1
+                next_solver_mesh_size_m = solver_mesh_size_m * growth_factor
+                print(
+                    f"Coarsening layered solver mesh for sample {int(sample_id):04d}: "
+                    f"estimated quadratic vector DOFs {estimated_q2_vector_dofs} exceed the "
+                    f"{max_solver_vector_dofs} limit; retrying with in-plane mesh size "
+                    f"{next_solver_mesh_size_m:.6g} m."
+                )
+                solver_mesh_size_m = next_solver_mesh_size_m
+                continue
+            break
         break
 
     if max_solver_vector_dofs is not None and estimated_q2_vector_dofs > max_solver_vector_dofs:
+        if not allow_solver_mesh_coarsening:
+            raise RuntimeError(
+                f"Layered solver mesh for sample {int(sample_id):04d} exceeds the quadratic-vector-DOF limit "
+                f"without any automatic coarsening because mesh_preset='{normalize_volume_mesh_preset(volume_config.mesh_preset)}' "
+                f"disables hidden coarsening for parity checks: {estimated_q2_vector_dofs} > {max_solver_vector_dofs}."
+            )
         raise RuntimeError(
             f"Layered solver mesh for sample {int(sample_id):04d} still exceeds the quadratic-vector-DOF limit "
             f"after {max_retries} coarsening retry/retries: {estimated_q2_vector_dofs} > {max_solver_vector_dofs}."
@@ -1683,8 +1723,14 @@ def _build_layered_tet_solver_mesh(
         triangle_cells=np.asarray(tri_cells, dtype=np.int64),
         triangle_tags=np.asarray(tri_tags, dtype=np.int32),
         solver_mesh_size_m=np.asarray([solver_mesh_size_m], dtype=np.float64),
+        requested_solver_mesh_size_m=np.asarray([requested_solver_mesh_size_m], dtype=np.float64),
         estimated_q2_vector_dofs=np.asarray([estimated_q2_vector_dofs], dtype=np.int64),
         solver_mesh_coarsening_passes=np.asarray([coarsening_pass], dtype=np.int32),
+        solver_mesh_coarsening_allowed=np.asarray([int(allow_solver_mesh_coarsening)], dtype=np.int32),
+        max_solver_vector_dofs=(
+            np.asarray([-1 if max_solver_vector_dofs is None else int(max_solver_vector_dofs)], dtype=np.int64)
+        ),
+        mesh_preset=np.asarray([normalize_volume_mesh_preset(volume_config.mesh_preset)]),
     )
     return solver_mesh_path
 

@@ -125,7 +125,22 @@ class FenicsxModalSolverTests(unittest.TestCase):
         self.assertEqual(str(np.asarray(payload["frf_search_seed_source"]).reshape(-1)[0]), "dominant_coupling")
         self.assertEqual(float(np.asarray(payload["frf_search_seed_frequency_hz"]).reshape(-1)[0]), 3.5)
 
-    def test_resolve_peak_search_seed_prefers_dominant_coupling_for_auto(self) -> None:
+    def test_auto_seed_prefers_f1_when_suspect_mode_ordering_false_even_if_dominant_is_finite(self) -> None:
+        modal_model = {
+            "eigenfreq_hz": np.asarray([0.7, 1.5, 3.7], dtype=np.float64),
+            "dominant_drive_coupling_mode_frequency_hz": np.asarray([3.7], dtype=np.float64),
+            "suspect_mode_ordering": np.asarray([False], dtype=np.bool_),
+        }
+
+        source, frequency_hz = _resolve_peak_search_seed(
+            modal_model=modal_model,
+            peak_search_seed="auto",
+        )
+
+        self.assertEqual(source, "f1")
+        self.assertEqual(frequency_hz, 0.7)
+
+    def test_auto_seed_uses_dominant_only_when_suspect_mode_ordering_true(self) -> None:
         modal_model = {
             "eigenfreq_hz": np.asarray([0.7, 1.5, 3.7], dtype=np.float64),
             "dominant_drive_coupling_mode_frequency_hz": np.asarray([3.7], dtype=np.float64),
@@ -154,6 +169,21 @@ class FenicsxModalSolverTests(unittest.TestCase):
 
         self.assertEqual(source, "f1")
         self.assertEqual(frequency_hz, 0.7)
+
+    def test_default_seed_regression_stays_in_fundamental_region(self) -> None:
+        modal_model = {
+            "eigenfreq_hz": np.asarray([0.707, 1.8, 4.4, 12.4], dtype=np.float64),
+            "dominant_drive_coupling_mode_frequency_hz": np.asarray([12.4052], dtype=np.float64),
+            "suspect_mode_ordering": np.asarray([False], dtype=np.bool_),
+        }
+
+        source, frequency_hz = _resolve_peak_search_seed(
+            modal_model=modal_model,
+            peak_search_seed="f1",
+        )
+
+        self.assertEqual(source, "f1")
+        self.assertAlmostEqual(frequency_hz, 0.707)
 
     def test_top_surface_cellwise_strain_is_root_dominant_for_cantilever_like_mode(self) -> None:
         x_nodes = np.linspace(0.0, 1.0, 5, dtype=np.float64)

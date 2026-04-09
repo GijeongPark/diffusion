@@ -957,8 +957,11 @@ def _resolve_peak_search_seed(
         if np.isfinite(dominant_frequency_hz) and dominant_frequency_hz > 0.0:
             return ("dominant_coupling", dominant_frequency_hz)
         return ("f1", f1_hz)
-    if np.isfinite(dominant_frequency_hz) and dominant_frequency_hz > 0.0 and (
-        suspect_mode_ordering or np.isfinite(dominant_frequency_hz)
+    if (
+        normalized_seed == "auto"
+        and np.isfinite(dominant_frequency_hz)
+        and dominant_frequency_hz > 0.0
+        and suspect_mode_ordering
     ):
         return ("dominant_coupling", dominant_frequency_hz)
     return ("f1", f1_hz)
@@ -970,7 +973,7 @@ def _search_peak_with_adaptive_window(
     resistance_ohm: float,
     search_scale: tuple[float, float],
     search_points: int,
-    peak_search_seed: str = "auto",
+    peak_search_seed: str = "f1",
     max_expansions: int = 12,
 ) -> tuple[np.ndarray, np.ndarray, int, bool, str, float]:
     seed_source, seed_frequency_hz = _resolve_peak_search_seed(
@@ -1357,7 +1360,7 @@ def solve_modal_voltage_frf(
     num_modes: int = 8,
     search_scale: tuple[float, float] = (0.5, 2.0),
     search_points: int = 301,
-    peak_search_seed: str = "auto",
+    peak_search_seed: str = "f1",
     frf_points: int = 256,
     normalized_range: tuple[float, float] = (0.9, 1.1),
     mechanical: MechanicalConfig | None = None,
@@ -1566,7 +1569,7 @@ def solve_modal_voltage_frf_batch(
     num_modes: int = 8,
     search_scale: tuple[float, float] = (0.5, 2.0),
     search_points: int = 301,
-    peak_search_seed: str = "auto",
+    peak_search_seed: str = "f1",
     frf_points: int = 256,
     normalized_range: tuple[float, float] = (0.9, 1.1),
     mechanical: MechanicalConfig | None = None,
@@ -1689,11 +1692,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--peak-search-seed",
-        default="auto",
+        default="f1",
         choices=["auto", "f1", "dominant_coupling"],
         help=(
-            "Seed for the adaptive FRF peak search. 'auto' prefers the dominant drive-coupling mode "
-            "when modal diagnostics are available, otherwise it starts from f1."
+            "Seed for the adaptive FRF peak search. Production runs default to 'f1'; "
+            "'dominant_coupling' remains an explicit debug override, and 'auto' only switches "
+            "to dominant coupling when suspect mode ordering is detected."
         ),
     )
     parser.add_argument(

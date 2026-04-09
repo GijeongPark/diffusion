@@ -1,0 +1,85 @@
+{
+  "sample_id": 0,
+  "unit_cell_npz": "data/unit_cell_dataset.npz",
+  "problem_spec_path": "/home/gijeong/Inverse Design/configs/peh_inverse_design_spec.yaml",
+  "mesh_preset": "ansys_parity",
+  "layer_sweep": [
+    [
+      2,
+      1
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      6,
+      2
+    ],
+    [
+      8,
+      3
+    ]
+  ],
+  "mesh_size_scales": [
+    0.08
+  ],
+  "ansys_modal_hz": 0.58,
+  "ansys_frf_peak_hz": null,
+  "ansys_voltage_v": 242.96,
+  "ansys_voltage_form": "unknown",
+  "records": [
+    {
+      "case_name": "ansys_parity_sub2_pz1_mesh0p08",
+      "case_dir": "tmp/parity_sweeps/sample_0000/ansys_parity_sub2_pz1_mesh0p08",
+      "status": "solve_failed",
+      "sample_id": 0,
+      "mesh_preset": "ansys_parity",
+      "substrate_layers": 2,
+      "piezo_layers": 1,
+      "mesh_size_scale": 0.08,
+      "element_order": 2,
+      "error_message": "'tmp/parity_sweeps/sample_0000/ansys_parity_sub2_pz1_mesh0p08/meshes/volumes/plate3d_0000_fenicsx.npz' is not in the subpath of '/home/gijeong/Inverse Design'",
+      "frequency_match_score_percent": Infinity
+    },
+    {
+      "case_name": "ansys_parity_sub4_pz2_mesh0p08",
+      "case_dir": "tmp/parity_sweeps/sample_0000/ansys_parity_sub4_pz2_mesh0p08",
+      "status": "solve_failed",
+      "sample_id": 0,
+      "mesh_preset": "ansys_parity",
+      "substrate_layers": 4,
+      "piezo_layers": 2,
+      "mesh_size_scale": 0.08,
+      "element_order": 2,
+      "error_message": "'tmp/parity_sweeps/sample_0000/ansys_parity_sub4_pz2_mesh0p08/meshes/volumes/plate3d_0000_fenicsx.npz' is not in the subpath of '/home/gijeong/Inverse Design'",
+      "frequency_match_score_percent": Infinity
+    },
+    {
+      "case_name": "ansys_parity_sub6_pz2_mesh0p08",
+      "case_dir": "tmp/parity_sweeps/sample_0000/ansys_parity_sub6_pz2_mesh0p08",
+      "status": "solve_failed",
+      "sample_id": 0,
+      "mesh_preset": "ansys_parity",
+      "substrate_layers": 6,
+      "piezo_layers": 2,
+      "mesh_size_scale": 0.08,
+      "element_order": 2,
+      "error_message": "'tmp/parity_sweeps/sample_0000/ansys_parity_sub6_pz2_mesh0p08/meshes/volumes/plate3d_0000_fenicsx.npz' is not in the subpath of '/home/gijeong/Inverse Design'",
+      "frequency_match_score_percent": Infinity
+    },
+    {
+      "case_name": "ansys_parity_sub8_pz3_mesh0p08",
+      "case_dir": "tmp/parity_sweeps/sample_0000/ansys_parity_sub8_pz3_mesh0p08",
+      "status": "solve_failed",
+      "sample_id": 0,
+      "mesh_preset": "ansys_parity",
+      "substrate_layers": 8,
+      "piezo_layers": 3,
+      "mesh_size_scale": 0.08,
+      "element_order": 2,
+      "error_message": "'tmp/parity_sweeps/sample_0000/ansys_parity_sub8_pz3_mesh0p08/meshes/volumes/plate3d_0000_fenicsx.npz' is not in the subpath of '/home/gijeong/Inverse Design'",
+      "frequency_match_score_percent": Infinity
+    }
+  ]
+}

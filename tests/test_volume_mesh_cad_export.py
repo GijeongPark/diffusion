@@ -434,6 +434,56 @@ class VolumeMeshCadExportTests(unittest.TestCase):
             )
             self.assertEqual(int(payload["estimated_q2_vector_dofs"][0]), 3_900_000)
 
+    def test_layered_tet_solver_mesh_refuses_hidden_coarsening_for_parity_preset(self) -> None:
+        geometry_config = self._geometry_config(tile_counts=(1, 1))
+        volume_config = VolumeMeshConfig(
+            substrate_thickness_m=2.0e-3,
+            piezo_thickness_m=1.0e-3,
+            mesh_size_relative_to_cell=0.2,
+            require_connected_substrate=True,
+            substrate_layers=8,
+            piezo_layers=3,
+            max_solver_vector_dofs=4_000_000,
+            allow_solver_mesh_coarsening=False,
+            mesh_preset="ansys_parity",
+        )
+        initial_mesh_size_m = geometry_config.cell_size_m[0] * volume_config.mesh_size_relative_to_cell
+        planform = _build_substrate_planform(
+            polygons=[self._full_plate(geometry_config)],
+            geometry_config=geometry_config,
+            volume_config=volume_config,
+            mesh_size_m=initial_mesh_size_m,
+        )
+        xy = np.asarray(
+            [
+                [0.0, 0.0],
+                [geometry_config.plate_size_m[0], 0.0],
+                [geometry_config.plate_size_m[0], geometry_config.plate_size_m[1]],
+                [0.0, geometry_config.plate_size_m[1]],
+            ],
+            dtype=np.float64,
+        )
+        triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+        substrate_mask = np.asarray([True, True], dtype=bool)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            with mock.patch(
+                "peh_inverse_design.volume_mesh._mesh_partitioned_full_plate_triangles",
+                return_value=(xy, triangles, substrate_mask),
+            ), mock.patch(
+                "peh_inverse_design.volume_mesh._estimate_quadratic_vector_dofs",
+                return_value=4_500_000,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "disables hidden coarsening for parity checks"):
+                    _build_layered_tet_solver_mesh(
+                        planform=planform,
+                        sample_id=12,
+                        output_dir=output_dir,
+                        geometry_config=geometry_config,
+                        volume_config=volume_config,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,25 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _percent_error_percent(value: float, reference: float) -> float:
+    value = float(value)
+    reference = float(reference)
+    if not np.isfinite(value) or not np.isfinite(reference) or abs(reference) <= 0.0:
+        return float("nan")
+    return 100.0 * (value - reference) / reference
+
+
+def _as_reference_or_nan(value: float | None) -> float:
+    return float("nan") if value is None else float(value)
+
+
+def _normalize_voltage_form(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"unknown", "peak", "rms"}:
+        raise ValueError("ansys_voltage_form must be one of: unknown, peak, rms.")
+    return normalized
+
+
 def _candidate_problem_spec_paths(run_dir: Path) -> list[Path]:
     return [
         run_dir / "data" / "problem_spec_used.yaml",
@@ -192,9 +211,14 @@ def audit_run_sample(
     run_dir: str | Path,
     sample_id: int,
     output_dir: str | Path | None = None,
+    ansys_modal_hz: float | None = None,
+    ansys_frf_peak_hz: float | None = None,
+    ansys_voltage_v: float | None = None,
+    ansys_voltage_form: str = "unknown",
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     sample_id = int(sample_id)
+    ansys_voltage_form = _normalize_voltage_form(ansys_voltage_form)
     mesh_dir = run_dir / "meshes" / "volumes"
     response_path = run_dir / "data" / "fem_responses" / f"sample_{sample_id:04d}_response.npz"
     modal_path = run_dir / "data" / "modal_data" / f"sample_{sample_id:04d}_modal.npz"
@@ -210,7 +234,8 @@ def audit_run_sample(
         freq_hz = np.asarray(response["freq_hz"], dtype=np.float64).reshape(-1)
         voltage_mag = np.asarray(response["voltage_mag"], dtype=np.float64).reshape(-1)
         f_peak_hz = float(np.asarray(response["f_peak_hz"], dtype=np.float64))
-        peak_voltage = float(np.max(voltage_mag))
+        peak_voltage_peak_v = float(np.max(voltage_mag))
+        peak_voltage_rms_v = float(peak_voltage_peak_v / np.sqrt(2.0))
         argmax_freq_hz = float(freq_hz[int(np.argmax(voltage_mag))])
         eigenfreq_hz = np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)
         mode1_frequency_hz = (
@@ -243,6 +268,79 @@ def audit_run_sample(
     warnings: list[str] = []
     if abs(argmax_freq_hz - f_peak_hz) > 1.0e-9:
         warnings.append("The saved FRF peak frequency does not match the stored f_peak_hz exactly.")
+    ansys_modal_reference_hz = None if ansys_modal_hz is None else float(ansys_modal_hz)
+    ansys_frf_peak_reference_hz = None if ansys_frf_peak_hz is None else float(ansys_frf_peak_hz)
+    supplied_frequency_references = [
+        reference
+        for reference in [ansys_modal_reference_hz, ansys_frf_peak_reference_hz]
+        if reference is not None and np.isfinite(reference)
+    ]
+    ambiguous_frequency_reference_hz = (
+        float(supplied_frequency_references[0]) if len(supplied_frequency_references) == 1 else float("nan")
+    )
+    ambiguous_frequency_comparison = len(supplied_frequency_references) == 1
+    if ambiguous_frequency_comparison:
+        warnings.append(
+            "Only one ANSYS frequency reference was provided; the comparison is ambiguous, so both "
+            "mode1_frequency_hz and f_peak_hz are reported against that same ANSYS value."
+        )
+
+    mode1_vs_ansys_modal_error_percent = (
+        _percent_error_percent(mode1_frequency_hz, ansys_modal_reference_hz)
+        if ansys_modal_reference_hz is not None
+        else float("nan")
+    )
+    f_peak_vs_ansys_frf_peak_error_percent = (
+        _percent_error_percent(f_peak_hz, ansys_frf_peak_reference_hz)
+        if ansys_frf_peak_reference_hz is not None
+        else float("nan")
+    )
+    mode1_vs_ambiguous_reference_error_percent = (
+        _percent_error_percent(mode1_frequency_hz, ambiguous_frequency_reference_hz)
+        if ambiguous_frequency_comparison
+        else float("nan")
+    )
+    f_peak_vs_ambiguous_reference_error_percent = (
+        _percent_error_percent(f_peak_hz, ambiguous_frequency_reference_hz)
+        if ambiguous_frequency_comparison
+        else float("nan")
+    )
+
+    voltage_convention_tolerance_percent = 2.0
+    voltage_error_if_ansys_peak = (
+        _percent_error_percent(peak_voltage_peak_v, ansys_voltage_v)
+        if ansys_voltage_v is not None
+        else float("nan")
+    )
+    voltage_error_if_ansys_rms = (
+        _percent_error_percent(peak_voltage_rms_v, ansys_voltage_v)
+        if ansys_voltage_v is not None
+        else float("nan")
+    )
+    selected_voltage_error_percent = float("nan")
+    selected_in_house_voltage_v = float("nan")
+    if ansys_voltage_v is not None:
+        if ansys_voltage_form == "peak":
+            selected_voltage_error_percent = float(voltage_error_if_ansys_peak)
+            selected_in_house_voltage_v = float(peak_voltage_peak_v)
+        elif ansys_voltage_form == "rms":
+            selected_voltage_error_percent = float(voltage_error_if_ansys_rms)
+            selected_in_house_voltage_v = float(peak_voltage_rms_v)
+    voltage_convention_mismatch_likely = bool(
+        ansys_voltage_v is not None
+        and ansys_voltage_form == "unknown"
+        and np.isfinite(voltage_error_if_ansys_rms)
+        and abs(voltage_error_if_ansys_rms) <= voltage_convention_tolerance_percent
+        and (
+            not np.isfinite(voltage_error_if_ansys_peak)
+            or abs(voltage_error_if_ansys_peak) > voltage_convention_tolerance_percent
+        )
+    )
+    if voltage_convention_mismatch_likely:
+        warnings.append(
+            "The ANSYS-vs-in-house voltage gap is likely explained by an RMS-vs-peak convention mismatch."
+        )
+
     top_surface_strain, surface_warnings = _surface_strain_summary(
         strain=preferred_surface_field["strain"],
         centroids=centroids,
@@ -281,16 +379,39 @@ def audit_run_sample(
         },
         "effective_problem_defaults": runtime_defaults,
         "frequency_comparison": {
-            "ansys_modal_target_hz": float(eigenfreq_hz[0]) if eigenfreq_hz.size > 0 else float("nan"),
+            "ansys_modal_target_hz": (
+                float(ansys_modal_reference_hz)
+                if ansys_modal_reference_hz is not None
+                else (float(eigenfreq_hz[0]) if eigenfreq_hz.size > 0 else float("nan"))
+            ),
             "mode1_frequency_hz": float(mode1_frequency_hz),
             "f_peak_hz": float(f_peak_hz),
             "harmonic_field_frequency_hz": float(harmonic_field_frequency_hz),
             "field_frequency_hz": float(harmonic_field_frequency_hz),
             "saved_voltage_peak_freq_hz": float(argmax_freq_hz),
+            "ansys_modal_reference_hz": _as_reference_or_nan(ansys_modal_reference_hz),
+            "ansys_frf_peak_reference_hz": _as_reference_or_nan(ansys_frf_peak_reference_hz),
+            "frequency_reference_ambiguous": bool(ambiguous_frequency_comparison),
+            "ambiguous_frequency_reference_hz": float(ambiguous_frequency_reference_hz),
+            "mode1_vs_ansys_modal_error_percent": float(mode1_vs_ansys_modal_error_percent),
+            "f_peak_vs_ansys_frf_peak_error_percent": float(f_peak_vs_ansys_frf_peak_error_percent),
+            "mode1_vs_ambiguous_frequency_error_percent": float(mode1_vs_ambiguous_reference_error_percent),
+            "f_peak_vs_ambiguous_frequency_error_percent": float(f_peak_vs_ambiguous_reference_error_percent),
         },
         "voltage_comparison": {
-            "peak_voltage_v": float(peak_voltage),
+            "peak_voltage_v": float(peak_voltage_peak_v),
+            "peak_voltage_peak_v": float(peak_voltage_peak_v),
+            "peak_voltage_rms_v": float(peak_voltage_rms_v),
             "external_load_resistance_ohm": float(runtime_defaults.get("resistance_ohm", np.nan)),
+            "ansys_voltage_reference_v": _as_reference_or_nan(ansys_voltage_v),
+            "ansys_voltage_form": str(ansys_voltage_form),
+            "selected_in_house_voltage_v": float(selected_in_house_voltage_v),
+            "selected_voltage_error_percent": float(selected_voltage_error_percent),
+            "error_percent_assuming_ansys_peak": float(voltage_error_if_ansys_peak),
+            "error_percent_assuming_ansys_rms": float(voltage_error_if_ansys_rms),
+            "rms_equivalent_error_percent": float(voltage_error_if_ansys_rms),
+            "voltage_convention_mismatch_likely": bool(voltage_convention_mismatch_likely),
+            "voltage_convention_tolerance_percent": float(voltage_convention_tolerance_percent),
         },
         "electromechanical": {
             "modal_theta_mode1": float(modal_theta[0]) if modal_theta.size > 0 else float("nan"),
@@ -337,6 +458,8 @@ def audit_run_sample(
 
 
 def _print_summary(summary: dict[str, Any]) -> None:
+    frequency_comparison = summary["frequency_comparison"]
+    voltage_comparison = summary["voltage_comparison"]
     print(f"run_dir: {summary['run_dir']}")
     print(f"sample_id: {summary['sample_id']}")
     print(
@@ -347,16 +470,54 @@ def _print_summary(summary: dict[str, Any]) -> None:
     )
     print(
         "frequency_comparison: "
-        f"eigenfreq_hz[0]={summary['frequency_comparison']['ansys_modal_target_hz']:.12g}, "
-        f"mode1_frequency_hz={summary['frequency_comparison']['mode1_frequency_hz']:.12g}, "
-        f"f_peak_hz={summary['frequency_comparison']['f_peak_hz']:.12g}, "
-        f"harmonic_field_frequency_hz={summary['frequency_comparison']['harmonic_field_frequency_hz']:.12g}"
+        f"mode1_frequency_hz={frequency_comparison['mode1_frequency_hz']:.12g}, "
+        f"f_peak_hz={frequency_comparison['f_peak_hz']:.12g}, "
+        f"harmonic_field_frequency_hz={frequency_comparison['harmonic_field_frequency_hz']:.12g}, "
+        f"ansys_modal_reference_hz={frequency_comparison['ansys_modal_reference_hz']:.12g}, "
+        f"ansys_frf_peak_reference_hz={frequency_comparison['ansys_frf_peak_reference_hz']:.12g}"
     )
+    if bool(frequency_comparison.get("frequency_reference_ambiguous", False)):
+        print(
+            "frequency_reference_ambiguity: "
+            f"ansys_reference_hz={frequency_comparison['ambiguous_frequency_reference_hz']:.12g}, "
+            f"mode1_error_percent={frequency_comparison['mode1_vs_ambiguous_frequency_error_percent']:.12g}, "
+            f"f_peak_error_percent={frequency_comparison['f_peak_vs_ambiguous_frequency_error_percent']:.12g}"
+        )
+    else:
+        if np.isfinite(float(frequency_comparison.get("mode1_vs_ansys_modal_error_percent", np.nan))):
+            print(
+                "modal_frequency_error: "
+                f"mode1_vs_ansys_modal_error_percent={frequency_comparison['mode1_vs_ansys_modal_error_percent']:.12g}"
+            )
+        if np.isfinite(float(frequency_comparison.get("f_peak_vs_ansys_frf_peak_error_percent", np.nan))):
+            print(
+                "frf_frequency_error: "
+                f"f_peak_vs_ansys_frf_peak_error_percent={frequency_comparison['f_peak_vs_ansys_frf_peak_error_percent']:.12g}"
+            )
     print(
         "voltage_comparison: "
-        f"peak_voltage_v={summary['voltage_comparison']['peak_voltage_v']:.12g}, "
-        f"load_ohm={summary['voltage_comparison']['external_load_resistance_ohm']:.12g}"
+        f"peak_voltage_peak_v={voltage_comparison['peak_voltage_peak_v']:.12g}, "
+        f"peak_voltage_rms_v={voltage_comparison['peak_voltage_rms_v']:.12g}, "
+        f"load_ohm={voltage_comparison['external_load_resistance_ohm']:.12g}"
     )
+    if np.isfinite(float(voltage_comparison.get("ansys_voltage_reference_v", np.nan))):
+        print(
+            "voltage_reference: "
+            f"ansys_voltage_v={voltage_comparison['ansys_voltage_reference_v']:.12g}, "
+            f"ansys_voltage_form={voltage_comparison['ansys_voltage_form']}"
+        )
+        if str(voltage_comparison.get("ansys_voltage_form", "unknown")) == "unknown":
+            print(
+                "voltage_reference_ambiguity: "
+                f"error_percent_assuming_ansys_peak={voltage_comparison['error_percent_assuming_ansys_peak']:.12g}, "
+                f"error_percent_assuming_ansys_rms={voltage_comparison['error_percent_assuming_ansys_rms']:.12g}, "
+                f"voltage_convention_mismatch_likely={bool(voltage_comparison['voltage_convention_mismatch_likely'])}"
+            )
+        else:
+            print(
+                "voltage_error: "
+                f"selected_voltage_error_percent={voltage_comparison['selected_voltage_error_percent']:.12g}"
+            )
     print(
         "electromechanical: "
         f"modal_theta_mode1={summary['electromechanical']['modal_theta_mode1']:.12g}, "
@@ -412,12 +573,25 @@ def main() -> None:
         default="",
         help="Optional directory for exported top-surface strain CSV/NPZ and the JSON summary.",
     )
+    parser.add_argument("--ansys-modal-hz", type=float, default=None, help="Optional ANSYS modal reference frequency in Hz.")
+    parser.add_argument("--ansys-frf-peak-hz", type=float, default=None, help="Optional ANSYS FRF peak reference frequency in Hz.")
+    parser.add_argument("--ansys-voltage-v", type=float, default=None, help="Optional ANSYS voltage reference value.")
+    parser.add_argument(
+        "--ansys-voltage-form",
+        default="unknown",
+        choices=["unknown", "peak", "rms"],
+        help="Interpretation of --ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+    )
     args = parser.parse_args()
 
     summary = audit_run_sample(
         run_dir=args.run_dir,
         sample_id=int(args.sample_id),
         output_dir=args.output_dir or None,
+        ansys_modal_hz=args.ansys_modal_hz,
+        ansys_frf_peak_hz=args.ansys_frf_peak_hz,
+        ansys_voltage_v=args.ansys_voltage_v,
+        ansys_voltage_form=args.ansys_voltage_form,
     )
     _print_summary(summary)
 

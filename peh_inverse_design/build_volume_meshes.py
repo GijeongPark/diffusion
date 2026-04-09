@@ -20,6 +20,7 @@ if __package__ in (None, ""):
     )
     from peh_inverse_design.volume_mesh import (
         VolumeMeshConfig,
+        volume_mesh_preset_overrides,
         mesh_tiled_plate_volume_sample,
     )
 else:
@@ -34,6 +35,7 @@ else:
     )
     from .volume_mesh import (
         VolumeMeshConfig,
+        volume_mesh_preset_overrides,
         mesh_tiled_plate_volume_sample,
     )
 
@@ -156,6 +158,15 @@ def main() -> None:
         help="Continue scanning candidate samples until this many successful solid exports are produced.",
     )
     parser.add_argument(
+        "--mesh-preset",
+        default="default",
+        choices=["default", "ansys_parity"],
+        help=(
+            "Named mesh preset. 'default' keeps the lightweight production mesh, while "
+            "'ansys_parity' increases through-thickness resolution and disables silent coarsening."
+        ),
+    )
+    parser.add_argument(
         "--substrate-thickness",
         type=float,
         default=None,
@@ -231,22 +242,22 @@ def main() -> None:
     parser.add_argument(
         "--substrate-layers",
         type=int,
-        default=2,
-        help="Number of swept layers through the substrate thickness for the fast layered_tet solver mesh.",
+        default=None,
+        help="Number of swept layers through the substrate thickness. Defaults to the selected mesh preset.",
     )
     parser.add_argument(
         "--piezo-layers",
         type=int,
-        default=1,
-        help="Number of swept layers through the piezo thickness for the fast layered_tet solver mesh.",
+        default=None,
+        help="Number of swept layers through the piezo thickness. Defaults to the selected mesh preset.",
     )
     parser.add_argument(
         "--solver-max-q2-vector-dofs",
         type=int,
-        default=VolumeMeshConfig().max_solver_vector_dofs,
+        default=None,
         help=(
             "Estimated quadratic vector-DOF cap for the layered_tet solver mesh. "
-            "The mesh is coarsened automatically until it falls below this limit."
+            "The default comes from the selected mesh preset."
         ),
     )
     parser.add_argument(
@@ -312,6 +323,19 @@ def main() -> None:
     if target_ok is not None and target_ok <= 0:
         raise ValueError("--target-ok must be strictly positive when provided.")
 
+    preset_overrides = volume_mesh_preset_overrides(str(args.mesh_preset))
+    substrate_layers = int(
+        preset_overrides["substrate_layers"] if args.substrate_layers is None else args.substrate_layers
+    )
+    piezo_layers = int(
+        preset_overrides["piezo_layers"] if args.piezo_layers is None else args.piezo_layers
+    )
+    solver_max_q2_vector_dofs = (
+        preset_overrides["max_solver_vector_dofs"]
+        if args.solver_max_q2_vector_dofs is None
+        else int(args.solver_max_q2_vector_dofs)
+    )
+
     volume_config = VolumeMeshConfig(
         substrate_thickness_m=float(
             runtime_defaults.get("substrate_thickness_m", 1.0e-3)
@@ -326,8 +350,8 @@ def main() -> None:
         mesh_size_relative_to_cell=float(args.mesh_size_scale),
         cad_reference_size_relative_to_cell=float(args.cad_reference_size_scale),
         limit_solver_mesh_by_thickness=bool(args.limit_solver_mesh_by_thickness),
-        substrate_layers=int(args.substrate_layers),
-        piezo_layers=int(args.piezo_layers),
+        substrate_layers=int(substrate_layers),
+        piezo_layers=int(piezo_layers),
         solver_mesh_backend=str(args.solver_mesh_backend),
         ansys_step_strategy=str(args.ansys_step_strategy),
         write_native_msh=bool(args.write_native_msh),
@@ -336,9 +360,9 @@ def main() -> None:
         exact_cad=not bool(args.repair_cad),
         repair_cad=bool(args.repair_cad),
         repair_bridge_width_m=None if args.repair_bridge_width_m is None else float(args.repair_bridge_width_m),
-        max_solver_vector_dofs=(
-            None if args.solver_max_q2_vector_dofs is None else int(args.solver_max_q2_vector_dofs)
-        ),
+        max_solver_vector_dofs=None if solver_max_q2_vector_dofs is None else int(solver_max_q2_vector_dofs),
+        allow_solver_mesh_coarsening=bool(preset_overrides["allow_solver_mesh_coarsening"]),
+        mesh_preset=str(args.mesh_preset),
         export_inspection_single_face_step=bool(args.export_inspection_single_face_step),
         cad_planform_simplify_relative_to_reference=float(args.cad_planform_simplify_scale),
         cad_min_hole_area_relative_to_reference_squared=float(args.cad_min_hole_area_scale),
@@ -447,9 +471,11 @@ def main() -> None:
                 ),
                 "limit_solver_mesh_by_thickness": bool(volume_config.limit_solver_mesh_by_thickness),
                 "solver_mesh_backend": str(volume_config.solver_mesh_backend),
+                "mesh_preset": str(volume_config.mesh_preset),
                 "max_solver_vector_dofs": None
                 if volume_config.max_solver_vector_dofs is None
                 else int(volume_config.max_solver_vector_dofs),
+                "allow_solver_mesh_coarsening": bool(volume_config.allow_solver_mesh_coarsening),
                 "ansys_step_strategy": str(volume_config.ansys_step_strategy),
                 "substrate_layers": int(volume_config.substrate_layers),
                 "piezo_layers": int(volume_config.piezo_layers),

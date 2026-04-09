@@ -239,6 +239,17 @@ def apply_strict_ansys_parity_overrides_to_config(config: PipelineConfig) -> Pip
     )
 
 
+def disable_mode_shape_storage_for_strict_parity(config: PipelineConfig) -> PipelineConfig:
+    if not bool(config.strict_parity) or not bool(config.solver_store_mode_shapes):
+        return config
+    print(
+        "Strict parity disables explicit modal mode-shape archival to avoid parity-invalid OOMs; "
+        "the modal/response summary outputs are still saved.",
+        flush=True,
+    )
+    return replace(config, solver_store_mode_shapes=False)
+
+
 def _build_mesh_command(
     *,
     project_python: Path,
@@ -1015,6 +1026,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         write_problem_spec_snapshot(problem_spec, runtime_problem_spec_path)
     config = _resolve_runtime_config(config, problem_spec)
     config = apply_strict_ansys_parity_overrides_to_config(config)
+    config = disable_mode_shape_storage_for_strict_parity(config)
     candidate_unit_cell_npz = _prepare_candidate_unit_cell_dataset(config, run_root, project_root)
     cell_size_m, tile_counts, geometry_scale_source = _resolve_geometry_scale_summary(
         config,
@@ -1072,6 +1084,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"peak_search_seed={config.peak_search_seed}, "
         f"element_order={config.solver_element_order}, eigensolver_backend={_solver_requested_backend(config)}, "
         f"allow_eigensolver_fallback={config.allow_eigensolver_fallback}, strict_parity={config.strict_parity}, "
+        f"store_mode_shapes={config.solver_store_mode_shapes}, "
         f"skip_existing={config.skip_existing_solver_outputs}, "
         f"mesh_size_scale={config.mesh_size_scale:.6g}, cad_reference_scale={config.cad_reference_size_scale:.6g}, "
         f"max_q2_vector_dofs={effective_mesh['solver_max_q2_vector_dofs']}, "

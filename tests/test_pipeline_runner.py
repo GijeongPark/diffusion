@@ -15,6 +15,7 @@ from peh_inverse_design.pipeline_runner import (
     _run_solver_with_isolated_retry,
     _solver_runtime_error_from_diagnostic,
     apply_strict_ansys_parity_overrides_to_config,
+    disable_mode_shape_storage_for_strict_parity,
 )
 
 
@@ -140,6 +141,20 @@ class PipelineRunnerTests(unittest.TestCase):
         self.assertFalse(updated.allow_eigensolver_fallback)
         self.assertEqual(updated.audit_ansys_voltage_form, "rms")
 
+    def test_disable_mode_shape_storage_for_strict_parity(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            strict_parity=True,
+            solver_store_mode_shapes=True,
+        )
+
+        updated = disable_mode_shape_storage_for_strict_parity(config)
+
+        self.assertTrue(config.solver_store_mode_shapes)
+        self.assertFalse(updated.solver_store_mode_shapes)
+
     def test_build_solver_inner_args_threads_peak_search_seed(self) -> None:
         config = PipelineConfig(
             source_unit_cell_npz="dummy.npz",
@@ -160,6 +175,30 @@ class PipelineRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(args[args.index("--peak-search-seed") + 1], "dominant_coupling")
+
+    def test_build_solver_inner_args_omits_mode_shape_storage_after_strict_normalization(self) -> None:
+        config = disable_mode_shape_storage_for_strict_parity(
+            PipelineConfig(
+                source_unit_cell_npz="dummy.npz",
+                exact_cad=True,
+                repair_cad=False,
+                substrate_rho=7930.0,
+                piezo_rho=7500.0,
+                strict_parity=True,
+                solver_store_mode_shapes=True,
+            )
+        )
+
+        args = _build_solver_inner_args(
+            project_root=Path("/tmp/project"),
+            response_dir=Path("/tmp/project/data/fem_responses"),
+            modal_dir=Path("/tmp/project/data/modal_data"),
+            config=config,
+            runtime_problem_spec_path=None,
+            mesh_path=Path("/tmp/project/meshes/plate3d_0000_fenicsx.npz"),
+        )
+
+        self.assertNotIn("--store-mode-shapes", args)
 
     def test_solver_runtime_error_uses_root_cause_from_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

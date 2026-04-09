@@ -510,6 +510,60 @@ def _write_pipeline_solver_diagnostic(
     return output_path
 
 
+def _solver_runtime_error_from_diagnostic(
+    *,
+    response_dir: Path,
+    mesh_path: Path,
+    exc: subprocess.CalledProcessError,
+) -> RuntimeError | None:
+    sample_id = _solver_sample_id_from_mesh(mesh_path)
+    diagnostic_path = _solver_diagnostic_output_path(response_dir, sample_id)
+    if not diagnostic_path.exists():
+        return None
+    try:
+        payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+
+    reason = str(payload.get("parity_invalid_reason", "")).strip() or str(payload.get("error_message", "")).strip()
+    if not reason:
+        reason = f"solver container exited with status {exc.returncode}"
+    strict_requested = bool(payload.get("strict_parity_requested", False))
+    backend = str(payload.get("eigensolver_backend", "unknown"))
+    used_eigensolver_fallback = bool(payload.get("used_eigensolver_fallback", False))
+    used_element_order_fallback = bool(payload.get("used_element_order_fallback", False))
+    diagnostic_only = bool(payload.get("diagnostic_only", False))
+
+    if strict_requested:
+        prefix = f"Strict parity became invalid for sample {sample_id:04d}: "
+    else:
+        prefix = f"Solver failed for sample {sample_id:04d}: "
+    return RuntimeError(
+        f"{prefix}{reason} "
+        f"[backend={backend}, "
+        f"used_eigensolver_fallback={used_eigensolver_fallback}, "
+        f"used_element_order_fallback={used_element_order_fallback}, "
+        f"diagnostic_only={diagnostic_only}] "
+        f"Diagnostic payload: {diagnostic_path}"
+    )
+
+
+def _raise_solver_runtime_error_from_existing_diagnostics(
+    *,
+    mesh_files: list[Path],
+    response_dir: Path,
+    exc: subprocess.CalledProcessError,
+) -> None:
+    for mesh_path in mesh_files:
+        diagnostic_error = _solver_runtime_error_from_diagnostic(
+            response_dir=response_dir,
+            mesh_path=mesh_path,
+            exc=exc,
+        )
+        if diagnostic_error is not None:
+            raise diagnostic_error from exc
+
+
 def _solver_outputs_exist(mesh_path: Path, response_dir: Path, modal_dir: Path) -> bool:
     sample_id = _solver_sample_id_from_mesh(mesh_path)
     return (
@@ -637,6 +691,11 @@ def _run_solver_with_isolated_retry(
         _run_command(batch_cmd, cwd=project_root)
         return
     except subprocess.CalledProcessError as exc:
+        _raise_solver_runtime_error_from_existing_diagnostics(
+            mesh_files=mesh_files,
+            response_dir=response_dir,
+            exc=exc,
+        )
         if exc.returncode != 137:
             raise
 
@@ -691,6 +750,11 @@ def _run_solver_with_isolated_retry(
                     continue
                 except subprocess.CalledProcessError as fallback_exc:
                     mesh_exc = fallback_exc
+            _raise_solver_runtime_error_from_existing_diagnostics(
+                mesh_files=[mesh_path],
+                response_dir=response_dir,
+                exc=mesh_exc,
+            )
             if mesh_exc.returncode == 137 and parity_sensitive:
                 diagnostic_path = _write_pipeline_solver_diagnostic(
                     response_dir=response_dir,

@@ -257,6 +257,59 @@ class PipelineRunnerTests(unittest.TestCase):
                 self.assertEqual(requested_orders, [None, None])
                 self.assertTrue((response_dir / "sample_0002_solver_diagnostic.json").exists())
 
+    def test_batch_failure_uses_existing_solver_diagnostic_for_strict_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mesh_dir = root / "meshes"
+            mesh_dir.mkdir(parents=True, exist_ok=True)
+            mesh_path = mesh_dir / "plate3d_0002_fenicsx.npz"
+            mesh_path.write_bytes(b"stub")
+            response_dir = root / "responses"
+            response_dir.mkdir(parents=True, exist_ok=True)
+            modal_dir = root / "modal"
+            diagnostic_path = response_dir / "sample_0002_solver_diagnostic.json"
+            diagnostic_path.write_text(
+                (
+                    "{\n"
+                    '  "sample_id": 2,\n'
+                    '  "eigensolver_backend": "shift_invert_lu",\n'
+                    '  "used_eigensolver_fallback": false,\n'
+                    '  "used_element_order_fallback": false,\n'
+                    '  "solver_parity_valid": false,\n'
+                    '  "parity_invalid_reason": "strict parity requested, but shift_invert_lu failed and automatic eigensolver fallback is disallowed",\n'
+                    '  "strict_parity_requested": true,\n'
+                    '  "diagnostic_only": false\n'
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                source_unit_cell_npz=root / "dummy.npz",
+                exact_cad=True,
+                repair_cad=False,
+                mesh_preset="ansys_parity",
+                strict_parity=True,
+            )
+
+            with mock.patch(
+                "peh_inverse_design.pipeline_runner._build_solver_docker_command",
+                return_value=["docker", "run"],
+            ), mock.patch(
+                "peh_inverse_design.pipeline_runner._run_command",
+                side_effect=subprocess.CalledProcessError(1, ["docker", "run"]),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    _run_solver_with_isolated_retry(
+                        mesh_files=[mesh_path],
+                        project_root=root,
+                        response_dir=response_dir,
+                        modal_dir=modal_dir,
+                        config=config,
+                        runtime_problem_spec_path=None,
+                    )
+                self.assertIn("Strict parity became invalid for sample 0002", str(raised.exception))
+                self.assertIn(str(diagnostic_path), str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

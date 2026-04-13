@@ -9,6 +9,8 @@ from unittest import mock
 from peh_inverse_design.pipeline_runner import (
     PipelineConfig,
     _build_mesh_command,
+    _build_solver_inner_args,
+    _cli_parser,
     _run_solver_with_isolated_retry,
 )
 
@@ -105,6 +107,40 @@ class PipelineRunnerTests(unittest.TestCase):
                 )
 
         self.assertEqual(requested_orders, [None, None, 1])
+
+    def test_build_solver_inner_args_forwards_house_voltage_convention(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            exact_cad=True,
+            repair_cad=False,
+            substrate_rho=7930.0,
+            piezo_rho=7500.0,
+            house_voltage_amplitude_convention="rms",
+        )
+
+        cmd = _build_solver_inner_args(
+            project_root=Path("/tmp/project"),
+            response_dir=Path("/tmp/project/data/fem_responses"),
+            modal_dir=Path("/tmp/project/data/modal_data"),
+            config=config,
+            runtime_problem_spec_path=None,
+            mesh_path=Path("/tmp/project/meshes/plate3d_0000_fenicsx.npz"),
+        )
+
+        self.assertEqual(
+            cmd[cmd.index("--house-voltage-amplitude-convention") + 1],
+            "rms",
+        )
+
+    def test_cli_parser_no_longer_exposes_ansys_audit_flags(self) -> None:
+        parser = _cli_parser()
+        option_strings = {option for action in parser._actions for option in action.option_strings}
+
+        self.assertNotIn("--audit-ansys-modal-hz", option_strings)
+        self.assertNotIn("--audit-ansys-frf-peak-hz", option_strings)
+        self.assertNotIn("--audit-ansys-voltage-v", option_strings)
+        self.assertNotIn("--audit-ansys-voltage-form", option_strings)
+        self.assertNotIn("--audit-sample-id", option_strings)
 
 
 if __name__ == "__main__":

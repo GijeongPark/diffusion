@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit_ansys_alignment import audit_run_sample
 from .problem_spec import (
     build_runtime_defaults,
     default_problem_spec_path,
@@ -57,17 +56,13 @@ class PipelineConfig:
     tile_count_y: int | None = None
     substrate_rho: float | None = None
     piezo_rho: float | None = None
+    house_voltage_amplitude_convention: str | None = None
     exact_cad: bool = True
     repair_cad: bool = False
     repair_bridge_width_m: float | None = None
     export_inspection_single_face_step: bool = False
     create_reports: bool = True
     build_integrated_dataset: bool = True
-    audit_ansys_modal_hz: float | None = None
-    audit_ansys_frf_peak_hz: float | None = None
-    audit_ansys_voltage_v: float | None = None
-    audit_ansys_voltage_form: str = "unknown"
-    audit_sample_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if bool(self.exact_cad) == bool(self.repair_cad):
@@ -92,8 +87,8 @@ class PipelineConfig:
             raise ValueError("solver_max_q2_vector_dofs must be strictly positive when provided.")
         if self.solver_oom_fallback_element_order is not None and int(self.solver_oom_fallback_element_order) <= 0:
             raise ValueError("solver_oom_fallback_element_order must be strictly positive when provided.")
-        if str(self.audit_ansys_voltage_form).strip().lower() not in {"unknown", "peak", "rms"}:
-            raise ValueError("audit_ansys_voltage_form must be one of: unknown, peak, rms.")
+        if self.house_voltage_amplitude_convention is not None and str(self.house_voltage_amplitude_convention).strip().lower() not in {"peak", "rms"}:
+            raise ValueError("house_voltage_amplitude_convention must be one of: peak, rms.")
 
 
 @dataclass(frozen=True)
@@ -108,7 +103,6 @@ class PipelineArtifacts:
     response_dataset_path: Path
     integrated_dataset_path: Path
     integrated_index_csv_path: Path
-    audit_dir: Path
     report_dir: Path
     gallery_path: Path
 
@@ -253,68 +247,6 @@ def _build_mesh_command(
     return mesh_cmd
 
 
-def _audit_is_requested(config: PipelineConfig) -> bool:
-    return bool(config.audit_sample_ids) or any(
-        value is not None
-        for value in [
-            config.audit_ansys_modal_hz,
-            config.audit_ansys_frf_peak_hz,
-            config.audit_ansys_voltage_v,
-        ]
-    )
-
-
-def _audit_sample_ids_for_run(config: PipelineConfig, mesh_files: list[Path]) -> list[int]:
-    if config.audit_sample_ids:
-        unique = sorted({int(sample_id) for sample_id in config.audit_sample_ids})
-        return unique
-    return sorted({_solver_sample_id_from_mesh(mesh_path) for mesh_path in mesh_files})
-
-
-def _run_audit_summaries(
-    *,
-    run_root: Path,
-    mesh_files: list[Path],
-    config: PipelineConfig,
-) -> list[dict[str, object]]:
-    audit_dir = run_root / "reports" / "audit"
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    summaries: list[dict[str, object]] = []
-    for sample_id in _audit_sample_ids_for_run(config, mesh_files):
-        summary = audit_run_sample(
-            run_dir=run_root,
-            sample_id=int(sample_id),
-            output_dir=audit_dir,
-            ansys_modal_hz=config.audit_ansys_modal_hz,
-            ansys_frf_peak_hz=config.audit_ansys_frf_peak_hz,
-            ansys_voltage_v=config.audit_ansys_voltage_v,
-            ansys_voltage_form=config.audit_ansys_voltage_form,
-        )
-        summaries.append(summary)
-        frequency = summary["frequency_comparison"]
-        voltage = summary["voltage_comparison"]
-        print(
-            "Audit summary       : "
-            f"sample={int(summary['sample_id']):04d}, "
-            f"mode1={float(frequency['mode1_frequency_hz']):.12g} Hz, "
-            f"f_peak={float(frequency['f_peak_hz']):.12g} Hz, "
-            f"Vpeak={float(voltage['peak_voltage_peak_v']):.12g} V, "
-            f"Vrms={float(voltage['peak_voltage_rms_v']):.12g} V, "
-            f"voltage_convention_mismatch_likely={bool(voltage['voltage_convention_mismatch_likely'])}"
-        )
-    return summaries
-
-
-def _parse_audit_sample_ids(values: list[str] | None) -> tuple[int, ...]:
-    parsed: list[int] = []
-    for value in values or []:
-        for chunk in str(value).split(","):
-            token = chunk.strip()
-            if token:
-                parsed.append(int(token))
-    return tuple(parsed)
-
-
 def _load_mesh_build_summary(mesh_dir: Path) -> dict[str, object] | None:
     summary_path = mesh_dir / "mesh_build_summary.json"
     if not summary_path.exists():
@@ -419,6 +351,8 @@ def _build_solver_inner_args(
             str(config.solver_search_points),
             "--element-order",
             str(config.solver_element_order if element_order is None else int(element_order)),
+            "--house-voltage-amplitude-convention",
+            str(config.house_voltage_amplitude_convention or "peak"),
         ]
     )
     if config.solver_store_mode_shapes:
@@ -584,6 +518,11 @@ def _resolve_runtime_config(config: PipelineConfig, problem_spec: dict[str, obje
             if config.piezo_rho is None
             else config.piezo_rho
         ),
+        house_voltage_amplitude_convention=str(
+            runtime_defaults.get("house_voltage_amplitude_convention", "peak")
+            if config.house_voltage_amplitude_convention is None
+            else config.house_voltage_amplitude_convention
+        ).strip().lower(),
     )
 
 
@@ -789,10 +728,9 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
     integrated_dataset_path = run_root / "data" / "integrated_dataset.npz"
     integrated_index_csv_path = integrated_dataset_path.with_suffix(".csv")
     report_dir = run_root / "reports"
-    audit_dir = report_dir / "audit"
     gallery_path = report_dir / "gallery.png"
     effective_mesh = _effective_mesh_builder_settings(config)
-    total_steps = 5 + int(_audit_is_requested(config))
+    total_steps = 5
     step_idx = 1
 
     plate_size_m = (
@@ -829,13 +767,14 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         f"layers={effective_mesh['substrate_layers']}+{effective_mesh['piezo_layers']}, "
         f"modes={config.solver_num_modes}, search_points={config.solver_search_points}, "
         f"element_order={config.solver_element_order}, skip_existing={config.skip_existing_solver_outputs}, "
+        f"house_voltage_amplitude_convention={config.house_voltage_amplitude_convention}, "
         f"mesh_size_scale={config.mesh_size_scale:.6g}, cad_reference_scale={config.cad_reference_size_scale:.6g}, "
         f"max_q2_vector_dofs={effective_mesh['solver_max_q2_vector_dofs']}, "
         f"oom_fallback_order={config.solver_oom_fallback_element_order}, "
         f"ansys_step_strategy={config.ansys_step_strategy}, thickness_limited_mesh={config.limit_solver_mesh_by_thickness}"
     )
 
-    _print_step(f"Step {step_idx}/{total_steps}: Export ANSYS STEP geometry and build Python solver meshes")
+    _print_step(f"Step {step_idx}/{total_steps}: Export STEP geometry for manual Workbench handoff and build Python solver meshes")
     step_idx += 1
     summary_path = mesh_dir / "mesh_build_summary.json"
     if summary_path.exists():
@@ -954,15 +893,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         ]
         _run_command(integrated_cmd, cwd=project_root)
 
-    if _audit_is_requested(config):
-        _print_step(f"Step {step_idx}/{total_steps}: Audit ANSYS alignment")
-        step_idx += 1
-        _run_audit_summaries(
-            run_root=run_root,
-            mesh_files=mesh_files,
-            config=config,
-        )
-
     _print_step(f"Step {step_idx}/{total_steps}: Create reports")
     if config.create_reports:
         env = dict(os.environ)
@@ -997,7 +927,6 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         response_dataset_path=response_dataset_path,
         integrated_dataset_path=integrated_dataset_path,
         integrated_index_csv_path=integrated_index_csv_path,
-        audit_dir=audit_dir,
         report_dir=report_dir,
         gallery_path=gallery_path,
     )
@@ -1081,23 +1010,14 @@ def _cli_parser() -> argparse.ArgumentParser:
         default=None,
         help="Piezo density in kg/m^3. Defaults to the shared problem spec when available.",
     )
+    parser.add_argument(
+        "--house-voltage-amplitude-convention",
+        default=None,
+        choices=["peak", "rms"],
+        help="Canonical peak/RMS convention used when storing in-house voltage magnitudes and peak_voltage.",
+    )
     parser.add_argument("--repair-cad", action="store_true", help="Use explicit bridge-repair CAD instead of exact topology-preserving CAD.")
     parser.add_argument("--repair-bridge-width-m", type=float, default=None, help="Explicit bridge width in repair CAD mode.")
-    parser.add_argument("--audit-ansys-modal-hz", type=float, default=None, help="Optional ANSYS modal reference frequency in Hz.")
-    parser.add_argument("--audit-ansys-frf-peak-hz", type=float, default=None, help="Optional ANSYS FRF peak reference frequency in Hz.")
-    parser.add_argument("--audit-ansys-voltage-v", type=float, default=None, help="Optional ANSYS voltage reference value.")
-    parser.add_argument(
-        "--audit-ansys-voltage-form",
-        default="unknown",
-        choices=["unknown", "peak", "rms"],
-        help="Interpretation of --audit-ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
-    )
-    parser.add_argument(
-        "--audit-sample-id",
-        action="append",
-        default=[],
-        help="Sample id(s) to audit after aggregation. Repeat the flag or pass a comma-separated list.",
-    )
     parser.add_argument("--no-reports", action="store_true", help="Skip summary image generation.")
     parser.add_argument("--no-integrated-dataset", action="store_true", help="Skip integrated_dataset.npz generation.")
     parser.add_argument("--no-materialize-input-dataset", action="store_true", help="Use the source NPZ directly instead of writing a run-local candidate NPZ copy.")
@@ -1141,16 +1061,12 @@ def main() -> None:
         tile_count_y=args.tile_count_y,
         substrate_rho=None if args.substrate_rho is None else float(args.substrate_rho),
         piezo_rho=None if args.piezo_rho is None else float(args.piezo_rho),
+        house_voltage_amplitude_convention=args.house_voltage_amplitude_convention,
         exact_cad=not bool(args.repair_cad),
         repair_cad=bool(args.repair_cad),
         repair_bridge_width_m=args.repair_bridge_width_m,
         create_reports=not bool(args.no_reports),
         build_integrated_dataset=not bool(args.no_integrated_dataset),
-        audit_ansys_modal_hz=args.audit_ansys_modal_hz,
-        audit_ansys_frf_peak_hz=args.audit_ansys_frf_peak_hz,
-        audit_ansys_voltage_v=args.audit_ansys_voltage_v,
-        audit_ansys_voltage_form=str(args.audit_ansys_voltage_form),
-        audit_sample_ids=_parse_audit_sample_ids(args.audit_sample_id),
     )
     run_pipeline(config)
 

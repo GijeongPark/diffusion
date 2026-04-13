@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from peh_inverse_design.visualize_run_outputs import _dataset_plate_size_m, _load_dataset_row
+from peh_inverse_design.response_dataset import save_fem_response
+from peh_inverse_design.visualize_run_outputs import _dataset_plate_size_m, _load_dataset_row, _load_response
 from peh_inverse_design.modal_surface_fields import preferred_surface_strain_field
 
 
@@ -67,6 +68,27 @@ class VisualizeRunOutputsTests(unittest.TestCase):
         self.assertIsNotNone(field)
         self.assertEqual(field.kind, "modal")
         np.testing.assert_array_equal(field.strain, np.asarray([1.0, 2.0], dtype=np.float64))
+
+    def test_load_response_uses_stored_voltage_convention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response_dir = Path(tmpdir) / "responses"
+            save_fem_response(
+                sample_id=3,
+                f_peak_hz=0.8,
+                freq_hz=np.asarray([0.7, 0.8, 0.9], dtype=np.float64),
+                voltage_mag=np.asarray([2.0, 4.0, 3.0], dtype=np.float64),
+                output_dir=response_dir,
+                voltage_amplitude_convention="rms",
+            )
+
+            response = _load_response(response_dir / "sample_0003_response.npz")
+
+            np.testing.assert_allclose(
+                np.asarray(response["voltage_mag"], dtype=np.float64),
+                np.asarray([2.0, 4.0, 3.0], dtype=np.float64) / np.sqrt(2.0),
+            )
+            self.assertAlmostEqual(float(response["peak_voltage"]), 4.0 / np.sqrt(2.0))
+            self.assertEqual(str(np.asarray(response["peak_voltage_form"]).reshape(-1)[0]), "rms")
 
 
 if __name__ == "__main__":

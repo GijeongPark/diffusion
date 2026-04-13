@@ -79,7 +79,9 @@ This aligned dataset contains, per sample:
 - modal diagnostics such as `eigenfreq_hz`, `field_frequency_hz`, `top_surface_strain_eqv`
 - path indices to the corresponding mesh, response, and modal files
 
-Export solid STEP geometry for ANSYS and build the fast Python solver meshes from the same planform:
+The in-house response files and aggregated datasets now treat `voltage_mag` and `peak_voltage` in the configured `electrical.house_voltage_amplitude_convention` (`peak` or `rms`), while still storing both `peak_voltage_peak_v` and `peak_voltage_rms_v` for traceability.
+
+Export solid STEP geometry for manual ANSYS Workbench handoff and build the fast Python solver meshes from the same planform:
 
 ```bash
 ./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
@@ -148,38 +150,11 @@ Run the FEniCSx modal-reduction solver in the official Docker image:
 ./scripts/run_fenicsx_solver.sh \
   --mesh /workspace/meshes/volumes/plate3d_0000_fenicsx.npz \
   --response-dir /workspace/data/fem_responses \
-  --modes-dir /workspace/data/modal_data
+  --modes-dir /workspace/data/modal_data \
+  --house-voltage-amplitude-convention peak
 ```
 
-Audit one sample against ANSYS without mixing modal-vs-FRF or peak-vs-RMS conventions:
-
-```bash
-./.venv/bin/python -m peh_inverse_design.audit_ansys_alignment \
-  --run-dir runs/0402 \
-  --sample-id 0 \
-  --ansys-modal-hz 0.58 \
-  --ansys-voltage-v 242.96 \
-  --ansys-voltage-form unknown
-```
-
-`audit_ansys_alignment` now reports `mode1_frequency_hz`, `f_peak_hz`, and `harmonic_field_frequency_hz` separately, and it prints both `peak_voltage_peak_v` and `peak_voltage_rms_v`. If the ANSYS voltage form is unknown, it compares the reference against both interpretations so an RMS-vs-peak mismatch is visible instead of being mistaken for a physics error.
-
-Run a dedicated single-sample parity sweep with the verification mesh preset:
-
-```bash
-./.venv/bin/python -m peh_inverse_design.verify_sample_parity \
-  --sample-id 0 \
-  --unit-cell-npz data/unit_cell_dataset.npz \
-  --output-dir tmp/parity_sweeps/sample_0000 \
-  --mesh-preset ansys_parity \
-  --layer-sweep 2:1,4:2,6:2,8:3 \
-  --mesh-size-scales 0.08 \
-  --ansys-modal-hz 0.58 \
-  --ansys-voltage-v 242.96 \
-  --ansys-voltage-form unknown
-```
-
-The `ansys_parity` mesh preset raises through-thickness resolution and disables silent solver-mesh coarsening so the saved JSON/CSV sweep report reflects the actual verification mesh that was solved.
+Manual Workbench handoff stays outside the automated pipeline. The mesh/CAD step still writes `plate3d_XXXX.step`, `plate3d_XXXX_ansys_face_groups.json`, and `plate3d_XXXX_ansys_workbench.json` so you can import the geometry into ANSYS Workbench and scope electrodes/interfaces manually when needed.
 
 Create human-readable summary figures after a run:
 

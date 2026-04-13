@@ -7,6 +7,33 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def normalize_voltage_amplitude_convention(convention: str) -> str:
+    normalized = str(convention).strip().lower()
+    if normalized not in {"peak", "rms"}:
+        raise ValueError("voltage_amplitude_convention must be 'peak' or 'rms'.")
+    return normalized
+
+
+def peak_voltage_in_convention(
+    peak_voltage_peak_v: float,
+    peak_voltage_rms_v: float,
+    voltage_amplitude_convention: str,
+) -> float:
+    normalized = normalize_voltage_amplitude_convention(voltage_amplitude_convention)
+    return float(peak_voltage_peak_v if normalized == "peak" else peak_voltage_rms_v)
+
+
+def voltage_trace_in_convention(
+    raw_voltage_mag: NDArray[np.floating],
+    voltage_amplitude_convention: str,
+) -> NDArray[np.float64]:
+    voltage = np.asarray(raw_voltage_mag, dtype=np.float64).reshape(-1)
+    normalized = normalize_voltage_amplitude_convention(voltage_amplitude_convention)
+    if normalized == "peak":
+        return voltage
+    return voltage / np.sqrt(2.0)
+
+
 def save_fem_response(
     sample_id: int,
     f_peak_hz: float,
@@ -14,18 +41,26 @@ def save_fem_response(
     voltage_mag: NDArray[np.floating],
     output_dir: str | Path,
     quality_flag: int = 1,
+    voltage_amplitude_convention: str = "peak",
 ) -> Path:
     """Persist one FEM response in the standard on-disk format."""
     freq_hz = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
-    voltage_mag = np.asarray(voltage_mag, dtype=np.float64).reshape(-1)
-    if freq_hz.shape != voltage_mag.shape:
+    raw_voltage_mag = np.asarray(voltage_mag, dtype=np.float64).reshape(-1)
+    if freq_hz.shape != raw_voltage_mag.shape:
         raise ValueError("freq_hz and voltage_mag must have the same shape.")
     if freq_hz.ndim != 1:
         raise ValueError("freq_hz and voltage_mag must be 1-D arrays.")
     if f_peak_hz <= 0.0:
         raise ValueError("f_peak_hz must be positive.")
-    peak_voltage_peak_v = float(np.nanmax(voltage_mag))
+    peak_voltage_form = normalize_voltage_amplitude_convention(voltage_amplitude_convention)
+    peak_voltage_peak_v = float(np.nanmax(raw_voltage_mag))
     peak_voltage_rms_v = float(peak_voltage_peak_v / np.sqrt(2.0))
+    canonical_voltage_mag = voltage_trace_in_convention(raw_voltage_mag, peak_voltage_form)
+    peak_voltage = peak_voltage_in_convention(
+        peak_voltage_peak_v,
+        peak_voltage_rms_v,
+        peak_voltage_form,
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -35,11 +70,11 @@ def save_fem_response(
         sample_id=np.asarray(int(sample_id), dtype=np.int32),
         f_peak_hz=np.asarray(float(f_peak_hz), dtype=np.float64),
         freq_hz=freq_hz,
-        voltage_mag=voltage_mag,
-        peak_voltage=np.asarray(peak_voltage_peak_v, dtype=np.float64),
+        voltage_mag=canonical_voltage_mag,
+        peak_voltage=np.asarray(peak_voltage, dtype=np.float64),
         peak_voltage_peak_v=np.asarray(peak_voltage_peak_v, dtype=np.float64),
         peak_voltage_rms_v=np.asarray(peak_voltage_rms_v, dtype=np.float64),
-        peak_voltage_form=np.asarray("peak"),
+        peak_voltage_form=np.asarray(peak_voltage_form),
         quality_flag=np.asarray(int(quality_flag), dtype=np.int32),
     )
     return path
@@ -97,9 +132,14 @@ def aggregate_response_directory(
             else float(peak_voltage_peak_v / np.sqrt(2.0))
         )
         peak_voltage_form = (
-            str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0])
+            normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
             if "peak_voltage_form" in data.files
             else "peak"
+        )
+        peak_voltage = peak_voltage_in_convention(
+            peak_voltage_peak_v,
+            peak_voltage_rms_v,
+            peak_voltage_form,
         )
 
         if freq_hz.shape != voltage_mag.shape:
@@ -115,6 +155,7 @@ def aggregate_response_directory(
             "f_peak_hz": f_peak_hz,
             "freq_hz": freq_hz,
             "voltage_mag": voltage_mag,
+            "peak_voltage": peak_voltage,
             "peak_voltage_peak_v": peak_voltage_peak_v,
             "peak_voltage_rms_v": peak_voltage_rms_v,
             "peak_voltage_form": peak_voltage_form,
@@ -158,10 +199,10 @@ def aggregate_response_directory(
         freq_hz[idx] = freq
         freq_ratio[idx] = freq / f_peak
         voltage_mag[idx] = voltage
+        peak_voltage[idx] = float(record["peak_voltage"])
         peak_voltage_peak_v[idx] = float(record["peak_voltage_peak_v"])
         peak_voltage_rms_v[idx] = float(record["peak_voltage_rms_v"])
         peak_voltage_form[idx] = str(record["peak_voltage_form"])
-        peak_voltage[idx] = float(record["peak_voltage_peak_v"])
         quality_flag[idx] = qflag
 
     response_dataset = {

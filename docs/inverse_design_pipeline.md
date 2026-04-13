@@ -171,8 +171,11 @@ Recommended file: `data/response_dataset.npz`
 | `f_peak_hz` | `(N,)` | Fundamental resonance frequency of the full tiled plate |
 | `freq_ratio` | `(N, N_f)` | Normalized grid in `[0.9, 1.1]` |
 | `freq_hz` | `(N, N_f)` | Absolute frequencies used in the solve |
-| `voltage_mag` | `(N, N_f)` | Magnitude of the voltage response |
-| `peak_voltage` | `(N,)` | Maximum voltage in the stored band |
+| `voltage_mag` | `(N, N_f)` | Voltage magnitude stored in the configured in-house peak/RMS convention |
+| `peak_voltage` | `(N,)` | Maximum voltage in that same stored convention |
+| `peak_voltage_peak_v` | `(N,)` | Traceability copy of the band maximum in peak volts |
+| `peak_voltage_rms_v` | `(N,)` | Traceability copy of the band maximum in RMS volts |
+| `peak_voltage_form` | `(N,)` | Stored in-house voltage convention: `peak` or `rms` |
 | `quality_flag` | `(N,)` | Mesh/FEM success flag |
 
 Recommended defaults:
@@ -235,7 +238,7 @@ The current FEniCSx implementation in this repository uses a 3D layered mesh and
 Current implementation note:
 
 - the fixed machine-readable problem spec uses `piezo density = 7500 kg/m^3` and `piezo thickness = 0.1 mm`, and the runtime defaults are aligned with that spec
-- the mesh builder now emits a **combined one-file** ANSYS handoff by default:
+- the mesh builder now emits a **combined one-file** STEP/Workbench handoff by default for manual ANSYS use outside the automated pipeline:
   - `plate3d_XXXX.step`: combined metaplate + piezo STEP with a conformal, meshable interface
   - `plate3d_XXXX_single_face_probe.step`: optional legacy combined-file probe when explicitly requested
   - `plate3d_XXXX_ansys_face_groups.json`: face-selection recipe for bottom electrode/interface grouping in Workbench

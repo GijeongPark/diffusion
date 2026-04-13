@@ -107,12 +107,17 @@ def build_piezo_config_kwargs(problem_spec: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
-def build_runtime_defaults(problem_spec: Mapping[str, Any]) -> dict[str, float]:
+def build_runtime_defaults(problem_spec: Mapping[str, Any]) -> dict[str, float | str]:
     geometry = problem_spec.get("geometry", {})
     materials = problem_spec.get("materials", {})
     substrate = materials.get("substrate", {}) if isinstance(materials, Mapping) else {}
     mechanics = build_mechanical_config_kwargs(problem_spec)
     electrical = problem_spec.get("electrical", {})
+    house_voltage_amplitude_convention = str(
+        electrical.get("house_voltage_amplitude_convention", "peak")
+    ).strip().lower()
+    if house_voltage_amplitude_convention not in {"peak", "rms"}:
+        raise ValueError("electrical.house_voltage_amplitude_convention must be 'peak' or 'rms'.")
 
     return {
         "substrate_thickness_m": float(geometry.get("substrate_thickness_m", 1.0e-3)),
@@ -120,6 +125,7 @@ def build_runtime_defaults(problem_spec: Mapping[str, Any]) -> dict[str, float]:
         "substrate_rho": float(substrate.get("density_kg_per_m3", mechanics["substrate_rho"])),
         "piezo_rho": float(mechanics["piezo_rho"]),
         "resistance_ohm": float(electrical.get("external_load_resistance_ohm", 1.0e4)),
+        "house_voltage_amplitude_convention": house_voltage_amplitude_convention,
     }
 
 

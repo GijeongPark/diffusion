@@ -1084,6 +1084,7 @@ def solve_modal_voltage_frf(
     modes_output_dir: str | Path | None = None,
     element_order: int = 2,
     store_mode_shapes: bool = False,
+    house_voltage_amplitude_convention: str = "peak",
 ) -> Path:
     mechanical = mechanical or MechanicalConfig()
     piezo = piezo or PiezoConfig()
@@ -1183,6 +1184,7 @@ def solve_modal_voltage_frf(
         voltage_mag=np.abs(voltage),
         output_dir=response_dir,
         quality_flag=1,
+        voltage_amplitude_convention=house_voltage_amplitude_convention,
     )
 
     if modes_output_dir is not None:
@@ -1239,6 +1241,7 @@ def solve_modal_voltage_frf_batch(
     element_order: int = 2,
     store_mode_shapes: bool = False,
     skip_existing: bool = False,
+    house_voltage_amplitude_convention: str = "peak",
 ) -> list[Path]:
     response_dir = Path(response_dir)
     response_dir.mkdir(parents=True, exist_ok=True)
@@ -1281,6 +1284,7 @@ def solve_modal_voltage_frf_batch(
                     modes_output_dir=modes_output_dir,
                     element_order=element_order,
                     store_mode_shapes=store_mode_shapes,
+                    house_voltage_amplitude_convention=house_voltage_amplitude_convention,
                 )
             )
         finally:
@@ -1384,6 +1388,12 @@ def main() -> None:
             "when present."
         ),
     )
+    parser.add_argument(
+        "--house-voltage-amplitude-convention",
+        default=None,
+        choices=["peak", "rms"],
+        help="Canonical peak/RMS convention used when saving in-house voltage magnitudes and peak_voltage.",
+    )
     args = parser.parse_args()
 
     mesh_paths = _resolve_mesh_paths(args.mesh, args.mesh_dir)
@@ -1411,12 +1421,20 @@ def main() -> None:
         piezo_kwargs = build_piezo_config_kwargs(problem_spec)
         mechanical = MechanicalConfig(**mechanical_kwargs)
         piezo = PiezoConfig(**piezo_kwargs)
+        house_voltage_amplitude_convention = str(
+            runtime_defaults["house_voltage_amplitude_convention"]
+            if args.house_voltage_amplitude_convention is None
+            else args.house_voltage_amplitude_convention
+        )
     else:
         mechanical = MechanicalConfig(
             substrate_rho=MechanicalConfig.substrate_rho if args.substrate_rho is None else float(args.substrate_rho),
             piezo_rho=MechanicalConfig.piezo_rho if args.piezo_rho is None else float(args.piezo_rho),
         )
         piezo = PiezoConfig()
+        house_voltage_amplitude_convention = (
+            "peak" if args.house_voltage_amplitude_convention is None else str(args.house_voltage_amplitude_convention)
+        )
 
     saved_paths = solve_modal_voltage_frf_batch(
         mesh_paths=[str(path) for path in mesh_paths],
@@ -1430,6 +1448,7 @@ def main() -> None:
         element_order=int(args.element_order),
         store_mode_shapes=bool(args.store_mode_shapes),
         skip_existing=bool(args.skip_existing),
+        house_voltage_amplitude_convention=house_voltage_amplitude_convention,
     )
     print(f"Saved {len(saved_paths)} response file(s) to {Path(args.response_dir)}")
 

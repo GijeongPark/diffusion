@@ -12,8 +12,10 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from peh_inverse_design.response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG
+    from .response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
 
 
 def _infer_sample_ids_from_source(data: np.lib.npyio.NpzFile, n_samples: int) -> tuple[np.ndarray, np.ndarray]:
@@ -75,13 +77,18 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
                 else float(np.nanmax(voltage_mag) / np.sqrt(2.0))
             ),
             "peak_voltage_form": (
-                str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0])
+                normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
                 if "peak_voltage_form" in data.files
                 else "peak"
             ),
             "quality_flag": int(data["quality_flag"]) if "quality_flag" in data.files else 1,
             "path": str(path),
         }
+        records[sample_id]["peak_voltage"] = peak_voltage_in_convention(
+            float(records[sample_id]["peak_voltage_peak_v"]),
+            float(records[sample_id]["peak_voltage_rms_v"]),
+            str(records[sample_id]["peak_voltage_form"]),
+        )
     return records, n_freq
 
 
@@ -263,7 +270,7 @@ def build_integrated_dataset(
         peak_voltage_peak_v[idx] = float(record["peak_voltage_peak_v"])
         peak_voltage_rms_v[idx] = float(record["peak_voltage_rms_v"])
         peak_voltage_form[idx] = str(record["peak_voltage_form"])
-        peak_voltage[idx] = float(record["peak_voltage_peak_v"])
+        peak_voltage[idx] = float(record["peak_voltage"])
         quality_flag[idx] = int(record["quality_flag"])
         freq_hz[idx, : freq.shape[0]] = freq
         freq_ratio[idx, : freq.shape[0]] = freq / f_peak

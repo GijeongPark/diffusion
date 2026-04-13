@@ -72,6 +72,7 @@ mechanics:
 electrical:
   measured_quantity: voltage
   measured_form: magnitude
+  house_voltage_amplitude_convention: peak
   electrode_measurement_region: full_plate_electrode
   external_load_resistance_ohm: 10000.0
 

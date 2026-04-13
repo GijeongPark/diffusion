@@ -20,8 +20,10 @@ from skimage.measure import find_contours
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
+    from peh_inverse_design.response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
 else:
     from .modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
+    from .response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
 
 
 TOP_ELECTRODE_TAG = 105
@@ -90,11 +92,38 @@ def _load_mesh(mesh_npz_path: Path) -> dict[str, np.ndarray]:
 
 def _load_response(response_path: Path) -> dict[str, np.ndarray]:
     data = np.load(response_path)
+    voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64)
+    peak_voltage_peak_v = (
+        float(np.asarray(data["peak_voltage_peak_v"], dtype=np.float64))
+        if "peak_voltage_peak_v" in data.files
+        else (
+            float(np.asarray(data["peak_voltage"], dtype=np.float64))
+            if "peak_voltage" in data.files
+            else float(np.nanmax(voltage_mag))
+        )
+    )
+    peak_voltage_rms_v = (
+        float(np.asarray(data["peak_voltage_rms_v"], dtype=np.float64))
+        if "peak_voltage_rms_v" in data.files
+        else float(peak_voltage_peak_v / np.sqrt(2.0))
+    )
+    peak_voltage_form = (
+        normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
+        if "peak_voltage_form" in data.files
+        else "peak"
+    )
     return {
         "sample_id": np.asarray(data["sample_id"]),
         "f_peak_hz": np.asarray(data["f_peak_hz"]),
         "freq_hz": np.asarray(data["freq_hz"], dtype=np.float64),
-        "voltage_mag": np.asarray(data["voltage_mag"], dtype=np.float64),
+        "voltage_mag": voltage_mag,
+        "peak_voltage": np.asarray(
+            peak_voltage_in_convention(peak_voltage_peak_v, peak_voltage_rms_v, peak_voltage_form),
+            dtype=np.float64,
+        ),
+        "peak_voltage_peak_v": np.asarray(peak_voltage_peak_v, dtype=np.float64),
+        "peak_voltage_rms_v": np.asarray(peak_voltage_rms_v, dtype=np.float64),
+        "peak_voltage_form": np.asarray(peak_voltage_form),
         "quality_flag": np.asarray(data["quality_flag"]),
     }
 
@@ -354,7 +383,7 @@ def _plot_frf(ax: plt.Axes, response: dict[str, np.ndarray], modal: dict[str, np
 
     ax.set_title("Voltage FRF")
     ax.set_xlabel(r"$f / f_{peak}$")
-    ax.set_ylabel(r"$|V(f)|$")
+    ax.set_ylabel("Voltage magnitude")
     ax.grid(alpha=0.25)
 
 
@@ -363,7 +392,8 @@ def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray]
     n_nodes = int(mesh["points"].shape[0])
     n_tetra = int(mesh["tetra_cells"].shape[0])
     f_peak = float(response["f_peak_hz"])
-    vmax = float(np.max(response["voltage_mag"]))
+    vmax = float(np.asarray(response["peak_voltage"], dtype=np.float64))
+    voltage_form = str(np.asarray(response["peak_voltage_form"]).reshape(-1)[0])
     vfrac = float(dataset_row["volume_fraction"])
     n_modes = int(len(modal["eigenfreq_hz"])) if modal is not None and "eigenfreq_hz" in modal else 0
 
@@ -381,7 +411,7 @@ def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray]
         f"sample_id: {sample_id}",
         f"volume fraction: {vfrac:.3f}",
         f"f_peak: {f_peak:.4f} Hz",
-        f"peak |V|: {vmax:.4f}",
+        f"peak voltage ({voltage_form}): {vmax:.4f}",
         f"nodes: {n_nodes:,}",
         f"tetra: {n_tetra:,}",
         f"modes saved: {n_modes}",

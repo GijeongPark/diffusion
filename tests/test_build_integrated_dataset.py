@@ -117,6 +117,54 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs"], "")
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs_unlimited"], "True")
 
+    def test_integrated_dataset_uses_stored_voltage_convention_for_peak_voltage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            unit_cell_npz = root / "unit_cell_dataset.npz"
+            response_dir = root / "responses"
+            output_path = root / "integrated_dataset.npz"
+            index_csv_path = root / "integrated_dataset.csv"
+
+            np.savez_compressed(
+                unit_cell_npz,
+                grf=np.zeros((1, 2, 2), dtype=np.float64),
+                threshold=np.asarray([0.0], dtype=np.float64),
+                sample_id=np.asarray([0], dtype=np.int32),
+                source_sample_id=np.asarray([0], dtype=np.int32),
+            )
+            save_fem_response(
+                sample_id=0,
+                f_peak_hz=0.72,
+                freq_hz=np.asarray([0.6, 0.72, 0.84], dtype=np.float64),
+                voltage_mag=np.asarray([200.0, 342.0, 210.0], dtype=np.float64),
+                output_dir=response_dir,
+                voltage_amplitude_convention="rms",
+            )
+
+            build_integrated_dataset(
+                unit_cell_npz=unit_cell_npz,
+                response_dir=response_dir,
+                output_path=output_path,
+                index_csv_path=index_csv_path,
+            )
+
+            with np.load(output_path, allow_pickle=True) as integrated:
+                np.testing.assert_allclose(
+                    np.asarray(integrated["voltage_mag"][0], dtype=np.float64),
+                    np.asarray([200.0, 342.0, 210.0], dtype=np.float64) / np.sqrt(2.0),
+                )
+                self.assertAlmostEqual(float(integrated["peak_voltage"][0]), 342.0 / np.sqrt(2.0))
+                self.assertAlmostEqual(float(integrated["peak_voltage_peak_v"][0]), 342.0)
+                self.assertAlmostEqual(float(integrated["peak_voltage_rms_v"][0]), 342.0 / np.sqrt(2.0))
+                self.assertEqual(str(integrated["peak_voltage_form"][0]), "rms")
+
+            with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["peak_voltage"], f"{342.0 / np.sqrt(2.0):.12g}")
+            self.assertEqual(rows[0]["peak_voltage_peak_v"], "342")
+            self.assertEqual(rows[0]["peak_voltage_rms_v"], f"{342.0 / np.sqrt(2.0):.12g}")
+            self.assertEqual(rows[0]["peak_voltage_form"], "rms")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ if __package__ in (None, ""):
         default_problem_spec_path,
         load_problem_spec,
     )
+    from peh_inverse_design.response_dataset import normalize_voltage_amplitude_convention
     from peh_inverse_design.response_dataset import save_fem_response
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
@@ -33,6 +34,7 @@ else:
         default_problem_spec_path,
         load_problem_spec,
     )
+    from .response_dataset import normalize_voltage_amplitude_convention
     from .response_dataset import save_fem_response
 
 
@@ -51,6 +53,7 @@ class PiezoConfig:
     thickness_m: float = 1.0e-4
     resistance_ohm: float = 1.0e4
     eps33s_f_per_m: float = 1.26934e-08
+    capacitance_eps33s_f_per_m: float = 1.729e-08
     e_matrix_c_per_m2: tuple[tuple[float, ...], ...] = (
         (0.0, 0.0, -6.622811852),
         (0.0, 0.0, -6.622811852),
@@ -650,7 +653,8 @@ def _assemble_modal_model(
         piezo_volume = comm.allreduce(piezo_volume_local, op=MPI.SUM)
         substrate_volume_local = fem.assemble_scalar(fem.form(one * dx(VOLUME_SUBSTRATE_TAG)))
         substrate_volume = comm.allreduce(substrate_volume_local, op=MPI.SUM)
-        capacitance = piezo.eps33s_f_per_m * piezo_volume / (piezo.thickness_m ** 2)
+        capacitance_eps33s_f_per_m = getattr(piezo, "capacitance_eps33s_f_per_m", piezo.eps33s_f_per_m)
+        capacitance = capacitance_eps33s_f_per_m * piezo_volume / (piezo.thickness_m ** 2)
         cell_tag_values = np.asarray(cell_tags.values, dtype=np.int32).reshape(-1)
         substrate_cell_count = int(np.count_nonzero(cell_tag_values == VOLUME_SUBSTRATE_TAG))
         piezo_cell_count = int(np.count_nonzero(cell_tag_values == VOLUME_PIEZO_TAG))
@@ -713,6 +717,7 @@ def _assemble_modal_model(
             "modal_theta": np.asarray(modal_theta, dtype=np.float64),
             "modal_mass": np.asarray(modal_mass, dtype=np.float64),
             "capacitance_f": np.asarray([capacitance], dtype=np.float64),
+            "capacitance_eps33s_f_per_m": np.asarray([capacitance_eps33s_f_per_m], dtype=np.float64),
             "mode_nodal_displacements": np.asarray(mode_nodal_displacements, dtype=np.float64),
             "mode_dof_vectors": np.asarray(mode_dof_vectors, dtype=np.float64),
             "raw_points": np.asarray(raw_points, dtype=np.float64),
@@ -1051,6 +1056,10 @@ def _build_modal_save_payload(
         "modal_theta": modal_model["modal_theta"],
         "modal_mass": modal_model["modal_mass"],
         "capacitance_f": modal_model["capacitance_f"],
+        "capacitance_eps33s_f_per_m": modal_model.get(
+            "capacitance_eps33s_f_per_m",
+            np.asarray([piezo.capacitance_eps33s_f_per_m], dtype=np.float64),
+        ),
         "eigensolver_backend": np.asarray(modal_model.get("eigensolver_backend", ["unknown"])),
         "substrate_volume_m3": modal_model["substrate_volume_m3"],
         "piezo_volume_m3": modal_model["piezo_volume_m3"],
@@ -1227,6 +1236,18 @@ def _modal_output_has_explicit_surface_fields(modal_path: Path) -> bool:
         return False
 
 
+def _response_output_is_peak(response_path: Path) -> bool:
+    if not response_path.exists():
+        return False
+    try:
+        with np.load(response_path, allow_pickle=True) as response:
+            if "peak_voltage_form" in response.files:
+                normalize_voltage_amplitude_convention(str(np.asarray(response["peak_voltage_form"]).reshape(-1)[0]))
+    except Exception:
+        return False
+    return True
+
+
 def solve_modal_voltage_frf_batch(
     mesh_paths: list[str | Path],
     response_dir: str | Path,
@@ -1254,13 +1275,14 @@ def solve_modal_voltage_frf_batch(
         mesh_path = Path(mesh_path)
         sample_id = _extract_sample_id(mesh_path)
         response_path = _response_output_path(response_dir, sample_id)
+        response_ready = _response_output_is_peak(response_path)
         modal_path = _modal_output_path(modes_output_dir, sample_id)
         modal_ready = modal_path is None or modal_path.exists()
         modal_missing_strain = False
         if modal_path is not None and modal_path.exists() and store_mode_shapes:
             modal_missing_strain = not _modal_output_has_explicit_surface_fields(modal_path)
             modal_ready = modal_ready and not modal_missing_strain
-        if skip_existing and response_path.exists() and modal_ready:
+        if skip_existing and response_ready and modal_ready:
             print(f"[{idx}/{total}] Skipping {mesh_path.name} (existing outputs found).")
             saved.append(response_path)
             gc.collect()
@@ -1391,8 +1413,8 @@ def main() -> None:
     parser.add_argument(
         "--house-voltage-amplitude-convention",
         default=None,
-        choices=["peak", "rms"],
-        help="Canonical peak/RMS convention used when saving in-house voltage magnitudes and peak_voltage.",
+        choices=["peak"],
+        help="Canonical in-house voltage convention. Only peak amplitudes are supported.",
     )
     args = parser.parse_args()
 

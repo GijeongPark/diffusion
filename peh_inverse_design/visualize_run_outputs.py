@@ -20,10 +20,10 @@ from skimage.measure import find_contours
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
-    from peh_inverse_design.response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
+    from peh_inverse_design.response_dataset import normalize_voltage_amplitude_convention
 else:
     from .modal_surface_fields import SurfaceStrainField, available_surface_strain_fields, preferred_surface_strain_field
-    from .response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
+    from .response_dataset import normalize_voltage_amplitude_convention
 
 
 TOP_ELECTRODE_TAG = 105
@@ -93,6 +93,8 @@ def _load_mesh(mesh_npz_path: Path) -> dict[str, np.ndarray]:
 def _load_response(response_path: Path) -> dict[str, np.ndarray]:
     data = np.load(response_path)
     voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64)
+    if "peak_voltage_form" in data.files:
+        normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
     peak_voltage_peak_v = (
         float(np.asarray(data["peak_voltage_peak_v"], dtype=np.float64))
         if "peak_voltage_peak_v" in data.files
@@ -102,28 +104,13 @@ def _load_response(response_path: Path) -> dict[str, np.ndarray]:
             else float(np.nanmax(voltage_mag))
         )
     )
-    peak_voltage_rms_v = (
-        float(np.asarray(data["peak_voltage_rms_v"], dtype=np.float64))
-        if "peak_voltage_rms_v" in data.files
-        else float(peak_voltage_peak_v / np.sqrt(2.0))
-    )
-    peak_voltage_form = (
-        normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
-        if "peak_voltage_form" in data.files
-        else "peak"
-    )
     return {
         "sample_id": np.asarray(data["sample_id"]),
         "f_peak_hz": np.asarray(data["f_peak_hz"]),
         "freq_hz": np.asarray(data["freq_hz"], dtype=np.float64),
         "voltage_mag": voltage_mag,
-        "peak_voltage": np.asarray(
-            peak_voltage_in_convention(peak_voltage_peak_v, peak_voltage_rms_v, peak_voltage_form),
-            dtype=np.float64,
-        ),
+        "peak_voltage": np.asarray(peak_voltage_peak_v, dtype=np.float64),
         "peak_voltage_peak_v": np.asarray(peak_voltage_peak_v, dtype=np.float64),
-        "peak_voltage_rms_v": np.asarray(peak_voltage_rms_v, dtype=np.float64),
-        "peak_voltage_form": np.asarray(peak_voltage_form),
         "quality_flag": np.asarray(data["quality_flag"]),
     }
 
@@ -388,18 +375,27 @@ def _plot_frf(ax: plt.Axes, response: dict[str, np.ndarray], modal: dict[str, np
 
 
 def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray], mesh: dict[str, np.ndarray],
-                response: dict[str, np.ndarray], modal: dict[str, np.ndarray] | None, strain_max: float) -> dict[str, float]:
+                response: dict[str, np.ndarray], modal: dict[str, np.ndarray] | None, strain_max: float) -> dict[str, float | str]:
     n_nodes = int(mesh["points"].shape[0])
     n_tetra = int(mesh["tetra_cells"].shape[0])
     f_peak = float(response["f_peak_hz"])
     vmax = float(np.asarray(response["peak_voltage"], dtype=np.float64))
-    voltage_form = str(np.asarray(response["peak_voltage_form"]).reshape(-1)[0])
     vfrac = float(dataset_row["volume_fraction"])
     n_modes = int(len(modal["eigenfreq_hz"])) if modal is not None and "eigenfreq_hz" in modal else 0
+    mode1_frequency_hz = (
+        float(np.asarray(modal["mode1_frequency_hz"], dtype=np.float64).reshape(-1)[0])
+        if modal is not None and "mode1_frequency_hz" in modal
+        else (
+            float(np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)[0])
+            if modal is not None and "eigenfreq_hz" in modal and np.asarray(modal["eigenfreq_hz"]).size > 0
+            else float("nan")
+        )
+    )
 
     stats = {
         "sample_id": float(sample_id),
         "volume_fraction": vfrac,
+        "mode1_frequency_hz": mode1_frequency_hz,
         "f_peak_hz": f_peak,
         "peak_voltage": vmax,
         "n_nodes": float(n_nodes),
@@ -411,7 +407,7 @@ def _plot_stats(ax: plt.Axes, sample_id: int, dataset_row: dict[str, np.ndarray]
         f"sample_id: {sample_id}",
         f"volume fraction: {vfrac:.3f}",
         f"f_peak: {f_peak:.4f} Hz",
-        f"peak voltage ({voltage_form}): {vmax:.4f}",
+        f"peak voltage (peak): {vmax:.4f}",
         f"nodes: {n_nodes:,}",
         f"tetra: {n_tetra:,}",
         f"modes saved: {n_modes}",
@@ -435,7 +431,7 @@ def _plot_sample_summary(
     response: dict[str, np.ndarray],
     modal: dict[str, np.ndarray] | None,
     output_path: Path,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     fig = plt.figure(figsize=(16, 8))
     gs = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 1.25], height_ratios=[1.0, 1.0])
     ax_unit = fig.add_subplot(gs[0, 0])
@@ -473,7 +469,7 @@ def _save_individual_plots(
     response: dict[str, np.ndarray],
     modal: dict[str, np.ndarray] | None,
     sample_output_dir: Path,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     sample_output_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(5.2, 5.0))
@@ -535,11 +531,12 @@ def _save_individual_plots(
     return stats
 
 
-def _write_summary_csv(rows: list[dict[str, float]], output_path: Path) -> None:
+def _write_summary_csv(rows: list[dict[str, float | str]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "sample_id",
         "volume_fraction",
+        "mode1_frequency_hz",
         "f_peak_hz",
         "peak_voltage",
         "n_nodes",
@@ -602,7 +599,7 @@ def main() -> None:
     if not sample_ids:
         raise FileNotFoundError(f"No sample ids could be inferred from {response_dir}.")
 
-    rows: list[dict[str, float]] = []
+    rows: list[dict[str, float | str]] = []
     image_paths: list[Path] = []
     for sample_id in sample_ids:
         mesh_npz = mesh_dir / f"plate3d_{sample_id:04d}_fenicsx.npz"

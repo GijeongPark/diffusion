@@ -12,10 +12,10 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from peh_inverse_design.mesh_tags import FACET_TOP_ELECTRODE_TAG
-    from peh_inverse_design.response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
+    from peh_inverse_design.response_dataset import normalize_voltage_amplitude_convention
 else:
     from .mesh_tags import FACET_TOP_ELECTRODE_TAG
-    from .response_dataset import peak_voltage_in_convention, normalize_voltage_amplitude_convention
+    from .response_dataset import normalize_voltage_amplitude_convention
 
 
 def _infer_sample_ids_from_source(data: np.lib.npyio.NpzFile, n_samples: int) -> tuple[np.ndarray, np.ndarray]:
@@ -53,16 +53,14 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
     records: dict[int, dict[str, np.ndarray | float | int]] = {}
     n_freq = 0
     for path in sorted(response_dir.glob("sample_*_response.npz")):
-        data = np.load(path, allow_pickle=True)
-        sample_id = int(data["sample_id"]) if "sample_id" in data.files else _extract_sample_id_from_path(path)
-        freq_hz = np.asarray(data["freq_hz"], dtype=np.float64).reshape(-1)
-        voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64).reshape(-1)
-        n_freq = max(n_freq, int(freq_hz.shape[0]))
-        records[sample_id] = {
-            "f_peak_hz": float(data["f_peak_hz"]),
-            "freq_hz": freq_hz,
-            "voltage_mag": voltage_mag,
-            "peak_voltage_peak_v": (
+        with np.load(path, allow_pickle=True) as data:
+            sample_id = int(data["sample_id"]) if "sample_id" in data.files else _extract_sample_id_from_path(path)
+            freq_hz = np.asarray(data["freq_hz"], dtype=np.float64).reshape(-1)
+            voltage_mag = np.asarray(data["voltage_mag"], dtype=np.float64).reshape(-1)
+            n_freq = max(n_freq, int(freq_hz.shape[0]))
+            if "peak_voltage_form" in data.files:
+                normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
+            peak_voltage_peak_v = (
                 float(np.asarray(data["peak_voltage_peak_v"], dtype=np.float64))
                 if "peak_voltage_peak_v" in data.files
                 else (
@@ -70,25 +68,16 @@ def _load_response_records(response_dir: Path) -> tuple[dict[int, dict[str, np.n
                     if "peak_voltage" in data.files
                     else float(np.nanmax(voltage_mag))
                 )
-            ),
-            "peak_voltage_rms_v": (
-                float(np.asarray(data["peak_voltage_rms_v"], dtype=np.float64))
-                if "peak_voltage_rms_v" in data.files
-                else float(np.nanmax(voltage_mag) / np.sqrt(2.0))
-            ),
-            "peak_voltage_form": (
-                normalize_voltage_amplitude_convention(str(np.asarray(data["peak_voltage_form"]).reshape(-1)[0]))
-                if "peak_voltage_form" in data.files
-                else "peak"
-            ),
-            "quality_flag": int(data["quality_flag"]) if "quality_flag" in data.files else 1,
-            "path": str(path),
-        }
-        records[sample_id]["peak_voltage"] = peak_voltage_in_convention(
-            float(records[sample_id]["peak_voltage_peak_v"]),
-            float(records[sample_id]["peak_voltage_rms_v"]),
-            str(records[sample_id]["peak_voltage_form"]),
-        )
+            )
+            records[sample_id] = {
+                "f_peak_hz": float(data["f_peak_hz"]),
+                "freq_hz": freq_hz,
+                "voltage_mag": voltage_mag,
+                "peak_voltage": peak_voltage_peak_v,
+                "peak_voltage_peak_v": peak_voltage_peak_v,
+                "quality_flag": int(data["quality_flag"]) if "quality_flag" in data.files else 1,
+                "path": str(path),
+            }
     return records, n_freq
 
 
@@ -245,8 +234,6 @@ def build_integrated_dataset(
     f_peak_hz = np.full(n_samples, np.nan, dtype=np.float64)
     peak_voltage = np.full(n_samples, np.nan, dtype=np.float64)
     peak_voltage_peak_v = np.full(n_samples, np.nan, dtype=np.float64)
-    peak_voltage_rms_v = np.full(n_samples, np.nan, dtype=np.float64)
-    peak_voltage_form = np.full(n_samples, "", dtype="<U16")
     quality_flag = np.zeros(n_samples, dtype=np.int32)
     response_npz_path = np.full(n_samples, "", dtype=object)
     if n_freq > 0:
@@ -268,8 +255,6 @@ def build_integrated_dataset(
         response_ok[idx] = 1
         f_peak_hz[idx] = f_peak
         peak_voltage_peak_v[idx] = float(record["peak_voltage_peak_v"])
-        peak_voltage_rms_v[idx] = float(record["peak_voltage_rms_v"])
-        peak_voltage_form[idx] = str(record["peak_voltage_form"])
         peak_voltage[idx] = float(record["peak_voltage"])
         quality_flag[idx] = int(record["quality_flag"])
         freq_hz[idx, : freq.shape[0]] = freq
@@ -281,8 +266,6 @@ def build_integrated_dataset(
     integrated["f_peak_hz"] = f_peak_hz
     integrated["peak_voltage"] = peak_voltage
     integrated["peak_voltage_peak_v"] = peak_voltage_peak_v
-    integrated["peak_voltage_rms_v"] = peak_voltage_rms_v
-    integrated["peak_voltage_form"] = peak_voltage_form
     integrated["quality_flag"] = quality_flag
     integrated["freq_hz"] = freq_hz
     integrated["freq_ratio"] = freq_ratio
@@ -455,10 +438,7 @@ def build_integrated_dataset(
                 "peak_voltage_peak_v": (
                     "" if np.isnan(peak_voltage_peak_v[idx]) else f"{float(peak_voltage_peak_v[idx]):.12g}"
                 ),
-                "peak_voltage_rms_v": (
-                    "" if np.isnan(peak_voltage_rms_v[idx]) else f"{float(peak_voltage_rms_v[idx]):.12g}"
-                ),
-                "peak_voltage_form": str(peak_voltage_form[idx]),
+
                 "max_top_surface_strain": (
                     "" if np.isnan(max_top_surface_strain[idx]) else f"{float(max_top_surface_strain[idx]):.12g}"
                 ),
@@ -492,8 +472,6 @@ def build_integrated_dataset(
                 "f_peak_hz",
                 "peak_voltage",
                 "peak_voltage_peak_v",
-                "peak_voltage_rms_v",
-                "peak_voltage_form",
                 "max_top_surface_strain",
                 "mesh_preset",
                 "substrate_layers",

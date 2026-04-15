@@ -87,6 +87,7 @@ def build_piezo_config_kwargs(problem_spec: Mapping[str, Any]) -> dict[str, Any]
     electrical = problem_spec.get("electrical", {})
     piezoelectric = materials.get("piezoelectric", {}) if isinstance(materials, Mapping) else {}
     full_3d = piezoelectric.get("full_3d_constants", {}) if isinstance(piezoelectric, Mapping) else {}
+    reduced_plate = piezoelectric.get("reduced_plate_constants", {}) if isinstance(piezoelectric, Mapping) else {}
 
     eps_matrix = full_3d.get("permittivity_epsS_f_per_m")
     if eps_matrix is None or len(eps_matrix) < 3 or len(eps_matrix[2]) < 3:
@@ -98,10 +99,16 @@ def build_piezo_config_kwargs(problem_spec: Mapping[str, Any]) -> dict[str, Any]
     if stiffness is None:
         raise ValueError("Problem specification must define materials.piezoelectric.full_3d_constants.stiffness_cE_pa.")
 
+    full_3d_eps33s_f_per_m = float(eps_matrix[2][2])
+    capacitance_eps33s_f_per_m = float(
+        reduced_plate.get("eps33s_f_per_m", full_3d_eps33s_f_per_m)
+    )
+
     return {
         "thickness_m": float(geometry.get("piezo_patch_thickness_m", 1.0e-4)),
         "resistance_ohm": float(electrical.get("external_load_resistance_ohm", 1.0e4)),
-        "eps33s_f_per_m": float(eps_matrix[2][2]),
+        "eps33s_f_per_m": full_3d_eps33s_f_per_m,
+        "capacitance_eps33s_f_per_m": capacitance_eps33s_f_per_m,
         "e_matrix_c_per_m2": tuple(tuple(float(value) for value in row) for row in e_matrix),
         "stiffness_cE_pa": tuple(tuple(float(value) for value in row) for row in stiffness),
     }
@@ -116,8 +123,10 @@ def build_runtime_defaults(problem_spec: Mapping[str, Any]) -> dict[str, float |
     house_voltage_amplitude_convention = str(
         electrical.get("house_voltage_amplitude_convention", "peak")
     ).strip().lower()
-    if house_voltage_amplitude_convention not in {"peak", "rms"}:
-        raise ValueError("electrical.house_voltage_amplitude_convention must be 'peak' or 'rms'.")
+    if house_voltage_amplitude_convention != "peak":
+        raise ValueError(
+            "electrical.house_voltage_amplitude_convention must be 'peak'. RMS handling was removed."
+        )
 
     return {
         "substrate_thickness_m": float(geometry.get("substrate_thickness_m", 1.0e-3)),

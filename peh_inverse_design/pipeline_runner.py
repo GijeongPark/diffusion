@@ -20,6 +20,7 @@ from .problem_spec import (
     load_problem_spec,
     write_problem_spec_snapshot,
 )
+from .response_dataset import normalize_voltage_amplitude_convention
 from .subset_unit_cell_dataset import subset_unit_cell_dataset
 
 
@@ -87,8 +88,8 @@ class PipelineConfig:
             raise ValueError("solver_max_q2_vector_dofs must be strictly positive when provided.")
         if self.solver_oom_fallback_element_order is not None and int(self.solver_oom_fallback_element_order) <= 0:
             raise ValueError("solver_oom_fallback_element_order must be strictly positive when provided.")
-        if self.house_voltage_amplitude_convention is not None and str(self.house_voltage_amplitude_convention).strip().lower() not in {"peak", "rms"}:
-            raise ValueError("house_voltage_amplitude_convention must be one of: peak, rms.")
+        if self.house_voltage_amplitude_convention is not None and str(self.house_voltage_amplitude_convention).strip().lower() != "peak":
+            raise ValueError("house_voltage_amplitude_convention must be 'peak'. RMS handling was removed.")
 
 
 @dataclass(frozen=True)
@@ -311,12 +312,24 @@ def _solver_modal_output_path(modal_dir: Path, sample_id: int) -> Path:
     return modal_dir / f"sample_{int(sample_id):04d}_modal.npz"
 
 
-def _solver_outputs_exist(mesh_path: Path, response_dir: Path, modal_dir: Path) -> bool:
+def _solver_outputs_exist(
+    mesh_path: Path,
+    response_dir: Path,
+    modal_dir: Path,
+    house_voltage_amplitude_convention: str,
+) -> bool:
+    del house_voltage_amplitude_convention
     sample_id = _solver_sample_id_from_mesh(mesh_path)
-    return (
-        _solver_response_output_path(response_dir, sample_id).exists()
-        and _solver_modal_output_path(modal_dir, sample_id).exists()
-    )
+    response_path = _solver_response_output_path(response_dir, sample_id)
+    if not response_path.exists():
+        return False
+    try:
+        with np.load(response_path, allow_pickle=True) as response:
+            if "peak_voltage_form" in response.files:
+                normalize_voltage_amplitude_convention(str(np.asarray(response["peak_voltage_form"]).reshape(-1)[0]))
+    except Exception:
+        return False
+    return _solver_modal_output_path(modal_dir, sample_id).exists()
 
 
 def _build_solver_inner_args(
@@ -425,7 +438,16 @@ def _run_solver_with_isolated_retry(
         if exc.returncode != 137:
             raise
 
-    remaining = [mesh_path for mesh_path in mesh_files if not _solver_outputs_exist(mesh_path, response_dir, modal_dir)]
+    remaining = [
+        mesh_path
+        for mesh_path in mesh_files
+        if not _solver_outputs_exist(
+            mesh_path,
+            response_dir,
+            modal_dir,
+            str(config.house_voltage_amplitude_convention or "peak"),
+        )
+    ]
     if not remaining:
         return
 
@@ -1013,8 +1035,8 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--house-voltage-amplitude-convention",
         default=None,
-        choices=["peak", "rms"],
-        help="Canonical peak/RMS convention used when storing in-house voltage magnitudes and peak_voltage.",
+        choices=["peak"],
+        help="Canonical in-house voltage convention. Only peak amplitudes are supported.",
     )
     parser.add_argument("--repair-cad", action="store_true", help="Use explicit bridge-repair CAD instead of exact topology-preserving CAD.")
     parser.add_argument("--repair-bridge-width-m", type=float, default=None, help="Explicit bridge width in repair CAD mode.")

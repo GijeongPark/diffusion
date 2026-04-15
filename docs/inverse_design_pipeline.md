@@ -171,11 +171,9 @@ Recommended file: `data/response_dataset.npz`
 | `f_peak_hz` | `(N,)` | Fundamental resonance frequency of the full tiled plate |
 | `freq_ratio` | `(N, N_f)` | Normalized grid in `[0.9, 1.1]` |
 | `freq_hz` | `(N, N_f)` | Absolute frequencies used in the solve |
-| `voltage_mag` | `(N, N_f)` | Voltage magnitude stored in the configured in-house peak/RMS convention |
+| `voltage_mag` | `(N, N_f)` | Voltage magnitude stored in peak-amplitude units |
 | `peak_voltage` | `(N,)` | Maximum voltage in that same stored convention |
 | `peak_voltage_peak_v` | `(N,)` | Traceability copy of the band maximum in peak volts |
-| `peak_voltage_rms_v` | `(N,)` | Traceability copy of the band maximum in RMS volts |
-| `peak_voltage_form` | `(N,)` | Stored in-house voltage convention: `peak` or `rms` |
 | `quality_flag` | `(N,)` | Mesh/FEM success flag |
 
 Recommended defaults:

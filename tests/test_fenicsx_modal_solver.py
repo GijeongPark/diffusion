@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -10,10 +13,69 @@ from peh_inverse_design.fenicsx_modal_solver import (
     _build_modal_save_payload,
     _compute_top_surface_cellwise_strain,
     _remap_raw_cell_tags_to_created_mesh,
+    solve_modal_voltage_frf_batch,
 )
+from peh_inverse_design.response_dataset import save_fem_response
 
 
 class FenicsxModalSolverTests(unittest.TestCase):
+    def test_skip_existing_reuses_peak_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mesh_path = root / "plate3d_0000_fenicsx.npz"
+            mesh_path.write_bytes(b"stub")
+            response_dir = root / "responses"
+            save_fem_response(
+                sample_id=0,
+                f_peak_hz=1.0,
+                freq_hz=np.asarray([0.9, 1.0, 1.1], dtype=np.float64),
+                voltage_mag=np.asarray([1.0, 2.0, 1.5], dtype=np.float64),
+                output_dir=response_dir,
+            )
+
+            with mock.patch("peh_inverse_design.fenicsx_modal_solver.solve_modal_voltage_frf") as solve_mock:
+                saved = solve_modal_voltage_frf_batch(
+                    mesh_paths=[mesh_path],
+                    response_dir=response_dir,
+                    skip_existing=True,
+                    house_voltage_amplitude_convention="peak",
+                )
+
+            solve_mock.assert_not_called()
+            self.assertEqual(saved, [response_dir / "sample_0000_response.npz"])
+
+    def test_skip_existing_recomputes_response_when_existing_file_is_tagged_rms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mesh_path = root / "plate3d_0000_fenicsx.npz"
+            mesh_path.write_bytes(b"stub")
+            response_dir = root / "responses"
+            response_path = save_fem_response(
+                sample_id=0,
+                f_peak_hz=1.0,
+                freq_hz=np.asarray([0.9, 1.0, 1.1], dtype=np.float64),
+                voltage_mag=np.asarray([1.0, 2.0, 1.5], dtype=np.float64),
+                output_dir=response_dir,
+            )
+            with np.load(response_path, allow_pickle=True) as response:
+                payload = {key: np.asarray(response[key]) for key in response.files}
+            payload["peak_voltage_form"] = np.asarray("rms")
+            np.savez_compressed(response_path, **payload)
+
+            with mock.patch(
+                "peh_inverse_design.fenicsx_modal_solver.solve_modal_voltage_frf",
+                return_value=response_path,
+            ) as solve_mock:
+                saved = solve_modal_voltage_frf_batch(
+                    mesh_paths=[mesh_path],
+                    response_dir=response_dir,
+                    skip_existing=True,
+                    house_voltage_amplitude_convention="peak",
+                )
+
+            solve_mock.assert_called_once()
+            self.assertEqual(saved, [response_path])
+
     def test_remap_raw_cell_tags_matches_created_mesh_after_point_reordering(self) -> None:
         raw_tetra_cells = np.asarray([[0, 1, 2, 3]], dtype=np.int64)
         raw_tetra_tags = np.asarray([12], dtype=np.int32)
@@ -93,6 +155,7 @@ class FenicsxModalSolverTests(unittest.TestCase):
             "modal_theta": np.asarray([0.01, 0.02], dtype=np.float64),
             "modal_mass": np.asarray([1.0, 1.0], dtype=np.float64),
             "capacitance_f": np.asarray([5.0e-7], dtype=np.float64),
+            "capacitance_eps33s_f_per_m": np.asarray([1.729e-8], dtype=np.float64),
             "substrate_volume_m3": np.asarray([1.0e-4], dtype=np.float64),
             "piezo_volume_m3": np.asarray([2.0e-5], dtype=np.float64),
             "substrate_cell_count": np.asarray([12], dtype=np.int32),
@@ -114,9 +177,11 @@ class FenicsxModalSolverTests(unittest.TestCase):
         self.assertIn("mode1_top_surface_strain_eqv", payload)
         self.assertIn("harmonic_field_frequency_hz", payload)
         self.assertIn("harmonic_top_surface_strain_eqv", payload)
+        self.assertIn("capacitance_eps33s_f_per_m", payload)
         np.testing.assert_array_equal(payload["top_surface_strain_eqv"], np.asarray([30.0, 40.0], dtype=np.float64))
         self.assertEqual(float(payload["mode1_frequency_hz"]), 1.25)
         self.assertEqual(float(payload["harmonic_field_frequency_hz"]), 1.2)
+        self.assertEqual(float(np.asarray(payload["capacitance_eps33s_f_per_m"]).reshape(-1)[0]), 1.729e-8)
 
     def test_top_surface_cellwise_strain_is_root_dominant_for_cantilever_like_mode(self) -> None:
         x_nodes = np.linspace(0.0, 1.0, 5, dtype=np.float64)

@@ -39,8 +39,8 @@ def _as_reference_or_nan(value: float | None) -> float:
 
 def _normalize_voltage_form(value: str) -> str:
     normalized = str(value).strip().lower()
-    if normalized not in {"unknown", "peak", "rms"}:
-        raise ValueError("ansys_voltage_form must be one of: unknown, peak, rms.")
+    if normalized not in {"unknown", "peak"}:
+        raise ValueError("ansys_voltage_form must be one of: unknown, peak.")
     return normalized
 
 
@@ -234,8 +234,15 @@ def audit_run_sample(
         freq_hz = np.asarray(response["freq_hz"], dtype=np.float64).reshape(-1)
         voltage_mag = np.asarray(response["voltage_mag"], dtype=np.float64).reshape(-1)
         f_peak_hz = float(np.asarray(response["f_peak_hz"], dtype=np.float64))
-        peak_voltage_peak_v = float(np.max(voltage_mag))
-        peak_voltage_rms_v = float(peak_voltage_peak_v / np.sqrt(2.0))
+        peak_voltage_peak_v = (
+            float(np.asarray(response["peak_voltage_peak_v"], dtype=np.float64).reshape(-1)[0])
+            if "peak_voltage_peak_v" in response
+            else (
+                float(np.asarray(response["peak_voltage"], dtype=np.float64).reshape(-1)[0])
+                if "peak_voltage" in response
+                else float(np.max(voltage_mag))
+            )
+        )
         argmax_freq_hz = float(freq_hz[int(np.argmax(voltage_mag))])
         eigenfreq_hz = np.asarray(modal["eigenfreq_hz"], dtype=np.float64).reshape(-1)
         mode1_frequency_hz = (
@@ -254,6 +261,11 @@ def audit_run_sample(
         capacitance_f = (
             float(np.asarray(modal["capacitance_f"], dtype=np.float64).reshape(-1)[0])
             if "capacitance_f" in modal
+            else float("nan")
+        )
+        capacitance_eps33s_f_per_m = (
+            float(np.asarray(modal["capacitance_eps33s_f_per_m"], dtype=np.float64).reshape(-1)[0])
+            if "capacitance_eps33s_f_per_m" in modal
             else float("nan")
         )
 
@@ -312,34 +324,8 @@ def audit_run_sample(
         if ansys_voltage_v is not None
         else float("nan")
     )
-    voltage_error_if_ansys_rms = (
-        _percent_error_percent(peak_voltage_rms_v, ansys_voltage_v)
-        if ansys_voltage_v is not None
-        else float("nan")
-    )
-    selected_voltage_error_percent = float("nan")
-    selected_in_house_voltage_v = float("nan")
-    if ansys_voltage_v is not None:
-        if ansys_voltage_form == "peak":
-            selected_voltage_error_percent = float(voltage_error_if_ansys_peak)
-            selected_in_house_voltage_v = float(peak_voltage_peak_v)
-        elif ansys_voltage_form == "rms":
-            selected_voltage_error_percent = float(voltage_error_if_ansys_rms)
-            selected_in_house_voltage_v = float(peak_voltage_rms_v)
-    voltage_convention_mismatch_likely = bool(
-        ansys_voltage_v is not None
-        and ansys_voltage_form == "unknown"
-        and np.isfinite(voltage_error_if_ansys_rms)
-        and abs(voltage_error_if_ansys_rms) <= voltage_convention_tolerance_percent
-        and (
-            not np.isfinite(voltage_error_if_ansys_peak)
-            or abs(voltage_error_if_ansys_peak) > voltage_convention_tolerance_percent
-        )
-    )
-    if voltage_convention_mismatch_likely:
-        warnings.append(
-            "The ANSYS-vs-in-house voltage gap is likely explained by an RMS-vs-peak convention mismatch."
-        )
+    selected_voltage_error_percent = float(voltage_error_if_ansys_peak)
+    selected_in_house_voltage_v = float(peak_voltage_peak_v) if ansys_voltage_v is not None else float("nan")
 
     top_surface_strain, surface_warnings = _surface_strain_summary(
         strain=preferred_surface_field["strain"],
@@ -401,16 +387,12 @@ def audit_run_sample(
         "voltage_comparison": {
             "peak_voltage_v": float(peak_voltage_peak_v),
             "peak_voltage_peak_v": float(peak_voltage_peak_v),
-            "peak_voltage_rms_v": float(peak_voltage_rms_v),
             "external_load_resistance_ohm": float(runtime_defaults.get("resistance_ohm", np.nan)),
             "ansys_voltage_reference_v": _as_reference_or_nan(ansys_voltage_v),
             "ansys_voltage_form": str(ansys_voltage_form),
             "selected_in_house_voltage_v": float(selected_in_house_voltage_v),
             "selected_voltage_error_percent": float(selected_voltage_error_percent),
             "error_percent_assuming_ansys_peak": float(voltage_error_if_ansys_peak),
-            "error_percent_assuming_ansys_rms": float(voltage_error_if_ansys_rms),
-            "rms_equivalent_error_percent": float(voltage_error_if_ansys_rms),
-            "voltage_convention_mismatch_likely": bool(voltage_convention_mismatch_likely),
             "voltage_convention_tolerance_percent": float(voltage_convention_tolerance_percent),
         },
         "electromechanical": {
@@ -418,6 +400,7 @@ def audit_run_sample(
             "modal_force_mode1": float(modal_force[0]) if modal_force.size > 0 else float("nan"),
             "modal_mass_mode1": float(modal_mass[0]) if modal_mass.size > 0 else float("nan"),
             "capacitance_f": float(capacitance_f),
+            "capacitance_eps33s_f_per_m": float(capacitance_eps33s_f_per_m),
         },
         "mesh_materials": mesh_materials,
         "top_surface_strain": top_surface_strain,
@@ -497,7 +480,6 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print(
         "voltage_comparison: "
         f"peak_voltage_peak_v={voltage_comparison['peak_voltage_peak_v']:.12g}, "
-        f"peak_voltage_rms_v={voltage_comparison['peak_voltage_rms_v']:.12g}, "
         f"load_ohm={voltage_comparison['external_load_resistance_ohm']:.12g}"
     )
     if np.isfinite(float(voltage_comparison.get("ansys_voltage_reference_v", np.nan))):
@@ -506,23 +488,16 @@ def _print_summary(summary: dict[str, Any]) -> None:
             f"ansys_voltage_v={voltage_comparison['ansys_voltage_reference_v']:.12g}, "
             f"ansys_voltage_form={voltage_comparison['ansys_voltage_form']}"
         )
-        if str(voltage_comparison.get("ansys_voltage_form", "unknown")) == "unknown":
-            print(
-                "voltage_reference_ambiguity: "
-                f"error_percent_assuming_ansys_peak={voltage_comparison['error_percent_assuming_ansys_peak']:.12g}, "
-                f"error_percent_assuming_ansys_rms={voltage_comparison['error_percent_assuming_ansys_rms']:.12g}, "
-                f"voltage_convention_mismatch_likely={bool(voltage_comparison['voltage_convention_mismatch_likely'])}"
-            )
-        else:
-            print(
-                "voltage_error: "
-                f"selected_voltage_error_percent={voltage_comparison['selected_voltage_error_percent']:.12g}"
-            )
+        print(
+            "voltage_error: "
+            f"selected_voltage_error_percent={voltage_comparison['selected_voltage_error_percent']:.12g}"
+        )
     print(
         "electromechanical: "
         f"modal_theta_mode1={summary['electromechanical']['modal_theta_mode1']:.12g}, "
         f"modal_force_mode1={summary['electromechanical']['modal_force_mode1']:.12g}, "
-        f"capacitance_f={summary['electromechanical']['capacitance_f']:.12g}"
+        f"capacitance_f={summary['electromechanical']['capacitance_f']:.12g}, "
+        f"capacitance_eps33s_f_per_m={summary['electromechanical']['capacitance_eps33s_f_per_m']:.12g}"
     )
     print(
         "mesh_materials: "
@@ -579,8 +554,8 @@ def main() -> None:
     parser.add_argument(
         "--ansys-voltage-form",
         default="unknown",
-        choices=["unknown", "peak", "rms"],
-        help="Interpretation of --ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+        choices=["unknown", "peak"],
+        help="Interpretation of --ansys-voltage-v. Only peak-voltage comparison is supported.",
     )
     args = parser.parse_args()
 

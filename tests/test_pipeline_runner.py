@@ -6,13 +6,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 from peh_inverse_design.pipeline_runner import (
     PipelineConfig,
     _build_mesh_command,
     _build_solver_inner_args,
     _cli_parser,
     _run_solver_with_isolated_retry,
+    _solver_outputs_exist,
 )
+from peh_inverse_design.response_dataset import save_fem_response
 
 
 class PipelineRunnerTests(unittest.TestCase):
@@ -108,14 +112,14 @@ class PipelineRunnerTests(unittest.TestCase):
 
         self.assertEqual(requested_orders, [None, None, 1])
 
-    def test_build_solver_inner_args_forwards_house_voltage_convention(self) -> None:
+    def test_build_solver_inner_args_forwards_peak_voltage_convention(self) -> None:
         config = PipelineConfig(
             source_unit_cell_npz="dummy.npz",
             exact_cad=True,
             repair_cad=False,
             substrate_rho=7930.0,
             piezo_rho=7500.0,
-            house_voltage_amplitude_convention="rms",
+            house_voltage_amplitude_convention="peak",
         )
 
         cmd = _build_solver_inner_args(
@@ -129,10 +133,19 @@ class PipelineRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             cmd[cmd.index("--house-voltage-amplitude-convention") + 1],
-            "rms",
+            "peak",
         )
 
-    def test_cli_parser_no_longer_exposes_ansys_audit_flags(self) -> None:
+    def test_pipeline_config_rejects_rms_voltage_convention(self) -> None:
+        with self.assertRaisesRegex(ValueError, "RMS handling was removed"):
+            PipelineConfig(
+                source_unit_cell_npz="dummy.npz",
+                exact_cad=True,
+                repair_cad=False,
+                house_voltage_amplitude_convention="rms",
+            )
+
+    def test_cli_parser_no_longer_exposes_ansys_audit_flags_and_only_accepts_peak_voltage_convention(self) -> None:
         parser = _cli_parser()
         option_strings = {option for action in parser._actions for option in action.option_strings}
 
@@ -141,6 +154,37 @@ class PipelineRunnerTests(unittest.TestCase):
         self.assertNotIn("--audit-ansys-voltage-v", option_strings)
         self.assertNotIn("--audit-ansys-voltage-form", option_strings)
         self.assertNotIn("--audit-sample-id", option_strings)
+
+        action = next(action for action in parser._actions if "--house-voltage-amplitude-convention" in action.option_strings)
+        self.assertEqual(action.choices, ["peak"])
+
+    def test_solver_outputs_exist_accepts_peak_and_rejects_rms_tagged_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mesh_dir = root / "meshes"
+            mesh_dir.mkdir(parents=True, exist_ok=True)
+            mesh_path = mesh_dir / "plate3d_0002_fenicsx.npz"
+            mesh_path.write_bytes(b"stub")
+            response_dir = root / "responses"
+            modal_dir = root / "modal"
+            modal_dir.mkdir(parents=True, exist_ok=True)
+            (modal_dir / "sample_0002_modal.npz").write_bytes(b"stub")
+            response_path = save_fem_response(
+                sample_id=2,
+                f_peak_hz=1.0,
+                freq_hz=[0.9, 1.0, 1.1],
+                voltage_mag=[1.0, 2.0, 1.5],
+                output_dir=response_dir,
+            )
+
+            self.assertTrue(_solver_outputs_exist(mesh_path, response_dir, modal_dir, "peak"))
+
+            with np.load(response_path, allow_pickle=True) as response:
+                tagged_rms_payload = {key: np.asarray(response[key]) for key in response.files}
+            tagged_rms_payload["peak_voltage_form"] = np.asarray("rms")
+            np.savez_compressed(response_path, **tagged_rms_payload)
+
+            self.assertFalse(_solver_outputs_exist(mesh_path, response_dir, modal_dir, "peak"))
 
 
 if __name__ == "__main__":

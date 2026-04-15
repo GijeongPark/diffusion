@@ -79,7 +79,7 @@ This aligned dataset contains, per sample:
 - modal diagnostics such as `eigenfreq_hz`, `field_frequency_hz`, `top_surface_strain_eqv`
 - path indices to the corresponding mesh, response, and modal files
 
-The in-house response files and aggregated datasets now treat `voltage_mag` and `peak_voltage` in the configured `electrical.house_voltage_amplitude_convention` (`peak` or `rms`), while still storing both `peak_voltage_peak_v` and `peak_voltage_rms_v` for traceability.
+The in-house response files and aggregated datasets now store `voltage_mag` and `peak_voltage` as peak amplitudes only. Legacy RMS-tagged response files are rejected so the stored voltage convention stays explicit and uniform.
 
 Export solid STEP geometry for manual ANSYS Workbench handoff and build the fast Python solver meshes from the same planform:
 
@@ -167,7 +167,7 @@ MPLCONFIGDIR=/tmp/mpl ./.venv/bin/python peh_inverse_design/visualize_run_output
   --output-dir reports/run_outputs
 ```
 
-This generates per-sample summary PNGs, a gallery image, and `summary.csv`.
+This generates per-sample summary PNGs, a gallery image, and `summary.csv`. The CSV records the modal frequency, FRF peak frequency, and peak voltage directly in peak-amplitude units.
 
 The surface-strain panel in those figures is now explicitly the **piezo top-surface** strain field. Because the patch fully covers the metaplate, that panel is expected to look almost solid in plan view; the visualizer now overlays the tiled substrate footprint so the underlying unit-cell pattern remains visible.
 

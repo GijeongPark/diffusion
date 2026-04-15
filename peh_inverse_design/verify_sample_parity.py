@@ -284,13 +284,10 @@ def _record_from_summary(
         "mode1_vs_ambiguous_frequency_error_percent": float(frequency["mode1_vs_ambiguous_frequency_error_percent"]),
         "f_peak_vs_ambiguous_frequency_error_percent": float(frequency["f_peak_vs_ambiguous_frequency_error_percent"]),
         "peak_voltage_peak_v": float(voltage["peak_voltage_peak_v"]),
-        "peak_voltage_rms_v": float(voltage["peak_voltage_rms_v"]),
         "ansys_voltage_reference_v": float(voltage["ansys_voltage_reference_v"]),
         "ansys_voltage_form": str(voltage["ansys_voltage_form"]),
         "selected_voltage_error_percent": float(voltage["selected_voltage_error_percent"]),
         "error_percent_assuming_ansys_peak": float(voltage["error_percent_assuming_ansys_peak"]),
-        "error_percent_assuming_ansys_rms": float(voltage["error_percent_assuming_ansys_rms"]),
-        "voltage_convention_mismatch_likely": bool(voltage["voltage_convention_mismatch_likely"]),
         "modal_theta_mode1": float(summary["electromechanical"]["modal_theta_mode1"]),
         "modal_force_mode1": float(summary["electromechanical"]["modal_force_mode1"]),
         "capacitance_f": float(summary["electromechanical"]["capacitance_f"]),
@@ -547,7 +544,6 @@ def verify_sample_parity(
                     f"[ok] {case_name}: mode1={record['mode1_frequency_hz']:.12g} Hz, "
                     f"f_peak={record['f_peak_hz']:.12g} Hz, "
                     f"Vpeak={record['peak_voltage_peak_v']:.12g} V, "
-                    f"Vrms={record['peak_voltage_rms_v']:.12g} V, "
                     f"freq_score={record['frequency_match_score_percent']:.6g}%",
                     flush=True,
                 )
@@ -600,7 +596,6 @@ def verify_sample_parity(
             f"mode1={record['mode1_frequency_hz']:.12g} Hz, "
             f"f_peak={record['f_peak_hz']:.12g} Hz, "
             f"Vpeak={record['peak_voltage_peak_v']:.12g} V, "
-            f"Vrms={record['peak_voltage_rms_v']:.12g} V, "
             f"freq_score={record['frequency_match_score_percent']:.6g}%",
             flush=True,
         )
@@ -613,7 +608,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run a single-sample ANSYS parity sweep. This keeps the fast reduced modal solver intact, "
-            "but sweeps verification mesh settings and audits peak-vs-RMS and modal-vs-FRF comparisons explicitly."
+            "but sweeps verification mesh settings and audits peak-voltage and modal-vs-FRF comparisons explicitly."
         ),
     )
     parser.add_argument("--sample-id", type=int, required=True, help="Sample id to verify.")
@@ -651,8 +646,8 @@ def main() -> None:
     parser.add_argument(
         "--ansys-voltage-form",
         default="unknown",
-        choices=["unknown", "peak", "rms"],
-        help="Interpretation of --ansys-voltage-v. Use 'unknown' to compare against both peak and RMS.",
+        choices=["unknown", "peak"],
+        help="Interpretation of --ansys-voltage-v. Only peak-voltage comparison is supported.",
     )
     parser.add_argument("--substrate-thickness", type=float, default=None, help="Override substrate thickness in meters.")
     parser.add_argument("--piezo-thickness", type=float, default=None, help="Override piezo thickness in meters.")

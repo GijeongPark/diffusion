@@ -13,7 +13,7 @@ from peh_inverse_design.response_dataset import save_fem_response
 
 
 class BuildIntegratedDatasetTests(unittest.TestCase):
-    def test_integrated_dataset_persists_voltage_and_mesh_provenance_fields(self) -> None:
+    def test_integrated_dataset_persists_peak_voltage_and_mesh_provenance_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             unit_cell_npz = root / "unit_cell_dataset.npz"
@@ -49,6 +49,7 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                 modal_theta=np.asarray([2.0], dtype=np.float64),
                 modal_mass=np.asarray([1.0], dtype=np.float64),
                 capacitance_f=np.asarray([1.0e-4], dtype=np.float64),
+                capacitance_eps33s_f_per_m=np.asarray([1.729e-8], dtype=np.float64),
             )
             np.savez_compressed(
                 mesh_dir / "plate3d_0000_fenicsx.npz",
@@ -96,8 +97,8 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
             with np.load(output_path, allow_pickle=True) as integrated:
                 self.assertAlmostEqual(float(integrated["peak_voltage"][0]), 342.0)
                 self.assertAlmostEqual(float(integrated["peak_voltage_peak_v"][0]), 342.0)
-                self.assertAlmostEqual(float(integrated["peak_voltage_rms_v"][0]), 342.0 / np.sqrt(2.0))
-                self.assertEqual(str(integrated["peak_voltage_form"][0]), "peak")
+                self.assertNotIn("peak_voltage_rms_v", integrated)
+                self.assertNotIn("peak_voltage_form", integrated)
                 self.assertEqual(str(integrated["mesh_preset"][0]), "ansys_parity")
                 self.assertEqual(int(integrated["substrate_layers"][0]), 8)
                 self.assertEqual(int(integrated["piezo_layers"][0]), 3)
@@ -110,21 +111,20 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
             with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["peak_voltage_peak_v"], "342")
-            self.assertEqual(rows[0]["peak_voltage_form"], "peak")
+            self.assertNotIn("peak_voltage_rms_v", rows[0])
+            self.assertNotIn("peak_voltage_form", rows[0])
             self.assertEqual(rows[0]["mesh_preset"], "ansys_parity")
             self.assertEqual(rows[0]["substrate_layers"], "8")
             self.assertEqual(rows[0]["piezo_layers"], "3")
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs"], "")
             self.assertEqual(rows[0]["solver_max_q2_vector_dofs_unlimited"], "True")
 
-    def test_integrated_dataset_uses_stored_voltage_convention_for_peak_voltage(self) -> None:
+    def test_integrated_dataset_rejects_rms_tagged_response_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             unit_cell_npz = root / "unit_cell_dataset.npz"
             response_dir = root / "responses"
             output_path = root / "integrated_dataset.npz"
-            index_csv_path = root / "integrated_dataset.csv"
-
             np.savez_compressed(
                 unit_cell_npz,
                 grf=np.zeros((1, 2, 2), dtype=np.float64),
@@ -132,38 +132,25 @@ class BuildIntegratedDatasetTests(unittest.TestCase):
                 sample_id=np.asarray([0], dtype=np.int32),
                 source_sample_id=np.asarray([0], dtype=np.int32),
             )
-            save_fem_response(
-                sample_id=0,
-                f_peak_hz=0.72,
+            response_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                response_dir / "sample_0000_response.npz",
+                sample_id=np.asarray(0, dtype=np.int32),
+                f_peak_hz=np.asarray(0.72, dtype=np.float64),
                 freq_hz=np.asarray([0.6, 0.72, 0.84], dtype=np.float64),
                 voltage_mag=np.asarray([200.0, 342.0, 210.0], dtype=np.float64),
-                output_dir=response_dir,
-                voltage_amplitude_convention="rms",
+                peak_voltage=np.asarray(342.0, dtype=np.float64),
+                peak_voltage_peak_v=np.asarray(342.0, dtype=np.float64),
+                peak_voltage_form=np.asarray("rms"),
+                quality_flag=np.asarray(1, dtype=np.int32),
             )
 
-            build_integrated_dataset(
-                unit_cell_npz=unit_cell_npz,
-                response_dir=response_dir,
-                output_path=output_path,
-                index_csv_path=index_csv_path,
-            )
-
-            with np.load(output_path, allow_pickle=True) as integrated:
-                np.testing.assert_allclose(
-                    np.asarray(integrated["voltage_mag"][0], dtype=np.float64),
-                    np.asarray([200.0, 342.0, 210.0], dtype=np.float64) / np.sqrt(2.0),
+            with self.assertRaisesRegex(ValueError, "RMS handling was removed"):
+                build_integrated_dataset(
+                    unit_cell_npz=unit_cell_npz,
+                    response_dir=response_dir,
+                    output_path=output_path,
                 )
-                self.assertAlmostEqual(float(integrated["peak_voltage"][0]), 342.0 / np.sqrt(2.0))
-                self.assertAlmostEqual(float(integrated["peak_voltage_peak_v"][0]), 342.0)
-                self.assertAlmostEqual(float(integrated["peak_voltage_rms_v"][0]), 342.0 / np.sqrt(2.0))
-                self.assertEqual(str(integrated["peak_voltage_form"][0]), "rms")
-
-            with index_csv_path.open("r", newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-            self.assertEqual(rows[0]["peak_voltage"], f"{342.0 / np.sqrt(2.0):.12g}")
-            self.assertEqual(rows[0]["peak_voltage_peak_v"], "342")
-            self.assertEqual(rows[0]["peak_voltage_rms_v"], f"{342.0 / np.sqrt(2.0):.12g}")
-            self.assertEqual(rows[0]["peak_voltage_form"], "rms")
 
 
 if __name__ == "__main__":

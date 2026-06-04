@@ -331,7 +331,7 @@ class PipelineRunnerTests(unittest.TestCase):
             mesh_path=Path("/tmp/project/meshes/plate3d_0000_fenicsx.npz"),
         )
 
-        self.assertEqual(cmd[:4], ["mpiexec", "--allow-run-as-root", "-n", "4"])
+        self.assertEqual(cmd[:3], ["mpiexec", "-n", "4"])
         self.assertIn("python3", cmd)
 
     def test_build_solver_docker_command_sets_mpi_environment(self) -> None:
@@ -356,7 +356,7 @@ class PipelineRunnerTests(unittest.TestCase):
 
         shell_command = cmd[-1]
         self.assertIn("OMPI_ALLOW_RUN_AS_ROOT=1", shell_command)
-        self.assertIn("OMP_NUM_THREADS=1 mpiexec --allow-run-as-root -n 4", shell_command)
+        self.assertIn("OMP_NUM_THREADS=1 mpiexec -n 4", shell_command)
 
     def test_pipeline_config_rejects_rms_voltage_convention(self) -> None:
         with self.assertRaisesRegex(ValueError, "RMS handling was removed"):

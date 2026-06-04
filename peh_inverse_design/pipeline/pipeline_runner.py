@@ -678,9 +678,12 @@ def _build_solver_inner_args(
         ]
     )
     if int(config.solver_mpi_ranks) > 1:
+        # Do not pass OpenMPI's --allow-run-as-root flag: the dolfinx image's
+        # mpiexec may be MPICH/Hydra, which rejects it. Running as root is
+        # instead authorized via the OMPI_ALLOW_RUN_AS_ROOT* env vars set in
+        # _build_solver_docker_command (OpenMPI), and MPICH needs neither.
         solver_args = [
             "mpiexec",
-            "--allow-run-as-root",
             "-n",
             str(int(config.solver_mpi_ranks)),
         ] + solver_args

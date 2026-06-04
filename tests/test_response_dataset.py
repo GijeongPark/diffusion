@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from peh_inverse_design.response_dataset import aggregate_response_directory, save_fem_response
+from peh_inverse_design.datasets.response_dataset import aggregate_response_directory, save_fem_response
 
 
 class ResponseDatasetTests(unittest.TestCase):

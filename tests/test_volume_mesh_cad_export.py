@@ -10,8 +10,8 @@ import gmsh
 import numpy as np
 from shapely.geometry import box
 
-from peh_inverse_design.geometry_pipeline import GeometryBuildConfig
-from peh_inverse_design.volume_mesh import (
+from peh_inverse_design.geometry.geometry_pipeline import GeometryBuildConfig
+from peh_inverse_design.meshing.volume_mesh import (
     VolumeMeshConfig,
     _build_layered_tet_solver_mesh,
     _build_substrate_planform,
@@ -273,15 +273,15 @@ class VolumeMeshCadExportTests(unittest.TestCase):
                 return solver_path
 
             with mock.patch(
-                "peh_inverse_design.volume_mesh._build_step_export_variant",
+                "peh_inverse_design.meshing.volume_mesh._build_step_export_variant",
                 side_effect=fake_build_step_export_variant,
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._build_layered_tet_solver_mesh",
+                "peh_inverse_design.meshing.volume_mesh._build_layered_tet_solver_mesh",
                 side_effect=fake_build_layered_tet_solver_mesh,
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._write_cad_report",
+                "peh_inverse_design.meshing.volume_mesh._write_cad_report",
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._write_ansys_face_selection_manifest",
+                "peh_inverse_design.meshing.volume_mesh._write_ansys_face_selection_manifest",
             ):
                 artifacts = _mesh_polygons_volume_sample_layered_tet(
                     polygons=[small_hole_planform],
@@ -355,15 +355,15 @@ class VolumeMeshCadExportTests(unittest.TestCase):
                 return solver_path
 
             with mock.patch(
-                "peh_inverse_design.volume_mesh._build_step_export_variant",
+                "peh_inverse_design.meshing.volume_mesh._build_step_export_variant",
                 side_effect=fake_build_step_export_variant,
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._build_layered_tet_solver_mesh",
+                "peh_inverse_design.meshing.volume_mesh._build_layered_tet_solver_mesh",
                 side_effect=fake_build_layered_tet_solver_mesh,
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._write_cad_report",
+                "peh_inverse_design.meshing.volume_mesh._write_cad_report",
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._write_ansys_face_selection_manifest",
+                "peh_inverse_design.meshing.volume_mesh._write_ansys_face_selection_manifest",
             ):
                 artifacts = _mesh_polygons_volume_sample_layered_tet(
                     polygons=[small_hole_planform],
@@ -412,10 +412,10 @@ class VolumeMeshCadExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
             with mock.patch(
-                "peh_inverse_design.volume_mesh._mesh_partitioned_full_plate_triangles",
+                "peh_inverse_design.meshing.volume_mesh._mesh_partitioned_full_plate_triangles",
                 return_value=(xy, triangles, substrate_mask),
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._estimate_quadratic_vector_dofs",
+                "peh_inverse_design.meshing.volume_mesh._estimate_quadratic_vector_dofs",
                 side_effect=[4_500_000, 3_900_000],
             ):
                 solver_path = _build_layered_tet_solver_mesh(
@@ -469,10 +469,10 @@ class VolumeMeshCadExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
             with mock.patch(
-                "peh_inverse_design.volume_mesh._mesh_partitioned_full_plate_triangles",
+                "peh_inverse_design.meshing.volume_mesh._mesh_partitioned_full_plate_triangles",
                 return_value=(xy, triangles, substrate_mask),
             ), mock.patch(
-                "peh_inverse_design.volume_mesh._estimate_quadratic_vector_dofs",
+                "peh_inverse_design.meshing.volume_mesh._estimate_quadratic_vector_dofs",
                 return_value=4_500_000,
             ):
                 with self.assertRaisesRegex(RuntimeError, "disables hidden coarsening for parity checks"):

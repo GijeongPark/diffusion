@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from peh_inverse_design.build_integrated_dataset import build_integrated_dataset
-from peh_inverse_design.response_dataset import save_fem_response
+from peh_inverse_design.datasets.build_integrated_dataset import build_integrated_dataset
+from peh_inverse_design.datasets.response_dataset import save_fem_response
 
 
 class BuildIntegratedDatasetTests(unittest.TestCase):

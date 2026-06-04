@@ -6,7 +6,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from peh_inverse_design.problem_spec import write_ansys_workbench_handoff
+from peh_inverse_design.core.problem_spec import build_piezo_config_kwargs, write_ansys_workbench_handoff
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,31 @@ class ProblemSpecHandoffTests(unittest.TestCase):
         import_sequence = " ".join(payload["ansys_workbench_geometry_import"]["recommended_import_sequence"])
         self.assertIn("step_path", import_sequence)
         self.assertIn("face_selection_manifest_path", import_sequence)
+
+    def test_piezo_capacitance_defaults_to_full_3d_eps33_not_reduced_plate_value(self) -> None:
+        problem_spec = {
+            "geometry": {"piezo_patch_thickness_m": 1.0e-4},
+            "electrical": {"external_load_resistance_ohm": 1.0e4},
+            "materials": {
+                "piezoelectric": {
+                    "reduced_plate_constants": {"eps33s_f_per_m": 1.729e-8},
+                    "full_3d_constants": {
+                        "permittivity_epsS_f_per_m": [
+                            [1.50911e-8, 0.0, 0.0],
+                            [0.0, 1.50911e-8, 0.0],
+                            [0.0, 0.0, 1.26934e-8],
+                        ],
+                        "piezoelectric_e_c_per_m2": [[0.0, 0.0, 0.0]] * 6,
+                        "stiffness_cE_pa": [[0.0] * 6] * 6,
+                    },
+                }
+            },
+        }
+
+        kwargs = build_piezo_config_kwargs(problem_spec)
+
+        self.assertAlmostEqual(kwargs["eps33s_f_per_m"], 1.26934e-8)
+        self.assertAlmostEqual(kwargs["capacitance_eps33s_f_per_m"], 1.26934e-8)
 
 
 if __name__ == "__main__":

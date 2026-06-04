@@ -30,9 +30,28 @@ The detailed physics setup, dataset schema, and recommended diffusion pipeline a
 
 The machine-readable problem specification is stored in [configs/peh_inverse_design_spec.yaml](/home/gijeong/Inverse%20Design/configs/peh_inverse_design_spec.yaml).
 
+## Package Layout
+
+The reusable Python package `peh_inverse_design/` is organized by role so you can find
+the relevant code without reading every file:
+
+| Subpackage | What lives there |
+| --- | --- |
+| `core/` | shared primitives: physical-group tags (`mesh_tags`), the problem specification loader (`problem_spec`), and `paths` (repository-root helper) |
+| `geometry/` | unit-cell geometry construction (`geometry_pipeline`) and modal surface-field extraction (`modal_surface_fields`) |
+| `meshing/` | volume meshing + CAD/STEP export (`volume_mesh`) and its CLI driver (`build_volume_meshes`) |
+| `solver/` | the FEniCSx modal FEM solver that runs inside the dolfinx Docker image (`fenicsx_modal_solver`) |
+| `datasets/` | dataset assembly and I/O (`response_dataset`, `build_geometry_dataset`, `build_response_dataset`, `build_integrated_dataset`, `subset_unit_cell_dataset`) |
+| `pipeline/` | the end-to-end orchestrator (`pipeline_runner`) used by the notebook and `run_all.sh` |
+| `viz/` | run-output figures and reports (`visualize_run_outputs`) |
+
+The top-level package API is unchanged: `from peh_inverse_design import PipelineConfig, run_pipeline`
+still works. Command-line modules are now addressed by their subpackage, e.g.
+`python -m peh_inverse_design.pipeline.pipeline_runner`.
+
 ## Dataset Utilities
 
-The repository now includes a reusable Python package, [peh_inverse_design](/home/gijeong/Inverse%20Design/peh_inverse_design), for the next pipeline step:
+The package handles the next pipeline step after the unit-cell notebook:
 
 - building `data/geometry_dataset.npz` from the unit-cell notebook output
 - generating `10 x 10` tiled full-plate meshes for FEM
@@ -45,7 +64,7 @@ The repository now includes a reusable Python package, [peh_inverse_design](/hom
 Build the geometry dataset and full-plate meshes:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_geometry_dataset \
+./.venv/bin/python -m peh_inverse_design.datasets.build_geometry_dataset \
   --unit-cell-npz data/dataset_100.npz \
   --geometry-output data/geometry_dataset.npz \
   --manifest data/samples.csv \
@@ -55,7 +74,7 @@ Build the geometry dataset and full-plate meshes:
 Aggregate per-sample FEM responses:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_response_dataset \
+./.venv/bin/python -m peh_inverse_design.datasets.build_response_dataset \
   --response-dir data/fem_responses \
   --output data/response_dataset.npz \
   --manifest data/samples.csv
@@ -64,7 +83,7 @@ Aggregate per-sample FEM responses:
 Build one integrated dataset after FEM is done:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_integrated_dataset \
+./.venv/bin/python -m peh_inverse_design.datasets.build_integrated_dataset \
   --unit-cell-npz data/unit_cell_dataset.npz \
   --response-dir runs/test3/data/fem_responses \
   --modal-dir runs/test3/data/modal_data \
@@ -84,7 +103,7 @@ The in-house response files and aggregated datasets now store `voltage_mag` and 
 Export solid STEP geometry for manual ANSYS Workbench handoff and build the fast Python solver meshes from the same planform:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
+./.venv/bin/python -m peh_inverse_design.meshing.build_volume_meshes \
   --unit-cell-npz data/dataset_100.npz \
   --mesh-dir meshes/volumes
 ```
@@ -111,7 +130,7 @@ Important ANSYS note:
 If you explicitly want the old full 3D gmsh volume-mesh route for the Python solver, switch to the legacy backend:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
+./.venv/bin/python -m peh_inverse_design.meshing.build_volume_meshes \
   --unit-cell-npz data/dataset_100.npz \
   --mesh-dir meshes/volumes \
   --solver-mesh-backend gmsh_volume \
@@ -135,7 +154,7 @@ Runtime note for the in-house solver:
 If you intentionally want repaired CAD for disconnected samples, opt in with:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.build_volume_meshes \
+./.venv/bin/python -m peh_inverse_design.meshing.build_volume_meshes \
   --unit-cell-npz data/dataset_100.npz \
   --mesh-dir meshes/volumes \
   --repair-cad \
@@ -159,7 +178,7 @@ Manual Workbench handoff stays outside the automated pipeline. The mesh/CAD step
 Create human-readable summary figures after a run:
 
 ```bash
-MPLCONFIGDIR=/tmp/mpl ./.venv/bin/python peh_inverse_design/visualize_run_outputs.py \
+MPLCONFIGDIR=/tmp/mpl ./.venv/bin/python peh_inverse_design/viz/visualize_run_outputs.py \
   --dataset data/dataset_100.npz \
   --mesh-dir meshes/volumes \
   --response-dir data/fem_responses \
@@ -176,7 +195,7 @@ The surface-strain panel in those figures is now explicitly the **piezo top-surf
 If you want a clean 3-sample test run without mixing outputs with older runs:
 
 ```bash
-./.venv/bin/python -m peh_inverse_design.subset_unit_cell_dataset \
+./.venv/bin/python -m peh_inverse_design.datasets.subset_unit_cell_dataset \
   --input data/unit_cell_dataset.npz \
   --output data/test_runs/test3/unit_cell_dataset.npz \
   --limit 3
@@ -213,8 +232,9 @@ Recommended order:
 1. run [periodic_grf_sdf.ipynb](/home/gijeong/Inverse%20Design/periodic_grf_sdf.ipynb)
 2. save or reuse the generated unit-cell dataset NPZ
 3. open [integrated_peh_pipeline.ipynb](/home/gijeong/Inverse%20Design/integrated_peh_pipeline.ipynb)
-4. update `SOURCE_UNIT_CELL_NPZ`, `RUN_NAME`, and `LIMIT`
-5. click `Run All`
+4. in cell **① Run & pipeline settings**, update `SOURCE_UNIT_CELL_NPZ`, `RUN_NAME`, and `LIMIT`
+5. in cell **② Materials & physics**, edit any material or physical value you need — every property (the full anisotropic piezo matrices, densities, damping, base excitation, load resistance, plate geometry, and the frequency window) is a plain variable here, assembled into `PROBLEM_SPEC`
+6. click `Run All`
 
 The notebook calls the same Python pipeline underneath and creates STEP geometry, Python solver meshes, FEM results, the integrated dataset, and report images in one run.
 
@@ -223,11 +243,28 @@ The notebook pipeline now also exposes CAD mode:
 - `EXACT_CAD = True`, `REPAIR_CAD = False` rejects disconnected tiled substrates
 - `EXACT_CAD = False`, `REPAIR_CAD = True` adds explicit bridge geometry for repair CAD
 
+For closer ANSYS parity in the notebook:
+
+- set `MESH_PRESET = "ansys_parity"`
+- leave `SUBSTRATE_LAYERS = None` and `PIEZO_LAYERS = None` so the preset supplies `8` substrate layers and `3` piezo layers together with the uncapped parity mesh profile
+- if you explicitly type `SUBSTRATE_LAYERS = 8` and `PIEZO_LAYERS = 3` while still leaving `mesh_preset="default"`, the pipeline now auto-aligns that combination to `ansys_parity` unless you also explicitly set `solver_max_q2_vector_dofs`
+- use `EIGENSOLVER_BACKEND = "shift_invert_cholesky"` first; reserve `shift_invert_lu`, `iterative_lobpcg_gamg`, `iterative_gd_gamg`, and `shift_invert_cholesky_ooc` for explicit follow-up runs
+- set `SOLVER_MPI_RANKS = 4` for the first distributed Docker solve attempt, then adjust to 2 or 8 if needed
+- use `--eigensolver-fallback-backends` only when you intentionally want the pipeline to restart failed isolated solves in fresh Docker containers with named fallback backends
+
 If Step 1 fails, inspect `runs/<RUN_NAME>/meshes/volumes/mesh_build_summary.json` for the exact CAD rejection reasons.
 
-Density values used by the solver can now be set explicitly:
+All material and physical properties are now edited directly in the notebook's **② Materials & physics** cell and assembled into a `PROBLEM_SPEC` dictionary that becomes the single source of truth and overrides `configs/peh_inverse_design_spec.yaml`. This includes substrate and piezo stiffness, densities (e.g. `SUBSTRATE_DENSITY_KG_PER_M3`, `PIEZO_DENSITY_KG_PER_M3`), the full 3D anisotropic piezo matrices, modal damping, base excitation, the external load resistance, the plate geometry, and the normalized frequency window (`FREQ_RATIO_MIN`, `FREQ_RATIO_MAX`, `FRF_POINTS`). The YAML file remains as a documented default used by the command-line tools.
 
-- `SUBSTRATE_RHO = 7930.0`
-- `PIEZO_RHO = 7500.0` or your desired patch density
+Both the notebook and `run_all.sh` use the same `peh_inverse_design.pipeline.pipeline_runner` implementation under the hood.
 
-Both the notebook and `run_all.sh` use the same `peh_inverse_design.pipeline_runner` implementation under the hood.
+## ANSYS-Parity Layer Diagnosis
+
+The earlier "voltage collapse" when refining from 2+1 to 8+3 through-thickness layers has been diagnosed as a **memory-limited solver artifact**, not a physics or mesh bug. Under an honest quadratic (Q2) solve only the low-layer case fits in RAM: the 4+2 (9.1 M DOFs) and 8+3 (15.7 M DOFs) cases exceed a 128 GiB machine and are OOM-killed, while the old "24 V" came from a pre-guard run that silently degraded the solve. Full evidence, root cause, and the decision options are recorded in [docs/peh_layer_voltage_diagnosis.md](docs/peh_layer_voltage_diagnosis.md).
+
+Key conclusions (superseding the earlier element-order / coarsening hypothesis):
+
+- The meshes are identical across layer counts (same Q2 order, same material volumes, same in-plane size, zero coarsening); only the DOF count grows, so the collapse is not a mesh defect.
+- A shift-invert modal eigensolve needs a sparse direct factorization whose memory grows superlinearly with DOFs; ~5 M DOFs already nears the 128 GiB ceiling, so no "memory handling" flag can make 9-16 M DOFs fit.
+- For a 1000:1 thin plate the low-layer Q2 model is already converged for first-mode voltage (~350 V vs ANSYS ~243 V); 8+3 layers is not physically required.
+- For ANSYS parity, the modal circuit capacitance uses the full 3D PZT `eps33`, not the reduced-plate value (see the memo for the parity caveat this introduces).

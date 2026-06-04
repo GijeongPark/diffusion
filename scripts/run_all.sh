@@ -14,4 +14,4 @@ else
   exit 1
 fi
 
-exec "$PYTHON_BIN" -m peh_inverse_design.pipeline_runner "$@"
+exec "$PYTHON_BIN" -m peh_inverse_design.pipeline.pipeline_runner "$@"

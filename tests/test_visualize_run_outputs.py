@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from peh_inverse_design.modal_surface_fields import preferred_surface_strain_field
-from peh_inverse_design.response_dataset import save_fem_response
-from peh_inverse_design.visualize_run_outputs import (
+from peh_inverse_design.geometry.modal_surface_fields import preferred_surface_strain_field
+from peh_inverse_design.datasets.response_dataset import save_fem_response
+from peh_inverse_design.viz.visualize_run_outputs import (
     _dataset_plate_size_m,
     _load_dataset_row,
     _load_response,

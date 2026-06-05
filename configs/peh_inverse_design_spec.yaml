@@ -24,6 +24,16 @@ materials:
   piezoelectric:
     density_kg_per_m3: 7500.0
     polarization_axis: z
+    elastic_model: anisotropic
+    voigt_order: xx,yy,zz,yz,xz,xy
+    isotropic_vrh:
+      youngs_modulus_pa: 6.10655e10
+      poisson_ratio: 0.39480
+      bulk_modulus_pa: 9.67451e10
+      shear_modulus_pa: 2.18904e10
+    # Explicit capacitance permittivity for 3D coupled-FEM parity with ANSYS.
+    # Normally this equals full_3d_constants.permittivity_epsS_f_per_m[2][2].
+    capacitance_eps33s_f_per_m: 1.26934e-08
     reduced_plate_constants:
       e31_c_per_m2: -23.38
       eps33s_f_per_m: 1.729e-08
@@ -50,6 +60,7 @@ materials:
     notes:
       - Use the reduced plate constants only for analytical reduced-order derivations.
       - Use the full 3D constitutive data for the coupled FEM dataset.
+      - For ANSYS parity, capacitance_eps33s_f_per_m must not silently use the reduced plate eps33 value.
       - Keep the same constitutive convention and axis ordering across all samples.
 
 mechanics:

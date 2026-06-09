@@ -2053,6 +2053,66 @@ def mesh_tiled_plate_volume_sample(
     return artifacts.solver_mesh_path
 
 
+def mesh_plain_plate_volume_sample(
+    sample_id: int,
+    output_dir: str | Path,
+    geometry_config: GeometryBuildConfig | None = None,
+    volume_config: VolumeMeshConfig | None = None,
+) -> Path | None:
+    """Build a void-free, full rectangular two-layer plate solver mesh.
+
+    This is an additive sibling of :func:`mesh_tiled_plate_volume_sample` that
+    bypasses the SDF/GRF metaplate geometry path entirely. Instead of a perforated
+    metamaterial substrate, the substrate planform is the full plate rectangle with
+    no interior holes, so the plate is a plain steel substrate (tag 11) carrying a
+    fully covering PZT layer (tag 12).
+
+    Everything else is produced by the same :func:`_build_layered_tet_solver_mesh`
+    routine the metaplate path uses: identical through-thickness layering (the
+    substrate/piezo layer counts in ``volume_config``), the same prism->tetra
+    splitting, linear-tetra cell ordering, ``VOLUME_SUBSTRATE_TAG``/``VOLUME_PIEZO_TAG``
+    cell tags, and the same top-electrode / interface / bottom-plate / side facet
+    markers. The plate spans ``x in [0, Lx]`` so the solver's geometric ``x_min``
+    clamp lands on the same edge as the metaplate reference. The resulting
+    ``plate3d_<id>_fenicsx.npz`` is therefore consumed by the existing FEniCSx modal
+    voltage solver with no changes.
+
+    Only the in-plane geometry differs from production (a solid rectangle rather
+    than a tiled, perforated metaplate), which is exactly the single intended
+    variable for the plain-plate vs metaplate comparison.
+    """
+    if geometry_config is None:
+        raise ValueError(
+            "geometry_config must be provided explicitly so the plain plate is built at the intended physical size."
+        )
+    volume_config = volume_config or VolumeMeshConfig()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plate_lx, plate_ly = geometry_config.plate_size_m
+    cad_reference_size_m = _resolve_cad_reference_size_m(
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+    )
+    # Void-free substrate planform: the entire plate rectangle, no interior holes.
+    plain_planform = _finalize_planform(
+        polygon=box(0.0, 0.0, float(plate_lx), float(plate_ly)),
+        was_repaired=False,
+        initial_component_count=1,
+        mesh_size_m=cad_reference_size_m,
+        volume_config=volume_config,
+        invalid_message="The plain plate planform is invalid and cannot be meshed.",
+    )
+    return _build_layered_tet_solver_mesh(
+        planform=plain_planform,
+        sample_id=sample_id,
+        output_dir=output_dir,
+        geometry_config=geometry_config,
+        volume_config=volume_config,
+    )
+
+
 def _stack_cell_blocks(mesh: meshio.Mesh, cell_type: str, data_name: str) -> tuple[np.ndarray, np.ndarray] | None:
     cell_blocks: list[np.ndarray] = []
     data_blocks: list[np.ndarray] = []

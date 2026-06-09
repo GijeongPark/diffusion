@@ -31,9 +31,16 @@ materials:
       poisson_ratio: 0.39480
       bulk_modulus_pa: 9.67451e10
       shear_modulus_pa: 2.18904e10
-    # Explicit capacitance permittivity for 3D coupled-FEM parity with ANSYS.
-    # Normally this equals full_3d_constants.permittivity_epsS_f_per_m[2][2].
-    capacitance_eps33s_f_per_m: 1.26934e-08
+    # Capacitance permittivity for the reduced modal-circuit voltage solver.
+    # A full 3D coupled-field solver uses the raw clamped permittivity eps_S
+    # (full_3d_constants.permittivity_epsS_f_per_m[2][2] = 1.26934e-08 F/m).
+    # The present reduced (plane-stress plate) modal-circuit solver instead uses
+    # the plate plane-stress condensed permittivity eps_bar_33:
+    #   eps_bar_33 = eps_S_33 + e_33^2 / c_33_E
+    #              = 1.26934e-8 + (23.2403)^2 / 1.17436e11
+    #              = 1.72926e-8 F/m
+    # Old raw (un-condensed) value, kept for raw-vs-condensed A/B comparison: 1.26934e-08
+    capacitance_eps33s_f_per_m: 1.72926e-08
     reduced_plate_constants:
       e31_c_per_m2: -23.38
       eps33s_f_per_m: 1.729e-08
@@ -60,7 +67,7 @@ materials:
     notes:
       - Use the reduced plate constants only for analytical reduced-order derivations.
       - Use the full 3D constitutive data for the coupled FEM dataset.
-      - For ANSYS parity, capacitance_eps33s_f_per_m must not silently use the reduced plate eps33 value.
+      - A full 3D coupled-field solver uses the raw clamped permittivity eps_S; the present reduced modal-circuit solver uses the plate plane-stress condensed permittivity eps_bar (capacitance_eps33s_f_per_m above).
       - Keep the same constitutive convention and axis ordering across all samples.
 
 mechanics:

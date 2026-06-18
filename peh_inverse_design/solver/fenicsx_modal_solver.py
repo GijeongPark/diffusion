@@ -25,6 +25,7 @@ if __package__ in (None, ""):
     )
     from peh_inverse_design.datasets.response_dataset import normalize_voltage_amplitude_convention
     from peh_inverse_design.datasets.response_dataset import save_fem_response
+    from peh_inverse_design.solver.modal_frf import evaluate_voltage_frf, solve_reduced_system
 else:
     from ..core.mesh_tags import FACET_TOP_ELECTRODE_TAG, VOLUME_PIEZO_TAG, VOLUME_SUBSTRATE_TAG
     from ..geometry.modal_surface_fields import has_explicit_surface_strain_fields
@@ -37,6 +38,11 @@ else:
     )
     from ..datasets.response_dataset import normalize_voltage_amplitude_convention
     from ..datasets.response_dataset import save_fem_response
+    from .modal_frf import evaluate_voltage_frf, solve_reduced_system
+
+# Internal aliases kept for the existing call sites and tests.
+_solve_reduced_system = solve_reduced_system
+_evaluate_voltage_frf = evaluate_voltage_frf
 
 
 EIGENSOLVER_BACKENDS = (
@@ -1248,48 +1254,6 @@ def _warn_if_open_circuit_resonance_is_inverted(
             f"open-circuit peak={open_peak_hz:.6g} Hz is below short-circuit f1={short_circuit_hz:.6g} Hz.",
             stacklevel=2,
         )
-
-
-def _solve_reduced_system(
-    omega: float,
-    modal_model: dict[str, np.ndarray],
-    damping_ratio: float,
-    resistance_ohm: float,
-) -> tuple[np.ndarray, complex]:
-    freq_n = modal_model["eigenfreq_hz"]
-    theta = modal_model["modal_theta"]
-    force = modal_model["modal_force"]
-    capacitance = float(modal_model["capacitance_f"][0])
-
-    n_modes = len(freq_n)
-    A = np.zeros((n_modes + 1, n_modes + 1), dtype=np.complex128)
-    b = np.zeros(n_modes + 1, dtype=np.complex128)
-    for mode_idx in range(n_modes):
-        omega_n = 2.0 * math.pi * float(freq_n[mode_idx])
-        A[mode_idx, mode_idx] = omega_n ** 2 - omega ** 2 + 2j * damping_ratio * omega_n * omega
-        A[mode_idx, -1] = -theta[mode_idx]
-        b[mode_idx] = force[mode_idx]
-    A[-1, :-1] = 1j * omega * theta
-    A[-1, -1] = (1.0 / resistance_ohm) + 1j * omega * capacitance
-    solution = np.linalg.solve(A, b)
-    return solution[:-1], solution[-1]
-
-
-def _evaluate_voltage_frf(
-    frequencies_hz: np.ndarray,
-    modal_model: dict[str, np.ndarray],
-    damping_ratio: float,
-    resistance_ohm: float,
-) -> np.ndarray:
-    voltage = np.zeros_like(frequencies_hz, dtype=np.complex128)
-    for idx, f_hz in enumerate(frequencies_hz):
-        _, voltage[idx] = _solve_reduced_system(
-            omega=2.0 * math.pi * float(f_hz),
-            modal_model=modal_model,
-            damping_ratio=damping_ratio,
-            resistance_ohm=resistance_ohm,
-        )
-    return voltage
 
 
 def _build_modal_save_payload(

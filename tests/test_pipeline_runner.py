@@ -11,6 +11,8 @@ import numpy as np
 
 from peh_inverse_design.pipeline.pipeline_runner import (
     PipelineConfig,
+    _build_frf_physical_export_command,
+    _build_geometry_parity_command,
     _build_mesh_command,
     _build_solver_docker_command,
     _effective_mesh_builder_settings,
@@ -48,6 +50,63 @@ class PipelineRunnerTests(unittest.TestCase):
         self.assertNotIn("--substrate-layers", cmd)
         self.assertNotIn("--piezo-layers", cmd)
         self.assertNotIn("--solver-max-q2-vector-dofs", cmd)
+
+    def test_build_frf_physical_export_command_forwards_sweep(self) -> None:
+        config = PipelineConfig(
+            source_unit_cell_npz="dummy.npz",
+            frf_physical_export_freq_min_hz=0.0,
+            frf_physical_export_freq_max_hz=2.0,
+            frf_physical_export_points=201,
+        )
+
+        cmd = _build_frf_physical_export_command(
+            project_python=Path("/tmp/python"),
+            modal_dir=Path("/tmp/modal"),
+            frf_physical_dir=Path("/tmp/frf_physical"),
+            config=config,
+        )
+
+        rendered = [str(value) for value in cmd]
+        self.assertIn("peh_inverse_design.validation.export_physical_frf", rendered)
+        self.assertEqual(rendered[rendered.index("--freq-min-hz") + 1], "0.0")
+        self.assertEqual(rendered[rendered.index("--freq-max-hz") + 1], "2.0")
+        self.assertEqual(rendered[rendered.index("--points") + 1], "201")
+
+    def test_build_geometry_parity_command_forwards_paths(self) -> None:
+        cmd = _build_geometry_parity_command(
+            project_python=Path("/tmp/python"),
+            mesh_dir=Path("/tmp/meshes"),
+            geometry_parity_dir=Path("/tmp/reports/geometry_parity"),
+            summary_csv_path=Path("/tmp/reports/geometry_parity.csv"),
+        )
+
+        rendered = [str(value) for value in cmd]
+        self.assertIn("peh_inverse_design.validation.geometry_parity", rendered)
+        self.assertEqual(rendered[rendered.index("--mesh-dir") + 1], str(Path("/tmp/meshes")))
+        self.assertEqual(
+            rendered[rendered.index("--summary-csv") + 1],
+            str(Path("/tmp/reports/geometry_parity.csv")),
+        )
+
+    def test_cli_parser_accepts_frf_export_and_parity_flags(self) -> None:
+        parser = _cli_parser()
+        args = parser.parse_args(
+            [
+                "--unit-cell-npz",
+                "dummy.npz",
+                "--frf-export-freq-min-hz",
+                "0.0",
+                "--frf-export-freq-max-hz",
+                "2.0",
+                "--frf-export-points",
+                "101",
+                "--verify-geometry-parity",
+            ]
+        )
+        self.assertEqual(float(args.frf_export_freq_min_hz), 0.0)
+        self.assertEqual(float(args.frf_export_freq_max_hz), 2.0)
+        self.assertEqual(int(args.frf_export_points), 101)
+        self.assertTrue(bool(args.verify_geometry_parity))
 
     def test_build_mesh_command_keeps_explicit_overrides(self) -> None:
         config = PipelineConfig(

@@ -107,6 +107,15 @@ class PipelineConfig:
     export_inspection_single_face_step: bool = False
     create_reports: bool = True
     build_integrated_dataset: bool = True
+    # Physical-units FRF export: when both bounds are set, every sample's FRF is
+    # re-evaluated on this absolute sweep (Hz) and written as CSV in peak volts
+    # (frequency_hz, voltage_v columns) under runs/<RUN>/data/frf_physical/.
+    frf_physical_export_freq_min_hz: float | None = None
+    frf_physical_export_freq_max_hz: float | None = None
+    frf_physical_export_points: int = 201
+    # Verify per sample that the solver mesh and the ANSYS STEP share the same
+    # planform/volumes (reports/geometry_parity.csv + per-sample JSON).
+    verify_geometry_parity: bool = False
 
     def __post_init__(self) -> None:
         if self.problem_spec is not None:
@@ -155,6 +164,21 @@ class PipelineConfig:
         object.__setattr__(self, "piezo_elastic_model", _normalize_piezo_elastic_model(self.piezo_elastic_model))
         if self.house_voltage_amplitude_convention is not None and str(self.house_voltage_amplitude_convention).strip().lower() != "peak":
             raise ValueError("house_voltage_amplitude_convention must be 'peak'. RMS handling was removed.")
+        frf_min = self.frf_physical_export_freq_min_hz
+        frf_max = self.frf_physical_export_freq_max_hz
+        if (frf_min is None) != (frf_max is None):
+            raise ValueError(
+                "frf_physical_export_freq_min_hz and frf_physical_export_freq_max_hz must be provided together."
+            )
+        if frf_min is not None:
+            if float(frf_min) < 0.0:
+                raise ValueError("frf_physical_export_freq_min_hz must be non-negative.")
+            if float(frf_max) <= float(frf_min):
+                raise ValueError(
+                    "frf_physical_export_freq_max_hz must be strictly greater than frf_physical_export_freq_min_hz."
+                )
+            if int(self.frf_physical_export_points) < 2:
+                raise ValueError("frf_physical_export_points must be at least 2.")
 
 
 @dataclass(frozen=True)
@@ -171,9 +195,11 @@ class PipelineArtifacts:
     integrated_index_csv_path: Path
     report_dir: Path
     gallery_path: Path
+    frf_physical_dir: Path | None = None
+    geometry_parity_csv_path: Path | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return {key: str(value) for key, value in asdict(self).items()}
+        return {key: ("" if value is None else str(value)) for key, value in asdict(self).items()}
 
 
 def _project_root() -> Path:
@@ -335,6 +361,50 @@ def _build_mesh_command(
     if config.limit is not None and not config.sample_ids.strip():
         mesh_cmd.extend(["--target-ok", str(int(config.limit))])
     return mesh_cmd
+
+
+def _build_frf_physical_export_command(
+    *,
+    project_python: Path,
+    modal_dir: Path,
+    frf_physical_dir: Path,
+    config: PipelineConfig,
+) -> list[str | Path]:
+    return [
+        project_python,
+        "-m",
+        "peh_inverse_design.validation.export_physical_frf",
+        "--modal-dir",
+        modal_dir,
+        "--output-dir",
+        frf_physical_dir,
+        "--freq-min-hz",
+        str(float(config.frf_physical_export_freq_min_hz)),
+        "--freq-max-hz",
+        str(float(config.frf_physical_export_freq_max_hz)),
+        "--points",
+        str(int(config.frf_physical_export_points)),
+    ]
+
+
+def _build_geometry_parity_command(
+    *,
+    project_python: Path,
+    mesh_dir: Path,
+    geometry_parity_dir: Path,
+    summary_csv_path: Path,
+) -> list[str | Path]:
+    return [
+        project_python,
+        "-m",
+        "peh_inverse_design.validation.geometry_parity",
+        "--mesh-dir",
+        mesh_dir,
+        "--output-dir",
+        geometry_parity_dir,
+        "--summary-csv",
+        summary_csv_path,
+    ]
 
 
 def _load_mesh_build_summary(mesh_dir: Path) -> dict[str, object] | None:
@@ -1117,9 +1187,13 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
     integrated_index_csv_path = integrated_dataset_path.with_suffix(".csv")
     report_dir = run_root / "reports"
     gallery_path = report_dir / "gallery.png"
+    frf_physical_export_enabled = config.frf_physical_export_freq_min_hz is not None
+    frf_physical_dir = run_root / "data" / "frf_physical"
+    geometry_parity_dir = report_dir / "geometry_parity"
+    geometry_parity_csv_path = report_dir / "geometry_parity.csv"
     effective_mesh = _effective_mesh_builder_settings(config)
     _, mesh_preset_alignment_note = _resolve_requested_mesh_preset(config)
-    total_steps = 5
+    total_steps = 5 + int(frf_physical_export_enabled) + int(config.verify_geometry_parity)
     step_idx = 1
 
     plate_size_m = (
@@ -1294,6 +1368,37 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         ]
         _run_command(integrated_cmd, cwd=project_root)
 
+    if frf_physical_export_enabled:
+        _print_step(
+            f"Step {step_idx}/{total_steps}: Export physical-units FRF CSVs "
+            f"({float(config.frf_physical_export_freq_min_hz):.6g}-"
+            f"{float(config.frf_physical_export_freq_max_hz):.6g} Hz, "
+            f"{int(config.frf_physical_export_points)} points)"
+        )
+        step_idx += 1
+        _run_command(
+            _build_frf_physical_export_command(
+                project_python=project_python,
+                modal_dir=modal_dir,
+                frf_physical_dir=frf_physical_dir,
+                config=config,
+            ),
+            cwd=project_root,
+        )
+
+    if config.verify_geometry_parity:
+        _print_step(f"Step {step_idx}/{total_steps}: Verify solver-mesh vs ANSYS-STEP geometry parity")
+        step_idx += 1
+        _run_command(
+            _build_geometry_parity_command(
+                project_python=project_python,
+                mesh_dir=mesh_dir,
+                geometry_parity_dir=geometry_parity_dir,
+                summary_csv_path=geometry_parity_csv_path,
+            ),
+            cwd=project_root,
+        )
+
     _print_step(f"Step {step_idx}/{total_steps}: Create reports")
     if config.create_reports:
         env = dict(os.environ)
@@ -1330,6 +1435,8 @@ def run_pipeline(config: PipelineConfig) -> PipelineArtifacts:
         integrated_index_csv_path=integrated_index_csv_path,
         report_dir=report_dir,
         gallery_path=gallery_path,
+        frf_physical_dir=frf_physical_dir if frf_physical_export_enabled else None,
+        geometry_parity_csv_path=geometry_parity_csv_path if config.verify_geometry_parity else None,
     )
     print()
     print("Pipeline complete.")
@@ -1452,6 +1559,29 @@ def _cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repair-cad", action="store_true", help="Use explicit bridge-repair CAD instead of exact topology-preserving CAD.")
     parser.add_argument("--repair-bridge-width-m", type=float, default=None, help="Explicit bridge width in repair CAD mode.")
+    parser.add_argument(
+        "--frf-export-freq-min-hz",
+        type=float,
+        default=None,
+        help="Lower bound of the physical-units FRF CSV sweep in Hz. Requires --frf-export-freq-max-hz.",
+    )
+    parser.add_argument(
+        "--frf-export-freq-max-hz",
+        type=float,
+        default=None,
+        help="Upper bound of the physical-units FRF CSV sweep in Hz. Requires --frf-export-freq-min-hz.",
+    )
+    parser.add_argument(
+        "--frf-export-points",
+        type=int,
+        default=201,
+        help="Number of evenly spaced points in the physical-units FRF CSV sweep.",
+    )
+    parser.add_argument(
+        "--verify-geometry-parity",
+        action="store_true",
+        help="Verify per sample that the solver mesh and the ANSYS STEP share the same planform and volumes.",
+    )
     parser.add_argument("--no-reports", action="store_true", help="Skip summary image generation.")
     parser.add_argument("--no-integrated-dataset", action="store_true", help="Skip integrated_dataset.npz generation.")
     parser.add_argument("--no-materialize-input-dataset", action="store_true", help="Use the source NPZ directly instead of writing a run-local candidate NPZ copy.")
@@ -1508,6 +1638,10 @@ def main() -> None:
         repair_bridge_width_m=args.repair_bridge_width_m,
         create_reports=not bool(args.no_reports),
         build_integrated_dataset=not bool(args.no_integrated_dataset),
+        frf_physical_export_freq_min_hz=args.frf_export_freq_min_hz,
+        frf_physical_export_freq_max_hz=args.frf_export_freq_max_hz,
+        frf_physical_export_points=int(args.frf_export_points),
+        verify_geometry_parity=bool(args.verify_geometry_parity),
     )
     run_pipeline(config)
 

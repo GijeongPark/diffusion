@@ -40,10 +40,11 @@ the relevant code without reading every file:
 | `core/` | shared primitives: physical-group tags (`mesh_tags`), the problem specification loader (`problem_spec`), and `paths` (repository-root helper) |
 | `geometry/` | unit-cell geometry construction (`geometry_pipeline`) and modal surface-field extraction (`modal_surface_fields`) |
 | `meshing/` | volume meshing + CAD/STEP export (`volume_mesh`) and its CLI driver (`build_volume_meshes`) |
-| `solver/` | the FEniCSx modal FEM solver that runs inside the dolfinx Docker image (`fenicsx_modal_solver`) |
+| `solver/` | the FEniCSx modal FEM solver that runs inside the dolfinx Docker image (`fenicsx_modal_solver`) and the numpy-only reduced-order FRF evaluator shared with host tools (`modal_frf`) |
 | `datasets/` | dataset assembly and I/O (`response_dataset`, `build_geometry_dataset`, `build_response_dataset`, `build_integrated_dataset`, `subset_unit_cell_dataset`) |
 | `pipeline/` | the end-to-end orchestrator (`pipeline_runner`) used by the notebook and `run_all.sh` |
 | `viz/` | run-output figures and reports (`visualize_run_outputs`) |
+| `validation/` | ANSYS cross-validation: physical-units FRF CSV export (`export_physical_frf`) and solver-mesh vs STEP geometry parity (`geometry_parity`) |
 
 The top-level package API is unchanged: `from peh_inverse_design import PipelineConfig, run_pipeline`
 still works. Command-line modules are now addressed by their subpackage, e.g.
@@ -189,6 +190,34 @@ MPLCONFIGDIR=/tmp/mpl ./.venv/bin/python peh_inverse_design/viz/visualize_run_ou
 This generates per-sample summary PNGs, a gallery image, and `summary.csv`. The CSV records the modal frequency, FRF peak frequency, and peak voltage directly in peak-amplitude units.
 
 The surface-strain panel in those figures is now explicitly the **piezo top-surface** strain field. Because the patch fully covers the metaplate, that panel is expected to look almost solid in plan view; the visualizer now overlays the tiled substrate footprint so the underlying unit-cell pattern remains visible.
+
+## ANSYS Cross-Validation
+
+Two host-side tools support cross-checking a finished run against ANSYS Workbench. They consume
+the per-sample artifacts a pipeline run already produces (modal NPZs, solver-mesh NPZs, STEP
+files) and need no Docker. The notebook enables both automatically via
+`FRF_PHYSICAL_EXPORT_RANGE_HZ` and `VERIFY_GEOMETRY_PARITY`.
+
+Export each sample's voltage FRF in physical units (Hz, peak volts) over an absolute sweep, so it
+lives on the same axis as an ANSYS harmonic sweep instead of the per-sample normalized window:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.validation.export_physical_frf \
+  --modal-dir runs/0605/data/modal_data \
+  --output-dir runs/0605/data/frf_physical \
+  --freq-min-hz 0 --freq-max-hz 2 --points 201
+```
+
+Verify per sample that the solver mesh and the ANSYS STEP share the same geometry: planform XOR
+(symmetric-difference) area, planform area, substrate/piezo volumes, and bounding box, with a
+cross-check against `plate3d_XXXX_cad.json`:
+
+```bash
+./.venv/bin/python -m peh_inverse_design.validation.geometry_parity \
+  --mesh-dir runs/0605/meshes/volumes \
+  --output-dir runs/0605/reports/geometry_parity \
+  --summary-csv runs/0605/reports/geometry_parity.csv
+```
 
 ## Quick Test Run
 

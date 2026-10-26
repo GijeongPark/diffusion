@@ -17,8 +17,9 @@ runs/
 # Scratch / diagnostic run outputs
 tmp/
 
-# Claude local settings
-.claude/settings.local.json
+# Local development tool state
+.claude/
+.codex
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
